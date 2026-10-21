@@ -48,7 +48,7 @@ class VersionAssessmentTests(unittest.TestCase):
                 self.assertEqual(result['php2shell_version_status'], 'prerelease_unverified')
 
     def test_partial_or_malformed_versions_are_unknown(self):
-        for version in ['8', '8.3', 'latest', '8.3.36 trailing text', '8.3.36/extra']:
+        for version in ['8', '8.3', 'latest', '8.3.36 trailing text', '8.3.36/extra', '9' * 5000 + '.0.0']:
             with self.subTest(version=version):
                 result = assess_php2shell(version)
                 self.assertEqual(result['php2shell_status'], 'unknown')

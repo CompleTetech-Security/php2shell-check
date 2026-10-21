@@ -67,10 +67,10 @@ def assess_php2shell(php_version="", *, version_candidates=None, php_hint=False)
         result["php2shell_notes"].append("Conflicting PHP versions: " + ", ".join(versions))
         return result
     version = versions[0]
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)([A-Za-z0-9.+_~:-]*)", version)
+    match = None if len(version) > 128 else re.fullmatch(r"(\d+)\.(\d+)\.(\d+)([A-Za-z0-9.+_~:-]*)", version)
     if not match:
         result["php2shell_version_status"] = "unrecognized_or_partial_version"
-        result["php2shell_notes"].append(f"Cannot safely compare PHP version {version!r} with the upstream release table.")
+        result["php2shell_notes"].append(f"Cannot safely compare PHP version {version[:128]!r} with the upstream release table.")
         return result
     major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
     suffix = match.group(4)
