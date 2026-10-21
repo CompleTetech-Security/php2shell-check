@@ -1,6 +1,6 @@
-# Exploint
+# SiteSignal
 
-[![Tests](https://github.com/CompleteDotTech/exploint/actions/workflows/tests.yml/badge.svg)](https://github.com/CompleteDotTech/exploint/actions/workflows/tests.yml)
+[![Tests](https://github.com/CompleteDotTech/site-signal/actions/workflows/tests.yml/badge.svg)](https://github.com/CompleteDotTech/site-signal/actions/workflows/tests.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -32,8 +32,8 @@ Python **3.10 or newer**, on Windows, macOS, or Linux. No `pip install`, API key
 browser, database, or third-party Python package is required.
 
 ```sh
-git clone https://github.com/CompleteDotTech/exploint.git
-cd exploint
+git clone https://github.com/CompleteDotTech/site-signal.git
+cd site-signal
 python wordpress_check.py --help
 ```
 
