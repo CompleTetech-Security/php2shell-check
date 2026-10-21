@@ -1,0 +1,252 @@
+# WordPress Public Checker
+
+[![Tests](https://github.com/CompleteDotTech/wordpress-public-checker/actions/workflows/tests.yml/badge.svg)](https://github.com/CompleteDotTech/wordpress-public-checker/actions/workflows/tests.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+A **single-file, dependency-free Python CLI** that checks public web pages for
+WordPress indicators and records openly disclosed WordPress/PHP versions and
+server headers. It checks robots.txt first, limits requests, and explains
+inconclusive results.
+
+**Technology detection is not a vulnerability assessment.** A WordPress marker
+or a version string does not establish that a website is vulnerable.
+
+## Features
+
+- Check one website or a text file containing multiple domains/URLs.
+- Detect WordPress generator metadata, REST API discovery links, and familiar
+  WordPress asset paths.
+- Record WordPress versions only when explicitly disclosed in generator metadata.
+- Record PHP versions only when explicitly disclosed in `X-Powered-By`.
+- Include the page title, final URL, HTTP status, `Server`, `X-Powered-By`,
+  timestamp, evidence, and explanatory notes.
+- Export CSV or JSON; report progress separately on stderr.
+- Respect supported robots.txt rules and pacing hints before requesting pages.
+- Use verified TLS, a descriptive User-Agent, bounded redirects, and bounded
+  response sizes. Stop on access restrictions instead of retrying them.
+
+## Requirements and installation
+
+Python **3.10 or newer**, on Windows, macOS, or Linux. No `pip install`, API key,
+browser, database, or third-party Python package is required.
+
+```sh
+git clone https://github.com/CompleteDotTech/wordpress-public-checker.git
+cd wordpress-public-checker
+python wordpress_check.py --help
+```
+
+On systems where Python is named `python3`, substitute `python3` in these
+commands. You can also copy just `wordpress_check.py` to another directory.
+
+## Quick start
+
+Check a single website and print CSV to the terminal:
+
+```sh
+python wordpress_check.py https://example.com
+```
+
+Check multiple websites and save JSON:
+
+```sh
+python wordpress_check.py example.com https://example.org --format json --output results.json
+```
+
+Check a list and save CSV:
+
+```sh
+python wordpress_check.py --input websites.txt --output results.csv
+```
+
+Use a descriptive contact URL and a slower minimum request interval:
+
+```sh
+python wordpress_check.py --input websites.txt --output results.csv --delay 2 --timeout 15 --contact https://your-domain.example/contact
+```
+
+The included [websites.example.txt](websites.example.txt) uses reserved example
+domains. Replace them with websites you are permitted to check.
+
+## Input format
+
+Input files are UTF-8 text, with one domain or URL per line:
+
+```text
+# Company websites
+example.com
+https://example.org/
+
+# You can check a specific page too
+https://example.net/about/
+```
+
+Blank lines and lines beginning with `#` are ignored. UTF-8 BOMs are accepted.
+Exact duplicate inputs are skipped. Positional URLs and `--input` can be combined.
+
+Bare domains default to HTTPS. Explicit paths are checked as supplied. There is
+no automatic fallback to HTTP after an HTTPS failure. URLs containing credentials
+are rejected. Input is a text list, **not a CSV or an Excel workbook**.
+
+## CLI options
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `urls` | None | Zero or more HTTP(S) URLs or bare domains. |
+| `--input PATH` | None | UTF-8 text file containing one website per line. |
+| `--output PATH` | stdout | Write results to this file. An existing output file is overwritten. |
+| `--format csv\|json` | `csv` | Output format. |
+| `--delay SECONDS` | `1` | Positive minimum time between requests to an origin. Robots rules may increase it. |
+| `--timeout SECONDS` | `15` | Positive per-socket timeout, not a total deadline for a website. |
+| `--contact VALUE` | Empty | Public contact URL/email included in the User-Agent. |
+| `--help` | — | Show command help. |
+
+The default User-Agent is `WordPressPublicChecker/1.0`. Requests are sequential.
+The CLI does not offer an option to ignore robots.txt or disable TLS validation.
+
+## Interpreting results
+
+### Detection status
+
+| `status` | Meaning |
+| --- | --- |
+| `wordpress` | The page advertises a WordPress generator or WordPress REST API discovery relation. |
+| `likely_wordpress` | WordPress-style asset paths were found, without a stronger marker. |
+| `no_evidence` | HTML was inspected successfully, but no supported markers were found. This does not prove WordPress is absent. |
+| `uncertain` | The response could not be fully interpreted, for example because of content type, encoding, or truncation without a marker. |
+| `blocked` | A robots rule, inaccessible robots policy, access restriction, excessive crawl delay, or disallowed redirect prevented inspection. |
+| `error` | Invalid input, a network/TLS error, or another unsuccessful HTTP response. |
+
+The checker deliberately does not produce a definitive "not WordPress" result.
+Sites can remove identifying headers and markup. Conversely, static exports,
+embedded assets, or stale/spoofed metadata can resemble WordPress.
+
+### Fetch status
+
+`fetch_status` is a coarse field for downstream processing:
+
+- `ok`: the final page returned HTTP 2xx, even if its content was inconclusive.
+- `timeout`: a recognized socket timeout occurred.
+- `dns_error`: a recognized DNS-resolution error occurred.
+- `blocked`: other cases preventing a successful fetch, including robots rules,
+  HTTP errors, invalid input, and TLS errors.
+
+Read `status`, `http_status`, and `notes` for the precise reason. Do not interpret
+the coarse `blocked` value as proof that the owner deliberately blocked you.
+
+### Output fields
+
+| Field | Meaning |
+| --- | --- |
+| `input_url` | The supplied domain or URL. |
+| `final_url` | The final or last attempted page URL. |
+| `status` | Detection outcome described above. |
+| `fetch_status` | Coarse fetch outcome described above. |
+| `http_status` | Last page HTTP status, or null/blank if unavailable. |
+| `wordpress_version` | Explicit WordPress generator version, or an empty string. Conflicting versions are left blank and noted. |
+| `php_version` | Explicit `PHP/version` from `X-Powered-By`, or an empty string. |
+| `server` | Public `Server` header. |
+| `powered_by` | Public `X-Powered-By` header. |
+| `title` | HTML page title, limited to 500 characters. |
+| `evidence` | The WordPress markers actually observed. |
+| `asset_version_hints` | Asset `?ver=` values; these are **not confirmed WordPress versions**. |
+| `notes` | Restrictions, uncertainty, truncation, or error details. |
+| `checked_at` | Check start time in UTC ISO 8601 format. |
+
+JSON preserves arrays in the three evidence/note fields. CSV joins array values
+with ` | ` and prefixes potentially dangerous spreadsheet-formula strings with
+an apostrophe. Empty version strings mean "not disclosed", not version zero.
+
+Version strings and headers are server/page disclosures, not independently
+verified runtime versions. In particular, an asset's `ver` parameter can refer
+to a theme, plugin, or cache key. A `Server` header naming a platform does not
+prove which programming language runs behind it.
+
+## What gets requested
+
+1. Normalize and validate the supplied HTTP(S) URL.
+2. Fetch the origin's `/robots.txt` and evaluate applicable rules.
+3. If permitted, GET the supplied page, checking robots policy at redirect destinations.
+4. Inspect response headers and HTML already returned. Linked scripts, images,
+   stylesheets, and API endpoints are **not fetched**.
+
+Robots rules support user-agent groups, `Allow`/`Disallow`, wildcards, end anchors,
+and common `Crawl-delay`/`Request-rate` hints. A longer matching path wins, with
+`Allow` breaking equal-length ties. Policies are cached per origin during a run.
+This is a practical, conservative parser, not a claim of full RFC certification.
+
+- A missing policy with HTTP 404/410 permits a page check. Other unsuccessful
+  policy responses stop it. HTML masquerading as robots.txt also stops it.
+- Same-origin robots redirects and same-host `www`/HTTPS canonical redirects
+  to `/robots.txt` are supported. Other cross-origin robots redirects stop.
+- Page redirects are limited to five hops. HTTPS-to-HTTP downgrades stop.
+- HTTP 401/403/407/429/451 page responses stop without an automatic retry.
+- Policies requiring more than 60 seconds between requests are recorded as
+  blocked; the page is skipped rather than ignoring the delay.
+- Each page read is limited to 2 MiB; robots.txt is limited to 512 KiB.
+- Gzip/Brotli decoding is not implemented. The checker requests identity encoding
+  and reports unsupported encodings as inconclusive or blocked.
+
+## Limitations and responsible use
+
+Use the checker only where the site's terms and your authorization permit
+these public requests. Robots.txt expresses crawling preferences; a missing or
+permissive file is not independent authorization.
+
+This tool does not execute JavaScript, log in, test vulnerabilities, enumerate
+plugins, probe PHP-info/readme/admin endpoints, or bypass access controls. Hidden
+markers and bot challenges returning HTTP 200 can produce inconclusive results.
+
+The program permits arbitrary HTTP(S) hosts, including local addresses. It is
+intended as a local CLI/library. Do not expose it as an unauthenticated web
+service accepting arbitrary URLs without adding appropriate network controls.
+
+Requests can reach the named websites and configured system proxies. Results may
+contain public URLs, titles, and headers. There is no built-in telemetry or
+upload destination; avoid committing real target lists or scan results.
+
+## Python use
+
+```python
+from dataclasses import asdict
+from wordpress_check import Checker
+
+checker = Checker(timeout=15, delay=1, contact="https://your-domain.example/contact")
+result = checker.check("https://example.com/")
+print(asdict(result))
+```
+
+Reuse a `Checker` instance to preserve policy caches and pacing across requests.
+The instance is not designed for concurrent use. Python callers can change
+`max_crawl_delay` (default 60 seconds); increasing it can mean long waits.
+Do not use `request()` directly to bypass the policy checks in `check()`.
+
+## File handling and exit codes
+
+Results are flushed after each website. CSV retains completed rows after an
+interruption; JSON can be left without its closing bracket. There is no automatic
+resume or retry. Preserve any partial result file before rerunning with the same
+`--output` path, because the CLI opens it for replacement.
+
+Exit code `0` means the run completed, not that every website was reachable or
+identified. Inspect each result's status. Argument/input-file errors exit with
+code `2`. Unexpected I/O errors may raise a Python exception.
+
+## Tests and contributing
+
+```sh
+python -m unittest -v
+```
+
+Tests use fixtures, mocks, and an ephemeral local HTTP server. They do not scan
+external websites. GitHub Actions tests Python 3.10 and 3.14 on Linux and Windows.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
+[SECURITY.md](SECURITY.md) for reporting a security issue in this checker.
+
+The WordPress REST marker follows WordPress's documented
+[discovery mechanism](https://developer.wordpress.org/rest-api/using-the-rest-api/discovery/).
+
+## License
+
+[MIT](LICENSE).
