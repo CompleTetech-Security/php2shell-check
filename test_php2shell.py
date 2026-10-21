@@ -34,7 +34,7 @@ class VersionAssessmentTests(unittest.TestCase):
 
     def test_vendor_backport_cannot_be_judged_by_base_version(self):
         # Ubuntu lists the first package below as a fix despite its older base.
-        for version in ['8.3.6-0ubuntu0.24.04.13', '8.2.29-1+deb12u1', '8.3.36-1', '8.5.12+vendor']:
+        for version in ['8.3.6-0ubuntu0.24.04.13', '8.2.29-1+deb12u1', '8.3.36-1', '8.5.12+vendor', '8.3.36+arch1']:
             with self.subTest(version=version):
                 result = assess_php2shell(version)
                 self.assertEqual(result['php2shell_status'], 'unknown')

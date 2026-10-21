@@ -84,7 +84,7 @@ def assess_php2shell(php_version="", *, version_candidates=None, php_hint=False)
     fixed = f"{major}.{minor}.{fixed_patch}"
     result["php2shell_fixed_version"] = fixed
     if suffix:
-        prerelease = re.search(r"(?:dev|alpha|beta|rc)", suffix, re.I)
+        prerelease = re.search(r"(?:^|[-+._~])(?:dev|alpha|beta|rc)(?:\d|[-._]|$)", suffix, re.I)
         result["php2shell_version_status"] = "prerelease_unverified" if prerelease else "vendor_build_unverified"
         result["php2shell_notes"].append(
             f"PHP {version} contains a build qualifier. Confirm the exact vendor package; its upstream base alone cannot establish patch status."
