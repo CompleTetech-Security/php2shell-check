@@ -1,24 +1,57 @@
-# SiteSignal
+# PHP2Shell Check
 
-[![Tests](https://github.com/CompleteDotTech/site-signal/actions/workflows/tests.yml/badge.svg)](https://github.com/CompleteDotTech/site-signal/actions/workflows/tests.yml)
+[![Tests](https://github.com/CompleteDotTech/php2shell-check/actions/workflows/tests.yml/badge.svg)](https://github.com/CompleteDotTech/php2shell-check/actions/workflows/tests.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A **single-file, dependency-free Python CLI** that checks public web pages for
-WordPress indicators and records openly disclosed WordPress/PHP versions and
-server headers. It checks robots.txt first, limits requests, and explains
-inconclusive results.
+A **single-file, dependency-free Python CLI** for passive PHP2Shell exposure
+triage: **CVE-2026-109618 and CVE-2026-109619**. It compares publicly advertised
+PHP versions with the official upstream fix thresholds and preserves the
+existing WordPress detection and server-header diagnostics.
 
-**Technology detection is not a vulnerability assessment.** A WordPress marker
-or a version string does not establish that a website is vulnerable.
+**Potential exposure is not confirmed exploitability.** The checker sends no
+exploit payloads and cannot establish a server's SAPI, exact package build,
+vendor backports, or actual patch status from headers alone.
+
+## PHP2Shell results
+
+Every website result includes `php2shell_status`:
+
+| Value | Meaning |
+| --- | --- |
+| `potentially_affected` | A complete, unqualified PHP version is advertised below its branch's upstream fix. Administrator review is needed. |
+| `fixed_version_reported` | The advertised version meets its branch's upstream fix threshold. This is not verified runtime or package state. |
+| `unknown` | Version hidden, partial, conflicting, pre-release, vendor-qualified, or outside the covered branches. |
+
+The version table was checked on **2026-10-21** against the two PHP project
+advisories: [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
+and [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp).
+
+| Upstream branch | Fix for both CVEs |
+| --- | --- |
+| 8.2 | 8.2.35 |
+| 8.3 | 8.3.36 |
+| 8.4 | 8.4.27 |
+| 8.5 | 8.5.12 |
+
+A bare `8.3.35` yields `potentially_affected`; `8.3.36` yields
+`fixed_version_reported`. A package such as `8.3.6-0ubuntu0.24.04.13` yields
+`unknown`: distributions can backport the fixes without adopting the new
+upstream base version. See [Ubuntu's advisory](https://ubuntu.com/security/notices/USN-8948-1).
+
+Older and future branches require vendor review. The rule snapshot is embedded
+in the script; it is not updated from the internet automatically. See the
+[assessment methodology](docs/PHP2SHELL.md) for the complete interpretation.
 
 ## Features
 
 - Check one website or a text file containing multiple domains/URLs.
+- Assess both PHP2Shell CVEs using a dated, source-linked upstream version table.
 - Detect WordPress generator metadata, REST API discovery links, and familiar
   WordPress asset paths.
 - Record WordPress versions only when explicitly disclosed in generator metadata.
-- Record PHP versions only when explicitly disclosed in `X-Powered-By`.
+- Record PHP versions explicitly disclosed in `X-Powered-By` or `Server`,
+  retaining qualifiers and detecting conflicting versions.
 - Include the page title, final URL, HTTP status, `Server`, `X-Powered-By`,
   timestamp, evidence, and explanatory notes.
 - Export CSV or JSON; report progress separately on stderr.
@@ -32,13 +65,14 @@ Python **3.10 or newer**, on Windows, macOS, or Linux. No `pip install`, API key
 browser, database, or third-party Python package is required.
 
 ```sh
-git clone https://github.com/CompleteDotTech/site-signal.git
-cd site-signal
+git clone https://github.com/CompleteDotTech/php2shell-check.git
+cd php2shell-check
 python wordpress_check.py --help
 ```
 
 On systems where Python is named `python3`, substitute `python3` in these
 commands. You can also copy just `wordpress_check.py` to another directory.
+The script filename and default User-Agent are retained for compatibility.
 
 ## Quick start
 
@@ -145,7 +179,7 @@ the coarse `blocked` value as proof that the owner deliberately blocked you.
 | `fetch_status` | Coarse fetch outcome described above. |
 | `http_status` | Last page HTTP status, or null/blank if unavailable. |
 | `wordpress_version` | Explicit WordPress generator version, or an empty string. Conflicting versions are left blank and noted. |
-| `php_version` | Explicit `PHP/version` from `X-Powered-By`, or an empty string. |
+| `php_version` | Explicit `PHP/version` from `X-Powered-By` or `Server`; blank if missing or conflicting. |
 | `server` | Public `Server` header. |
 | `powered_by` | Public `X-Powered-By` header. |
 | `title` | HTML page title, limited to 500 characters. |
@@ -153,8 +187,19 @@ the coarse `blocked` value as proof that the owner deliberately blocked you.
 | `asset_version_hints` | Asset `?ver=` values; these are **not confirmed WordPress versions**. |
 | `notes` | Restrictions, uncertainty, truncation, or error details. |
 | `checked_at` | Check start time in UTC ISO 8601 format. |
+| `php_version_candidates` | All distinct PHP versions found in the inspected headers. |
+| `php_evidence` | The public headers providing PHP-related indicators. |
+| `php2shell_status` | `potentially_affected`, `fixed_version_reported`, or `unknown`. |
+| `php2shell_version_status` | Specific version interpretation; see the methodology. |
+| `php2shell_fixed_version` | Upstream fix threshold for the reported branch, if covered. |
+| `php2shell_exploitability` | Always `not_tested`; no remote-code-execution confirmation is attempted. |
+| `php2shell_cves` | The two CVE identifiers covered by this assessment. |
+| `php2shell_rules_as_of` | Date the embedded rule snapshot was checked. |
+| `php2shell_sources` | Official PHP advisories and the vendor-backport reference. |
+| `php2shell_notes` | Evidence limits and the reason for this interpretation. |
+| `php2shell_recommendation` | Administrator review or patch-verification guidance. |
 
-JSON preserves arrays in the three evidence/note fields. CSV joins array values
+JSON preserves arrays in the evidence, version-candidate, CVE, source, and note fields. CSV joins array values
 with ` | ` and prefixes potentially dangerous spreadsheet-formula strings with
 an apostrophe. Empty version strings mean "not disclosed", not version zero.
 
@@ -194,7 +239,7 @@ Use the checker only where the site's terms and your authorization permit
 these public requests. Robots.txt expresses crawling preferences; a missing or
 permissive file is not independent authorization.
 
-This tool does not execute JavaScript, log in, test vulnerabilities, enumerate
+This tool does not execute JavaScript, log in, send exploit probes, enumerate
 plugins, probe PHP-info/readme/admin endpoints, or bypass access controls. Hidden
 markers and bot challenges returning HTTP 200 can produce inconclusive results.
 
@@ -241,6 +286,9 @@ python -m unittest -v
 
 Tests use fixtures, mocks, and an ephemeral local HTTP server. They do not scan
 external websites. GitHub Actions tests Python 3.10 and 3.14 on Linux and Windows.
+The PHP2Shell tests include every supported branch's release boundary, vendor
+backports, pre-releases, hidden/conflicting versions, and proof that the
+assessment does not add network requests.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
 [SECURITY.md](SECURITY.md) for reporting a security issue in this checker.
 

@@ -17,6 +17,10 @@ scope, TLS verification, robots checks, descriptive User-Agent, request limits,
 and explicit uncertainty. Do not turn an absent marker or a version disclosure
 into an unsupported vulnerability claim.
 
+PHP2Shell rules must cite official advisories and include branch-specific
+boundary tests. Keep build qualifiers and vendor-backport uncertainty intact.
+The assessment must not add HTTP requests or exploit payloads.
+
 Add focused regression tests for behavior changes. Prefer local HTTP fixtures
 and mocks; automated tests must not contact external websites. If a case depends
 on a real response, reduce it to a small, synthetic fixture without personal

@@ -13,7 +13,8 @@ reproducing a report. No response-time guarantee is made.
 
 ## Findings about a website
 
-This repository does not assess vulnerabilities in websites. WordPress, PHP,
+This repository performs passive version-based PHP2Shell exposure triage.
+It does not execute exploits or confirm vulnerabilities in websites. WordPress, PHP,
 or version detection alone is not a confirmed security finding. Direct any
 supported website-specific report to that site's published security contact
 or disclosure program rather than publishing its details in this repository.
