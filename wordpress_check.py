@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Conservative, public-page WordPress detection. Python 3.10+."""
+"""Passive PHP2Shell exposure checks and WordPress detection. Python 3.10+."""
 
 from __future__ import annotations
 
@@ -25,6 +25,94 @@ BOT = "WordPressPublicChecker"
 REDIRECTS = {301, 302, 303, 307, 308}
 MAX_BODY = 2 * 1024 * 1024
 MAX_ROBOTS = 512 * 1024
+PHP2SHELL_RULES_DATE = "2026-10-21"
+PHP2SHELL_CVES = ("CVE-2026-109618", "CVE-2026-109619")
+PHP2SHELL_FIXES = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
+PHP2SHELL_SOURCES = (
+    "https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w",
+    "https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp",
+    "https://ubuntu.com/security/notices/USN-8948-1",
+)
+
+
+def assess_php2shell(php_version="", *, version_candidates=None, php_hint=False):
+    """Assess advertised upstream release numbers, never exploitability.
+
+    This is offline: no HTTP requests, probes, or payloads are sent. The fixed
+    release table is a dated snapshot, not a live vulnerability feed.
+    """
+    values = version_candidates if version_candidates is not None else [php_version]
+    versions = sorted({str(value).strip() for value in values if value and str(value).strip()})
+    result = {
+        "php2shell_status": "unknown",
+        "php2shell_version_status": "version_not_disclosed",
+        "php2shell_fixed_version": "",
+        "php2shell_exploitability": "not_tested",
+        "php2shell_cves": list(PHP2SHELL_CVES),
+        "php2shell_rules_as_of": PHP2SHELL_RULES_DATE,
+        "php2shell_sources": list(PHP2SHELL_SOURCES),
+        "php2shell_notes": [
+            "Passive metadata only. Runtime SAPI, vendor backports, configuration, and exploitability are not verified."
+        ],
+        "php2shell_recommendation": "Ask the site administrator to verify the deployed PHP package and applicable vendor security updates.",
+    }
+    if not versions:
+        result["php2shell_notes"].append(
+            "A PHP-related indicator was observed, but no complete PHP version was disclosed."
+            if php_hint else "No public PHP version was disclosed; lack of a header does not establish that PHP is absent."
+        )
+        return result
+    if len(versions) > 1:
+        result["php2shell_version_status"] = "conflicting_versions"
+        result["php2shell_notes"].append("Conflicting PHP versions: " + ", ".join(versions))
+        return result
+    version = versions[0]
+    match = None if len(version) > 128 else re.fullmatch(r"(\d+)\.(\d+)\.(\d+)([A-Za-z0-9.+_~:-]*)", version)
+    if not match:
+        result["php2shell_version_status"] = "unrecognized_or_partial_version"
+        result["php2shell_notes"].append(f"Cannot safely compare PHP version {version[:128]!r} with the upstream release table.")
+        return result
+    major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
+    suffix = match.group(4)
+    fixed_patch = PHP2SHELL_FIXES.get((major, minor))
+    if fixed_patch is None:
+        result["php2shell_version_status"] = "branch_requires_vendor_review"
+        result["php2shell_notes"].append(
+            f"PHP {major}.{minor} is outside this rule snapshot's upstream 8.2-8.5 fix table. No safety conclusion is made."
+        )
+        return result
+    fixed = f"{major}.{minor}.{fixed_patch}"
+    result["php2shell_fixed_version"] = fixed
+    if suffix:
+        prerelease = re.search(r"(?:^|[-+._~])(?:dev|alpha|beta|rc)(?:\d|[-._]|$)", suffix, re.I)
+        result["php2shell_version_status"] = "prerelease_unverified" if prerelease else "vendor_build_unverified"
+        result["php2shell_notes"].append(
+            f"PHP {version} contains a build qualifier. Confirm the exact vendor package; its upstream base alone cannot establish patch status."
+        )
+        return result
+    if patch < fixed_patch:
+        result["php2shell_status"] = "potentially_affected"
+        result["php2shell_version_status"] = "below_upstream_fix"
+        result["php2shell_notes"].append(f"Advertised PHP {version} is older than the {fixed} upstream fix for both listed CVEs.")
+        result["php2shell_recommendation"] = (
+            f"Prioritize administrator review. Verify vendor backports and the actual runtime; install the vendor security update or upstream PHP {fixed} or newer in this branch."
+        )
+    else:
+        result["php2shell_status"] = "fixed_version_reported"
+        result["php2shell_version_status"] = "at_or_above_upstream_fix"
+        result["php2shell_notes"].append(f"Advertised PHP {version} is at or above the {fixed} upstream fix. This is not a verified clean bill of health.")
+        result["php2shell_recommendation"] = "Confirm that the advertised version is the deployed, patched runtime and follow the current vendor advisory."
+    return result
+
+
+def annotate_php2shell(result):
+    assessment = assess_php2shell(
+        result.php_version,
+        version_candidates=result.php_version_candidates or None,
+        php_hint=bool(result.php_evidence) or result.status in {"wordpress", "likely_wordpress"},
+    )
+    for name, value in assessment.items():
+        setattr(result, name, value)
 
 
 class CheckStopped(Exception):
@@ -151,6 +239,17 @@ class Result:
     asset_version_hints: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     checked_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    php_version_candidates: list[str] = field(default_factory=list)
+    php_evidence: list[str] = field(default_factory=list)
+    php2shell_status: str = "unknown"
+    php2shell_version_status: str = "version_not_disclosed"
+    php2shell_fixed_version: str = ""
+    php2shell_exploitability: str = "not_tested"
+    php2shell_cves: list[str] = field(default_factory=lambda: list(PHP2SHELL_CVES))
+    php2shell_rules_as_of: str = PHP2SHELL_RULES_DATE
+    php2shell_sources: list[str] = field(default_factory=lambda: list(PHP2SHELL_SOURCES))
+    php2shell_notes: list[str] = field(default_factory=list)
+    php2shell_recommendation: str = ""
 
 
 class PageParser(HTMLParser):
@@ -184,14 +283,20 @@ class PageParser(HTMLParser):
             self.title_parts.append(data)
 
 
-def inspect_page(response: Response, result: Result) -> None:
+def _inspect_page(response: Response, result: Result) -> None:
     result.http_status = response.status
     result.fetch_status = "ok" if 200 <= response.status < 300 else "blocked"
     result.server = response.headers.get("server", "")
     result.powered_by = response.headers.get("x-powered-by", "")
-    php = re.search(r"\bPHP/([0-9]+(?:\.[0-9]+)*(?:[-+._a-zA-Z0-9]*)?)", result.powered_by, re.I)
-    if php:
-        result.php_version = php.group(1)
+    candidates = set()
+    for header, value in (("X-Powered-By", result.powered_by), ("Server", result.server)):
+        if re.search(r"\bPHP\b", value, re.I):
+            result.php_evidence.append(f"{header}: {value}")
+        candidates.update(re.findall(r"\bPHP/([0-9][A-Za-z0-9.+_~:-]*)(?=$|[\s,;()])", value, re.I))
+    result.php_version_candidates = sorted(candidates)
+    result.php_version = next(iter(candidates)) if len(candidates) == 1 else ""
+    if len(candidates) > 1:
+        result.notes.append("Conflicting PHP versions in public headers; patch status is unknown.")
     if response.status in {401, 403, 407, 429, 451}:
         result.status = "blocked"
         result.notes.append(f"HTTP {response.status}; access restriction or rate limit. No retry.")
@@ -242,6 +347,13 @@ def inspect_page(response: Response, result: Result) -> None:
         result.notes.append("No public WordPress markers found; this does not establish that WordPress is absent.")
     if result.php_version or result.wordpress_version:
         result.notes.append("Versions are server/page disclosures, not independently verified runtime versions.")
+
+
+def inspect_page(response: Response, result: Result) -> None:
+    try:
+        _inspect_page(response, result)
+    finally:
+        annotate_php2shell(result)
 
 
 class Checker:
@@ -357,6 +469,8 @@ class Checker:
             elif isinstance(cause, socket.gaierror):
                 result.fetch_status = "dns_error"
             result.notes.append(str(exc))
+        finally:
+            annotate_php2shell(result)
         return result
 
 
