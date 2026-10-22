@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-CompleteTech-Commercial
+# Copyright (c) 2026 CompleteTech LLC. See LICENSING.md.
 """Passive PHP2Shell exposure checks and WordPress detection. Python 3.10+."""
 
 from __future__ import annotations

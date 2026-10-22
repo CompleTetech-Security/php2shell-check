@@ -7,7 +7,7 @@
   <a href="https://github.com/CompleteTech-LLC/php2shell-check/releases"><img src="https://img.shields.io/github/v/release/CompleteTech-LLC/php2shell-check?color=1E3A8A" alt="Release"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-1E3A8A" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/dependencies-none-067647" alt="No dependencies">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-64748B" alt="MIT License"></a>
+  <a href="LICENSING.md"><img src="https://img.shields.io/badge/license-AGPL--3.0%20%7C%20commercial-64748B" alt="AGPL-3.0 or commercial license"></a>
 </p>
 
 <p align="center">
@@ -84,7 +84,7 @@ python -m unittest -v      # local-only tests; no external websites are contacte
 
 ## License
 
-Code is [MIT](LICENSE). The CompleteTech LLC name and logo are not covered by the MIT License; see [BRAND_ASSETS.md](BRAND_ASSETS.md).
+Dual licensed. It's free under [AGPL-3.0](LICENSE) for research, education, and open-source use. A [commercial license](LICENSING.md#commercial-license) is available for closed-source products and hosted services that don't publish their source. See [LICENSING.md](LICENSING.md) for details. Releases up to v1.0.0 remain MIT. The CompleteTech LLC name and logo are covered by neither license; see [BRAND_ASSETS.md](BRAND_ASSETS.md).
 
 <p align="center">
   <a href="https://complete.tech"><img src="assets/logo.png" alt="CompleteTech LLC" width="160"></a><br>
