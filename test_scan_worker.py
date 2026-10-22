@@ -631,11 +631,11 @@ if host == "security.example.test":
         raise SystemExit(2)
 if host == "admit.example.test":
     channel = socket.socket(fileno=int(os.environ["CT_ADMISSION_FD"]))
-    channel.sendall(b'{{"op":"admit","kind":"http"}}\\n')
+    channel.sendall(b'{{"op":"admit","kind":"http","n":1}}\\n')
     reply = b""
     while not reply.endswith(b"\\n"):
         reply += channel.recv(64)
-    channel.sendall(b'{{"op":"done"}}\\n')
+    channel.sendall(b'{{"op":"done","n":1}}\\n')
     result["notes"] = ["child_uid=" + str(os.geteuid()), "admission_ok=" + str(json.loads(reply)["ok"]).lower()]
 sys.stdout.write(json.dumps({{"ok":True,"result":result}}, separators=(",", ":")) + "\\n")
 '''
