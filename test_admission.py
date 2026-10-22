@@ -327,13 +327,28 @@ class PumpStateMachineTests(unittest.TestCase):
     def test_a_second_admission_while_one_is_outstanding_kills_the_scanner(self):
         harness = _PumpHarness(self, _ScriptGate(admit=[_grant(), _grant()]))
         self.assertEqual(harness.child_admit()[0], {"ok": True})
-        harness.child_sock.sendall(b'{"op":"admit","kind":"http"}\n')
+        harness.child_sock.sendall(b'{"op":"admit","kind":"http","n":2}\n')
         self.assertTrue(__import__("select").select([harness.parent], [], [], 1)[0])
         self.assertEqual(harness.pump.service(), "admission_protocol_violation")
         self.assertEqual(harness.pump.grants, 1)
 
     def test_malformed_messages_are_protocol_violations(self):
-        for raw in (b"done\n", b'{"op":"done"}\n', b'{"op":"admit"}\n', b'{"op":"admit","kind":"tls"}\n', b'{"op":"admit","kind":"http","x":1}\n', b"[]\n", b"\xff\n", b"x" * 400 + b"\n", b"x" * 300):
+        for raw in (
+            b"done\n",
+            b'{"op":"done"}\n',
+            b'{"op":"done","n":1}\n',
+            b'{"op":"admit","kind":"http"}\n',
+            b'{"op":"admit","kind":"tls","n":1}\n',
+            b'{"op":"admit","kind":"http","n":1,"x":1}\n',
+            b'{"op":"admit","kind":"http","n":2}\n',
+            b'{"op":"admit","kind":"http","n":0}\n',
+            b'{"op":"admit","kind":"http","n":true}\n',
+            b'{"op":"admit","kind":"http","n":"1"}\n',
+            b"[]\n",
+            b"\xff\n",
+            b"x" * 400 + b"\n",
+            b"x" * 300,
+        ):
             with self.subTest(raw=raw[:20]):
                 harness = _PumpHarness(self, _ScriptGate(admit=[_grant()]))
                 harness.child_sock.sendall(raw)
@@ -360,15 +375,64 @@ class PumpStateMachineTests(unittest.TestCase):
         self.assertEqual(harness.pump.tick(), "request_deadline_exceeded")
 
     def test_probe_refusal_is_fatal_but_an_unreachable_guard_is_not_by_itself(self):
+        self.assertLessEqual(admission.PROBE_INTERVAL_SECONDS, 2.0, "cancellation must be noticed within a couple of seconds")
         clock = _Clock()
         gate = _ScriptGate(probe=[AdmissionDenied("guard_unavailable"), AdmissionDenied("job_cancelled")])
         harness = _PumpHarness(self, gate, monotonic=clock)
+        self.assertIsNone(harness.pump.tick(), "no probe before the interval")
+        self.assertEqual(gate.probes, 0)
         clock.now += admission.PROBE_INTERVAL_SECONDS + 0.01
         self.assertIsNone(harness.pump.tick())
+        harness.pump.wait_probe()
+        self.assertIsNone(harness.pump.tick(), "an unreachable guard alone does not kill the admitted request")
         self.assertEqual(gate.probes, 1)
-        self.assertIsNone(harness.pump.tick(), "probes are paced")
         clock.now += admission.PROBE_INTERVAL_SECONDS + 0.01
+        harness.pump.tick()
+        harness.pump.wait_probe()
         self.assertEqual(harness.pump.tick(), "admission_job_cancelled")
+
+    def test_a_disabled_integration_is_a_refusal_that_stops_the_scanner(self):
+        clock = _Clock()
+        gate = _ScriptGate(probe=[AdmissionDenied("integration_disabled")])
+        harness = _PumpHarness(self, gate, monotonic=clock)
+        clock.now += admission.PROBE_INTERVAL_SECONDS + 0.01
+        harness.pump.tick()
+        harness.pump.wait_probe()
+        self.assertEqual(harness.pump.tick(), "admission_integration_disabled")
+        down = parse_refusal(APIError("api_http_503", status=503, payload={"error": "ct_scan_disabled"}))
+        self.assertEqual(down.slug, "integration_disabled")
+
+    def test_a_slow_probe_never_blocks_the_in_flight_deadline(self):
+        clock = _Clock()
+        release = threading.Event()
+
+        class Slow(_ScriptGate):
+            def probe(self):
+                release.wait(5)
+
+        harness = _PumpHarness(self, Slow(admit=[_grant(timeout=10.0)]), monotonic=clock)
+        self.assertEqual(harness.child_admit()[0], {"ok": True})
+        clock.now += admission.PROBE_INTERVAL_SECONDS + 0.01
+        started = time.monotonic()
+        self.assertIsNone(harness.pump.tick())
+        self.assertLess(time.monotonic() - started, 1.0, "tick() waited on the guard")
+        clock.now += 20
+        self.assertEqual(harness.pump.tick(), "request_deadline_exceeded")
+        release.set()
+        harness.pump.wait_probe()
+
+    def test_a_grant_that_aged_past_its_lifetime_while_the_supervisor_waited_is_not_delivered(self):
+        clock = _Clock()
+
+        class Slow(_ScriptGate):
+            def admit(self):
+                clock.now += 1.5  # the guard call took longer than the grant lives
+                return Grant(1, 1.0, 10.0, 19, issued_at=1000.0)
+
+        harness = _PumpHarness(self, Slow(), monotonic=clock)
+        outcome, fatal = harness.child_admit()
+        self.assertEqual((outcome, fatal), ({"refused": "admission_expired"}, "admission_expired"))
+        self.assertFalse(harness.pump.inflight)
 
     def test_unreachable_guard_fails_the_next_admission_closed(self):
         class Down(_ScriptGate):
@@ -379,6 +443,20 @@ class PumpStateMachineTests(unittest.TestCase):
         harness = _PumpHarness(self, Down())
         outcome, fatal = harness.child_admit()
         self.assertEqual((outcome, fatal), ({"refused": "guard_unavailable"}, "admission_guard_unavailable"))
+
+    def test_a_guard_call_that_overruns_its_budget_is_a_refusal(self):
+        release = threading.Event()
+
+        class Hang:
+            def admit(self, claim, kind):
+                release.wait(5)
+
+        gate = AdmissionGate(Hang(), _claim(expires_at=NOW + 7200), clock=lambda: NOW)
+        with mock.patch.object(admission, "CALL_BUDGET_SECONDS", 0.1):
+            with self.assertRaises(AdmissionDenied) as denied:
+                gate.admit()
+        release.set()
+        self.assertEqual(denied.exception.slug, "guard_timeout")
 
     def test_peer_close_is_remembered_without_spinning(self):
         harness = _PumpHarness(self, _ScriptGate())
@@ -395,13 +473,23 @@ class ChildAdmissionTests(unittest.TestCase):
         self.addCleanup(self.child.close)
         self.client = ChildAdmission(self.child, monotonic=self.clock)
 
-    def reply(self, value):
-        threading.Thread(target=lambda: (self.parent.recv(256), self.parent.sendall(value)), daemon=True).start()
+    def reply(self, value, *, number=None):
+        """Answer the next request. A dict gets the request's sequence number unless one is forced."""
+
+        def run():
+            request = json.loads(self.parent.recv(256).decode())
+            if isinstance(value, dict):
+                body = json.dumps(dict(value, n=request["n"] if number is None else number)).encode() + b"\n"
+            else:
+                body = value
+            self.parent.sendall(body)
+
+        threading.Thread(target=run, daemon=True).start()
 
     def test_connect_is_refused_without_a_grant_and_after_the_grant_goes_stale(self):
         with self.assertRaises(AdmissionRefused):
             self.client.ensure_fresh()
-        self.reply(b'{"ok":true,"valid_ms":1000}\n')
+        self.reply({"ok": True, "valid_ms": 1000})
         self.client.admit()
         self.clock.now += 0.5
         self.client.ensure_fresh()
@@ -411,25 +499,71 @@ class ChildAdmissionTests(unittest.TestCase):
         self.assertEqual(str(stale.exception), "admission_expired")
 
     def test_scanner_rejects_oversized_extended_or_garbled_replies(self):
-        for raw in (b'{"ok":true,"valid_ms":5000}\n', b'{"ok":true,"valid_ms":0}\n', b'{"ok":true,"valid_ms":1000,"x":1}\n', b'{"ok":true}\n', b'not json\n', b"[]\n", b"x" * 400 + b"\n"):
-            with self.subTest(raw=raw[:30]):
+        for raw in (
+            {"ok": True, "valid_ms": 5000},
+            {"ok": True, "valid_ms": 0},
+            {"ok": True, "valid_ms": 1000, "x": 1},
+            {"ok": True},
+            b"not json\n",
+            b"[]\n",
+            b"x" * 400 + b"\n",
+        ):
+            with self.subTest(raw=raw if isinstance(raw, dict) else raw[:30]):
+                parent, child = socket.socketpair()
+                self.addCleanup(parent.close)
+                client = ChildAdmission(child, monotonic=self.clock)
+                self.parent, self.child = parent, child
                 self.reply(raw)
                 with self.assertRaises(AdmissionRefused):
-                    self.client.admit()
+                    client.admit()
                 with self.assertRaises(AdmissionRefused):
-                    self.client.ensure_fresh()
+                    client.ensure_fresh()
 
-    def test_refusal_reason_is_surfaced_and_a_closed_channel_refuses(self):
-        self.reply(b'{"ok":false,"reason":"job_cancelled"}\n')
+    def test_a_reply_for_another_request_is_never_taken_as_the_answer(self):
+        # Desynchronisation: a stale grant arrives after the scanner gave up on its request.
+        self.reply({"ok": True, "valid_ms": 1000}, number=7)
+        with self.assertRaises(AdmissionRefused) as wrong:
+            self.client.admit()
+        self.assertEqual(str(wrong.exception), "admission_reply_invalid")
+        with self.assertRaises(AdmissionRefused):
+            self.client.admit()
+        with self.assertRaises(AdmissionRefused):
+            self.client.ensure_fresh()
+
+    def test_a_late_reply_after_a_timeout_cannot_satisfy_the_next_request(self):
+        timeline = iter([1000.0, 1100.0])
+
+        def fake_monotonic():
+            return next(timeline, 1100.0)
+
+        client = ChildAdmission(self.child, monotonic=fake_monotonic)
+        with self.assertRaises(AdmissionRefused) as timeout:
+            client.admit()
+        self.assertEqual(str(timeout.exception), "admission_timeout")
+        try:
+            self.parent.sendall(b'{"ok":true,"n":1,"valid_ms":1000}\n')  # the late answer
+        except OSError:
+            pass  # the poisoned scanner end is already closed: the answer has nowhere to land
+        with self.assertRaises(AdmissionRefused):
+            client.admit()
+        with self.assertRaises(AdmissionRefused):
+            client.ensure_fresh()
+
+    def test_refusal_reason_is_surfaced_and_is_final(self):
+        self.reply({"ok": False, "reason": "job_cancelled"})
         with self.assertRaises(AdmissionRefused) as refused:
             self.client.admit()
         self.assertEqual(str(refused.exception), "job_cancelled")
+        with self.assertRaises(AdmissionRefused):
+            self.client.admit()
+
+    def test_a_closed_channel_refuses(self):
         self.parent.close()
         with self.assertRaises(AdmissionRefused):
             self.client.admit()
 
     def test_a_second_admission_before_done_is_refused_in_the_scanner(self):
-        self.reply(b'{"ok":true,"valid_ms":1000}\n')
+        self.reply({"ok": True, "valid_ms": 1000})
         self.client.admit()
         with self.assertRaises(AdmissionRefused):
             self.client.admit()
@@ -572,8 +706,9 @@ class OpenerGuardTests(unittest.TestCase):
         checker = Checker(timeout=2, delay=0)
         checker.opener = PinnedOpener(_LocalScope(recorder.port), guard=_Guard(allow=0))
         with mock.patch.object(network, "_public_addresses", return_value=[(socket.AF_INET, "127.0.0.1")]):
-            result = checker.check("http://example.test/")
-        self.assertEqual(result.status, "error")
+            # Not swallowed into an ordinary fetch error: the refusal ends the run.
+            with self.assertRaises(AdmissionRefused):
+                checker.check("http://example.test/")
         self.assertEqual(recorder.requests, [])
 
 
@@ -594,6 +729,55 @@ class ScannerChannelTests(unittest.TestCase):
         self.assertGreaterEqual(duplicate, 3)
         with mock.patch.dict(os.environ, {"CT_ADMISSION_FD": str(duplicate)}):
             self.assertIsNone(scanner._admission_channel(), "a TCP socket is not the supervisor channel")
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "the scanner entry point requires Linux")
+class ScannerMainTests(unittest.TestCase):
+    """Drive the real scanner entry point, as the unprivileged child would run it."""
+
+    def run_main(self, env, target="https://example.test/"):
+        import io
+
+        from integrations.worker import scanner
+
+        stdout = io.BytesIO()
+
+        class Out:
+            buffer = stdout
+
+        class In:
+            buffer = io.BytesIO(json.dumps({"target": target}).encode())
+
+        with mock.patch.object(scanner.os, "geteuid", return_value=65534), mock.patch.object(scanner.sys, "stdin", In), mock.patch.object(
+            scanner.sys, "stdout", Out
+        ), mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            network, "_public_addresses", return_value=[(socket.AF_INET, "127.0.0.1")]
+        ):
+            code = scanner.main()
+        return code, json.loads(stdout.getvalue().decode())
+
+    def test_without_the_supervisor_channel_the_scanner_refuses_to_scan(self):
+        env = dict(os.environ)
+        env.pop("CT_ADMISSION_FD", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, output = self.run_main({})
+        self.assertEqual((code, output), (2, {"ok": False, "error": "admission_channel_unavailable"}))
+
+    def test_a_refused_admission_ends_the_run_as_a_failure_not_a_result(self):
+        parent, child = socket.socketpair()
+        self.addCleanup(parent.close)
+        fd = os.dup(child.fileno())
+        child.close()
+
+        def supervisor():
+            request = json.loads(parent.recv(256).decode())
+            parent.sendall(json.dumps({"ok": False, "n": request["n"], "reason": "job_cancelled"}).encode() + b"\n")
+
+        thread = threading.Thread(target=supervisor, daemon=True)
+        thread.start()
+        code, output = self.run_main({"CT_ADMISSION_FD": str(fd)})
+        thread.join(2)
+        self.assertEqual((code, output), (2, {"ok": False, "error": "admission_job_cancelled"}))
 
 
 # --- supervisor integration: a real child process, a local server, a flippable gate -----------

@@ -172,6 +172,18 @@ fclose( $pipes[1] );
 fclose( $pipes[2] );
 proc_close( $holder );
 
+// Operator revocation waits for an in-progress admission like a stop does, and then blocks admission.
+$job5b = ct_test_running_job( 'admit-revoke-wait.example.net' );
+$request_ids[] = $job5b['request_id'];
+$holder = proc_open( array( PHP_BINARY, __DIR__ . '/lock-holder.php', '1.3' ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $pipes, null, null );
+ct_test_assert( is_resource( $holder ) && "locked\n" === fgets( $pipes[1] ), 'The lock-holder helper did not acquire the queue lock for revocation.' );
+$started = microtime( true );
+ct_test_assert( true === ct_scan_admin_revoke( $job5b['job_id'] ) && microtime( true ) - $started > 0.3, 'Operator revocation did not wait for the in-progress lock holder.' );
+ct_test_assert( 410 === ct_test_admit( $job5b )->get_status(), 'A job was admitted after operator revocation that waited on the lock.' );
+fclose( $pipes[1] );
+fclose( $pipes[2] );
+proc_close( $holder );
+
 // Operator revocation behaves like a stop for admission.
 $job5 = ct_test_running_job( 'admit-revoked.example.net' );
 $request_ids[] = $job5['request_id'];
@@ -192,9 +204,53 @@ ct_test_assert( 200 === ct_test_admit( $job7 )->get_status(), 'Fixture admission
 $wpdb->update( $jobs, array( 'lease_until' => gmdate( 'Y-m-d H:i:s', time() - 2 ) ), array( 'job_id' => $job7['job_id'] ) );
 ct_test_age_admission( $job7['job_id'] );
 $lapsed = ct_test_admit( $job7 );
-ct_test_assert( 410 === $lapsed->get_status() && 1 === (int) ct_test_job_fields( $job7['job_id'] )->http_admitted && 'failed_unknown' === ct_test_job_fields( $job7['job_id'] )->status, 'A lapsed lease was admitted or its counters reset.' );
+ct_test_assert( 410 === $lapsed->get_status() && 'lease_invalid_or_expired' === $lapsed->get_data()['reason'] && 1 === (int) ct_test_job_fields( $job7['job_id'] )->http_admitted, 'A lapsed lease was admitted or its counters reset.' );
 $reclaim = ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() );
-ct_test_assert( null === $reclaim->get_data()['job'] && 1 === (int) ct_test_job_fields( $job7['job_id'] )->http_admitted, 'Recovery produced a fresh claim or budget for a started job.' );
+ct_test_assert( null === $reclaim->get_data()['job'] && 1 === (int) ct_test_job_fields( $job7['job_id'] )->http_admitted && 'failed_unknown' === ct_test_job_fields( $job7['job_id'] )->status, 'Recovery produced a fresh claim or budget for a started job, or did not close it.' );
+
+// Fault injection: a competing writer wins the reservation (the lock was lost) or the write throws.
+// The compare-and-set must refuse rather than overwrite, and an exception must refuse rather than grant.
+$job9 = ct_test_running_job( 'admit-fault.example.net' );
+$request_ids[] = $job9['request_id'];
+$raced = false;
+$competitor = static function ( $sql ) use ( &$raced, $jobs, $job9 ) {
+	global $wpdb;
+	if ( ! $raced && 0 === strpos( ltrim( $sql ), "UPDATE `{$jobs}` SET `http_admitted`" ) ) {
+		$raced = true;
+		$wpdb->query( $wpdb->prepare( "UPDATE {$jobs} SET http_admitted = 7 WHERE job_id = %d", $job9['job_id'] ) );
+	}
+	return $sql;
+};
+add_filter( 'query', $competitor );
+$lost = ct_test_admit( $job9 );
+remove_filter( 'query', $competitor );
+ct_test_assert( $raced && 503 === $lost->get_status() && 'admission_write_failed' === $lost->get_data()['reason'] && 7 === (int) ct_test_job_fields( $job9['job_id'] )->http_admitted, 'A lost reservation race was granted or overwritten.' );
+ct_test_age_admission( $job9['job_id'] );
+$wpdb->update( $jobs, array( 'http_admitted' => 0, 'last_admit_ms' => null ), array( 'job_id' => $job9['job_id'] ) );
+$thrower = static function ( $sql ) use ( $jobs ) {
+	if ( 0 === strpos( ltrim( $sql ), "UPDATE `{$jobs}` SET `http_admitted`" ) ) {
+		throw new RuntimeException( 'injected database fault' );
+	}
+	return $sql;
+};
+add_filter( 'query', $thrower );
+$faulted = ct_test_admit( $job9 );
+remove_filter( 'query', $thrower );
+ct_test_assert( 503 === $faulted->get_status() && 'admission_error' === $faulted->get_data()['reason'] && 0 === (int) ct_test_job_fields( $job9['job_id'] )->http_admitted, 'A database fault during admission did not fail closed.' );
+$wpdb->get_var( 'SELECT 1' );
+ct_test_assert( ct_scan_lock_acquire(), 'The queue lock was not released after a faulted admission.' );
+ct_scan_lock_release();
+ct_test_end_job( $job9['job_id'] );
+
+// Schema upgrade: a job already running when request counting appears gets no fresh budget.
+$job10 = ct_test_running_job( 'admit-upgrade.example.net' );
+$request_ids[] = $job10['request_id'];
+update_option( 'ct_scan_schema_version', '2', false );
+ct_scan_maybe_install_schema();
+ct_test_assert( get_option( 'ct_scan_schema_version' ) === CT_SCAN_SCHEMA_VERSION && 20 === (int) ct_test_job_fields( $job10['job_id'] )->http_admitted, 'The v2 to v3 upgrade gave a running job a fresh request budget.' );
+ct_test_age_admission( $job10['job_id'] );
+ct_test_assert( 409 === ct_test_admit( $job10 )->get_status(), 'A running job from before the upgrade was still admitted.' );
+ct_test_end_job( $job10['job_id'] );
 
 // Unavailable authorization store: a schema mismatch disables the whole worker API, including admission.
 $job8 = ct_test_running_job( 'admit-store.example.net' );
@@ -206,7 +262,7 @@ ct_test_assert( 503 === $unavailable->get_status() && 0 === (int) ct_test_job_fi
 ct_test_end_job( $job8['job_id'] );
 
 // Global operator kill switch: with the integration disabled, nothing is admitted.
-$disabled = proc_open( array( PHP_BINARY, __DIR__ . '/admission-disabled.php' ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $dpipes, null, array_merge( $_ENV, array( 'CT_TEST_ENABLED' => '0', 'WORDPRESS_DB_PASSWORD' => 'fixture-only', 'WORDPRESS_DB_HOST' => 'db', 'CT_TEST_WP_ROOT' => getenv( 'CT_TEST_WP_ROOT' ) ?: '/var/www/html', 'PATH' => getenv( 'PATH' ) ) ) );
+$disabled = proc_open( array( PHP_BINARY, __DIR__ . '/admission-disabled.php' ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $dpipes, null, array_merge( getenv(), array( 'CT_TEST_ENABLED' => '0', 'WORDPRESS_DB_PASSWORD' => 'fixture-only', 'WORDPRESS_DB_HOST' => 'db', 'CT_TEST_WP_ROOT' => getenv( 'CT_TEST_WP_ROOT' ) ?: '/var/www/html', 'PATH' => getenv( 'PATH' ) ) ) );
 $out = stream_get_contents( $dpipes[1] );
 $err = stream_get_contents( $dpipes[2] );
 proc_close( $disabled );

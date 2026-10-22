@@ -111,7 +111,8 @@ function ct_scan_nonces_table() {
 
 /** Create plugin tables once; MU plugins do not receive activation hooks. */
 function ct_scan_maybe_install_schema() {
-	if ( get_option( 'ct_scan_schema_version' ) === CT_SCAN_SCHEMA_VERSION ) {
+	$previous = get_option( 'ct_scan_schema_version' );
+	if ( $previous === CT_SCAN_SCHEMA_VERSION ) {
 		return;
 	}
 	global $wpdb;
@@ -183,6 +184,12 @@ function ct_scan_maybe_install_schema() {
 		if ( ! is_array( $found ) || array_diff( $columns, $found ) ) {
 			return;
 		}
+	}
+	if ( is_string( $previous ) && '' !== $previous && version_compare( $previous, '3', '<' ) ) {
+		// A job that started before request counting existed has no record of what it already
+		// sent: it gets no fresh budget, so its remaining admissions are refused.
+		$limits = ct_scan_profile_limits( ct_scan_current_profile() );
+		$wpdb->query( $wpdb->prepare( "UPDATE {$jobs} SET http_admitted = %d WHERE status = 'running'", (int) $limits['http_requests'] ) );
 	}
 	update_option( 'ct_scan_schema_version', CT_SCAN_SCHEMA_VERSION, false );
 }
@@ -1033,10 +1040,16 @@ function ct_scan_admit_locked( $data, $now_ms ) {
 	$refuse = static function ( $status, $reason, $extra = array() ) {
 		return array( (int) $status, array_merge( array( 'ok' => false, 'reason' => sanitize_key( $reason ) ), $extra ) );
 	};
-	ct_scan_maintenance_locked();
+	// No table-wide maintenance here: probes run every couple of seconds under the same
+	// lock as Stop, so this path stays short. Expiry and lease are checked on the row.
 	$row = ct_scan_row( $data['id'] );
 	if ( ! $row ) {
 		return $refuse( 410, 'job_not_found' );
+	}
+	if ( 'running' === $row->status && strtotime( $row->authorization_expires_at . ' UTC' ) <= time() ) {
+		$wpdb->update( $table, array( 'status' => 'expired', 'error_code' => 'authorization_expired', 'finished_at' => ct_scan_utc_now(), 'lease_hash' => null, 'lease_until' => null, 'confirmation_token_hash' => null ), array( 'job_id' => (int) $row->job_id, 'status' => 'running' ), array( '%s', '%s', '%s', '%s', '%s', '%s' ), array( '%d', '%s' ) );
+		ct_scan_mark_request_status( (int) $row->request_id, 'expired', 'authorization_expired' );
+		return $refuse( 410, 'job_expired' );
 	}
 	if ( 'cancelled' === $row->status ) {
 		return $refuse( 410, 'job_cancelled' );

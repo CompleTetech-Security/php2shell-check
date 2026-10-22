@@ -107,26 +107,41 @@ Enforcement in the supervisor and scanner:
 - No grant, no connection: the network adapter asks for admission after
   destination validation and before opening any socket, re-checks that the
   grant is under one second old immediately before connecting, and reports
-  completion. A scanner started without the supervisor socket refuses to run.
-- One grant is outstanding at a time. A second request, an unexpected message
-  or an oversized message ends the scan (`admission_protocol_violation`).
-- The supervisor measures the disclosed ten-second request bound from the
-  grant (plus one second of grace) and kills the scanner on overrun
+  completion. A scanner started without the supervisor socket refuses to run,
+  and a refused admission ends the run as a failure (`admission_<reason>`), not
+  as an ordinary fetch error.
+- Requests and replies on the socket carry a sequence number and any channel
+  error poisons the channel, so a late reply can never be read as the answer to
+  a later request. Every supervisor call to WordPress has a four-second wall
+  clock budget (a slower store is a refusal); one admission, including bounded
+  pacing and busy retries, takes at most about eight seconds.
+- The grant's one-second lifetime and ten-second request bound are measured
+  from just before the call WordPress granted, not from delivery to the
+  scanner. A grant that aged out while the supervisor waited is not delivered.
+- One grant is outstanding at a time. A second request, an out-of-sequence or
+  unexpected message or an oversized message ends the scan
+  (`admission_protocol_violation`).
+- The supervisor kills the scanner when a request is not reported finished
+  within the ten-second bound plus one second of grace
   (`request_deadline_exceeded`).
-- While the scanner runs, the supervisor probes the job about every two
-  seconds, including during backoff, and kills the scanner as soon as
-  WordPress reports that it is cancelled, expired or revoked. The abort is
-  therefore bounded by the probe interval plus the five-second probe timeout,
-  and by the ten-second request bound in any case.
-- An unreachable guard refuses the next admission (`admission_guard_unavailable`)
-  and does not extend the bound on a request already admitted. Expired
-  authorization is refused locally without a call.
+- While the scanner runs, the supervisor probes the job about every two seconds
+  on a separate thread (so a slow store cannot delay the deadline or the kill),
+  including during backoff, and kills the scanner as soon as WordPress reports
+  that the job is cancelled, expired or revoked, or that the integration is
+  disabled (the operator kill switch). Cancellation therefore aborts the one
+  admitted request within about two seconds plus the probe's own latency, and
+  never later than the ten-second bound. A probe that cannot reach WordPress
+  does not abort a request already admitted, and the next admission fails closed
+  (`admission_guard_unavailable`). Expired authorization is refused locally
+  without a call.
 - `SubprocessRunner.run` refuses to start without a gate.
 
 A refusal fails the run with an `admission_<reason>` category (for example
 `admission_job_cancelled`, `admission_budget_exhausted`). The result for a job
 already cancelled is rejected by WordPress as before. A budget or time stop is
-a failed receipt, never a clean result, and no automatic rescan follows.
+a failed receipt, never a clean result, and no automatic rescan follows. A job
+that was already running when the schema is upgraded to version 3 has no record
+of what it sent, so it receives no fresh budget (its admissions are refused).
 
 What this does not do: it cannot constrain a compromised scanner that ignores
 the protocol and opens its own sockets. The unprivileged UID and the
@@ -137,6 +152,9 @@ deny private, link-local and metadata ranges) is the necessary second boundary.
 responsibility. DNS lookups of the already authorized hostname happen before
 admission and are not treated as target requests. The supervisor therefore also
 enforces the deadline and the stop by killing the scanner's process group.
+Admission answers are protected by TLS to the fixed API origin but are not
+themselves signed; a party able to forge that TLS session could mint grants,
+which the egress boundary above still limits.
 
 Receipt retries stop at authorization expiry or one hour after lease expiry,
 whichever comes first. Permanent rejection keeps the receipt in the private

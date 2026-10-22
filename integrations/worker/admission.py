@@ -11,6 +11,10 @@ Fail-closed rules:
   violation or unavailable store is a refusal.
 * A grant is reserved and consumed in one step, is valid for at most
   ``MAX_VALID_SECONDS`` and covers exactly one connection and request.
+* Every supervisor call to WordPress has a hard wall-clock budget; a call that
+  overruns it is a refusal. Requests and replies on the scanner socket carry a
+  sequence number, and any channel error poisons the channel, so a late reply
+  can never be read as the answer to a later request.
 * Only one grant may be outstanding. The supervisor kills the scanner if a
   request is not reported finished within ``MAX_REQUEST_SECONDS`` (plus a short
   grace), if the scanner skips the protocol, or if WordPress reports that the
@@ -21,8 +25,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .protocol import APIError
 
@@ -32,6 +37,7 @@ MAX_REQUEST_SECONDS = 10.0
 REQUEST_GRACE_SECONDS = 1.0
 PROBE_INTERVAL_SECONDS = 2.0
 MAX_ADMIT_WAIT_SECONDS = 4.0
+CALL_BUDGET_SECONDS = 4.0
 BUSY_RETRY_SECONDS = 0.15
 MAX_MESSAGE_BYTES = 256
 CHILD_REPLY_TIMEOUT_SECONDS = 15.0
@@ -54,6 +60,9 @@ class Grant:
     valid_seconds: float
     timeout_seconds: float
     remaining: int
+    # Supervisor monotonic time just before the call that WordPress granted: the
+    # grant's one-second lifetime and ten-second bound are measured from here.
+    issued_at: float = 0.0
 
 
 def _is_int(value) -> bool:
@@ -81,6 +90,9 @@ def parse_grant(value) -> Grant:
 def parse_refusal(error: APIError) -> AdmissionDenied:
     """Turn a non-2xx answer into a refusal; unknown or malformed answers stay refusals."""
     payload = getattr(error, "payload", None)
+    if isinstance(payload, dict) and payload.get("error") == "ct_scan_disabled":
+        # The operator kill switch (or an incomplete schema upgrade): not merely "unreachable".
+        return AdmissionDenied("integration_disabled")
     reason = payload.get("reason") if isinstance(payload, dict) else None
     if not isinstance(reason, str) or not REASON_RE.fullmatch(reason):
         reason = "guard_unavailable"
@@ -114,21 +126,37 @@ class AdmissionGate:
             raise AdmissionDenied("authorization_expired")
 
     def _call(self, kind: str):
-        try:
-            response = self.api.admit(self.claim, kind)
-        except APIError as exc:
-            if exc.status is None:
-                raise AdmissionDenied("guard_unavailable") from exc
-            raise parse_refusal(exc) from exc
-        return response
+        """One WordPress call under a hard wall-clock budget (a slow store is a refusal)."""
+        box = {}
+
+        def run():
+            try:
+                box["value"] = self.api.admit(self.claim, kind)
+            except BaseException as exc:  # reported to the caller as a refusal below
+                box["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(CALL_BUDGET_SECONDS)
+        if worker.is_alive():
+            raise AdmissionDenied("guard_timeout")
+        error = box.get("error")
+        if isinstance(error, APIError):
+            if error.status is None:
+                raise AdmissionDenied("guard_unavailable") from error
+            raise parse_refusal(error) from error
+        if error is not None:
+            raise AdmissionDenied("guard_unavailable") from error
+        return box["value"]
 
     def admit(self) -> Grant:
         """Reserve exactly one request, or raise AdmissionDenied. Retries are bounded."""
         deadline = self._monotonic() + MAX_ADMIT_WAIT_SECONDS
         while True:
             self._check_local()
+            started = self._monotonic()
             try:
-                return parse_grant(self._call("http"))
+                return replace(parse_grant(self._call("http")), issued_at=started)
             except AdmissionDenied as denied:
                 if self._monotonic() >= deadline:
                     raise
@@ -152,6 +180,11 @@ class AdmissionPump:
 
     ``service`` and ``tick`` return a fatal reason slug when the scanner must be
     killed, and ``None`` otherwise. After a fatal reason the pump answers nothing.
+
+    Messages are single JSON lines: ``{"op":"admit","kind":"http","n":N}`` answered
+    by ``{"ok":true,"n":N,"valid_ms":M}`` or ``{"ok":false,"n":N,"reason":R}``, and
+    ``{"op":"done","n":N}``. ``N`` counts the scanner's admissions from 1 and must
+    advance by exactly one.
     """
 
     def __init__(self, sock, gate, *, monotonic=time.monotonic):
@@ -160,7 +193,11 @@ class AdmissionPump:
         self._monotonic = monotonic
         self._buffer = bytearray()
         self._inflight_until = None
+        self._inflight_n = None
+        self._last_n = 0
         self._last_probe = monotonic()
+        self._probe_thread = None
+        self._probe_result = None
         self.grants = 0
         self.fatal = None
         self.closed = False
@@ -188,26 +225,37 @@ class AdmissionPump:
             message = json.loads(line.decode("ascii"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return self._fail("admission_protocol_violation")
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or not _is_int(message.get("n")):
             return self._fail("admission_protocol_violation")
-        if message == {"op": "done"}:
-            if not self.inflight:
+        number = message["n"]
+        if set(message) == {"op", "n"} and message["op"] == "done":
+            if not self.inflight or number != self._inflight_n:
                 return self._fail("admission_protocol_violation")
             self._inflight_until = None
+            self._inflight_n = None
             return None
-        if message == {"op": "admit", "kind": "http"}:
-            if self.inflight:
-                # One connection at a time: a second grant is never available.
+        if set(message) == {"op", "kind", "n"} and message["op"] == "admit" and message["kind"] == "http":
+            if self.inflight or number != self._last_n + 1:
+                # One connection at a time and strictly sequential requests.
                 return self._fail("admission_protocol_violation")
+            self._last_n = number
             try:
                 grant = self.gate.admit()
             except AdmissionDenied as denied:
-                self._send({"ok": False, "reason": denied.slug})
+                self._send({"ok": False, "n": number, "reason": denied.slug})
                 return self._fail(denied.slug)
-            # The deadline starts when WordPress granted, before the reply is delivered.
-            self._inflight_until = self._monotonic() + grant.timeout_seconds + REQUEST_GRACE_SECONDS
+            elapsed = self._monotonic() - grant.issued_at if grant.issued_at else 0.0
+            valid = grant.valid_seconds - elapsed
+            if valid < 0.05:
+                # The grant outlived its lifetime while the supervisor waited on the guard.
+                self._send({"ok": False, "n": number, "reason": "admission_expired"})
+                return self._fail("admission_expired")
+            # The disclosed bounds are measured from just before WordPress granted.
+            started = grant.issued_at or self._monotonic()
+            self._inflight_until = started + grant.timeout_seconds + REQUEST_GRACE_SECONDS
+            self._inflight_n = number
             self.grants += 1
-            if not self._send({"ok": True, "valid_ms": int(grant.valid_seconds * 1000)}):
+            if not self._send({"ok": True, "n": number, "valid_ms": int(valid * 1000)}):
                 return self._fail("admission_channel_failed")
             return None
         return self._fail("admission_protocol_violation")
@@ -240,29 +288,55 @@ class AdmissionPump:
             return self._fail("admission_protocol_violation")
         return None
 
+    def _probe_worker(self):
+        try:
+            self.gate.probe()
+            self._probe_result = None
+        except AdmissionDenied as denied:
+            self._probe_result = denied
+        except BaseException:
+            self._probe_result = AdmissionDenied("guard_unavailable")
+
+    def wait_probe(self, timeout: float = 10.0):
+        """Wait for an outstanding probe (tests, and orderly shutdown)."""
+        thread = self._probe_thread
+        if thread is not None:
+            thread.join(timeout)
+
     def tick(self):
-        """Enforce the in-flight bound and watch for cancellation, expiry or revocation."""
+        """Enforce the in-flight bound and watch for cancellation, expiry or revocation.
+
+        Probes run on their own thread so a slow store can never delay the in-flight
+        deadline, a shutdown or the kill itself.
+        """
         if self.fatal:
             return self.fatal
         now = self._monotonic()
         if self._inflight_until is not None and now > self._inflight_until:
             return self._fail("request_deadline_exceeded")
-        if now - self._last_probe >= PROBE_INTERVAL_SECONDS:
+        thread = self._probe_thread
+        if thread is not None and not thread.is_alive():
+            self._probe_thread = None
+            denied, self._probe_result = self._probe_result, None
+            # An unreachable guard does not abort the request already admitted (its own
+            # ten-second bound applies), and the next admission fails closed. An explicit
+            # refusal, including a disabled integration, stops the scanner now.
+            if denied is not None and denied.slug not in {"guard_unavailable", "guard_timeout", "admission_response_invalid"}:
+                return self._fail(denied.slug)
+            thread = None
+        if self._probe_thread is None and now - self._last_probe >= PROBE_INTERVAL_SECONDS:
             self._last_probe = now
-            try:
-                self.gate.probe()
-            except AdmissionDenied as denied:
-                # An unreachable guard does not abort the request already admitted (its own
-                # ten-second bound applies), and the next admission fails closed. An explicit
-                # refusal stops the scanner now.
-                if denied.slug not in {"guard_unavailable", "admission_response_invalid"}:
-                    return self._fail(denied.slug)
+            self._probe_result = None
+            self._probe_thread = threading.Thread(target=self._probe_worker, daemon=True)
+            self._probe_thread.start()
         return None
 
 
-class AdmissionRefused(OSError):
-    """Raised inside the scanner when no admission was granted. Subclasses OSError so
-    that an unmodified checker treats it as a failed fetch and sends nothing."""
+class AdmissionRefused(Exception):
+    """Raised inside the scanner when no admission was granted.
+
+    Deliberately not an OSError: the checker must not swallow it into an ordinary
+    fetch error, because a refused admission ends the run as a failure."""
 
 
 class ChildAdmission:
@@ -274,6 +348,18 @@ class ChildAdmission:
         self._granted_at = None
         self._valid_seconds = 0.0
         self._outstanding = False
+        self._n = 0
+        self._dead = False
+
+    def _poison(self, reason: str):
+        """After any channel error no later byte may be read as an answer."""
+        self._dead = True
+        self._outstanding = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        raise AdmissionRefused(reason)
 
     def _read_line(self) -> bytes:
         deadline = self._monotonic() + CHILD_REPLY_TIMEOUT_SECONDS
@@ -281,47 +367,52 @@ class ChildAdmission:
         while True:
             remaining = deadline - self._monotonic()
             if remaining <= 0:
-                raise AdmissionRefused("admission_timeout")
-            self.sock.settimeout(remaining)
+                self._poison("admission_timeout")
             try:
+                self.sock.settimeout(remaining)
                 chunk = self.sock.recv(1)
-            except OSError as exc:
-                raise AdmissionRefused("admission_channel_failed") from exc
+            except OSError:
+                self._poison("admission_channel_failed")
             if not chunk:
-                raise AdmissionRefused("admission_channel_closed")
+                self._poison("admission_channel_closed")
             if chunk == b"\n":
                 return bytes(data)
             data.extend(chunk)
             if len(data) > MAX_MESSAGE_BYTES:
-                raise AdmissionRefused("admission_reply_invalid")
+                self._poison("admission_reply_invalid")
 
     def admit(self):
+        if self._dead:
+            raise AdmissionRefused("admission_channel_failed")
         if self._outstanding:
             raise AdmissionRefused("admission_outstanding")
+        self._n += 1
         try:
             self.sock.settimeout(5.0)
-            self.sock.sendall(b'{"op":"admit","kind":"http"}\n')
-        except OSError as exc:
-            raise AdmissionRefused("admission_channel_failed") from exc
+            self.sock.sendall(json.dumps({"op": "admit", "kind": "http", "n": self._n}, separators=(",", ":")).encode("ascii") + b"\n")
+        except OSError:
+            self._poison("admission_channel_failed")
         try:
             reply = json.loads(self._read_line().decode("ascii"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AdmissionRefused("admission_reply_invalid") from exc
-        if not isinstance(reply, dict):
-            raise AdmissionRefused("admission_reply_invalid")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._poison("admission_reply_invalid")
+        if not isinstance(reply, dict) or reply.get("n") != self._n or not _is_int(reply.get("n")):
+            self._poison("admission_reply_invalid")
         if reply.get("ok") is not True:
             reason = reply.get("reason")
+            # A refusal is final for this scanner.
+            self._dead = True
             raise AdmissionRefused(reason if isinstance(reason, str) and REASON_RE.fullmatch(reason) else "admission_denied")
         valid_ms = reply.get("valid_ms")
-        if set(reply) != {"ok", "valid_ms"} or not _is_int(valid_ms) or not 1 <= valid_ms <= int(MAX_VALID_SECONDS * 1000):
-            raise AdmissionRefused("admission_reply_invalid")
+        if set(reply) != {"ok", "n", "valid_ms"} or not _is_int(valid_ms) or not 1 <= valid_ms <= int(MAX_VALID_SECONDS * 1000):
+            self._poison("admission_reply_invalid")
         self._granted_at = self._monotonic()
         self._valid_seconds = valid_ms / 1000.0
         self._outstanding = True
 
     def ensure_fresh(self):
         """Call immediately before connecting: a stale grant is never used."""
-        if not self._outstanding or self._granted_at is None:
+        if self._dead or not self._outstanding or self._granted_at is None:
             raise AdmissionRefused("admission_missing")
         if self._monotonic() - self._granted_at >= self._valid_seconds:
             raise AdmissionRefused("admission_expired")
@@ -334,6 +425,6 @@ class ChildAdmission:
         self._granted_at = None
         try:
             self.sock.settimeout(2.0)
-            self.sock.sendall(b'{"op":"done"}\n')
+            self.sock.sendall(json.dumps({"op": "done", "n": self._n}, separators=(",", ":")).encode("ascii") + b"\n")
         except OSError:
-            pass
+            self._dead = True

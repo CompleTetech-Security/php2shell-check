@@ -12,7 +12,7 @@ from dataclasses import asdict
 
 from wordpress_check import Checker
 
-from .admission import ChildAdmission
+from .admission import AdmissionRefused, ChildAdmission
 from .network import PinnedOpener, RequestOrigin
 
 
@@ -83,7 +83,13 @@ def main() -> int:
         guard = ChildAdmission(channel)
         checker = Checker(timeout=10.0, delay=1.0, contact=CONTACT)
         checker.opener = PinnedOpener(scope, guard=guard)
-        result = checker.check(target)
+        try:
+            result = checker.check(target)
+        except AdmissionRefused as exc:
+            # Not a fetch error: a refused admission ends the run as a failure.
+            reason = str(exc)
+            slug = reason if reason.startswith("admission_") else "admission_" + reason
+            return _write({"ok": False, "error": slug[:64]}, 2)
         return _write({"ok": True, "result": asdict(result)}, 0)
     except TimeoutError:
         return _write({"ok": False, "error": "scanner_timeout"}, 2)
