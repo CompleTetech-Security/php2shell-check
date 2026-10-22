@@ -105,6 +105,9 @@ class _FakeAPI:
             raise self.start_error
         return True
 
+    def control_claim(self):
+        return None
+
     def result(self, body):
         self.result_bodies.append(body)
         if self.result_errors:

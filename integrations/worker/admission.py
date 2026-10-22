@@ -105,9 +105,12 @@ def parse_refusal(error: APIError) -> AdmissionDenied:
 class AdmissionGate:
     """Supervisor-side client for the WordPress admission route."""
 
-    def __init__(self, api, claim, *, stop_event=None, clock=time.time, monotonic=time.monotonic):
+    def __init__(self, api, claim, *, kind="http", stop_event=None, clock=time.time, monotonic=time.monotonic):
+        if kind not in {"http", "control"}:
+            raise ValueError("invalid_admission_kind")
         self.api = api
         self.claim = claim
+        self.kind = kind
         self.stop_event = stop_event
         self._clock = clock
         self._monotonic = monotonic
@@ -156,7 +159,7 @@ class AdmissionGate:
             self._check_local()
             started = self._monotonic()
             try:
-                return replace(parse_grant(self._call("http")), issued_at=started)
+                return replace(parse_grant(self._call(self.kind)), issued_at=started)
             except AdmissionDenied as denied:
                 if self._monotonic() >= deadline:
                     raise
@@ -170,7 +173,7 @@ class AdmissionGate:
     def probe(self):
         """Ask whether the job is still live. Consumes no budget and does not pace."""
         self._check_local()
-        response = self._call("probe")
+        response = self._call("probe" if self.kind == "http" else "control_probe")
         if not isinstance(response, dict) or set(response) != {"ok", "live"} or response["ok"] is not True or response["live"] is not True:
             raise AdmissionDenied("admission_response_invalid")
 
@@ -187,9 +190,12 @@ class AdmissionPump:
     advance by exactly one.
     """
 
-    def __init__(self, sock, gate, *, monotonic=time.monotonic):
+    def __init__(self, sock, gate, *, kind="http", monotonic=time.monotonic):
+        if kind not in {"http", "control"}:
+            raise ValueError("invalid_admission_kind")
         self.sock = sock
         self.gate = gate
+        self.kind = kind
         self._monotonic = monotonic
         self._buffer = bytearray()
         self._inflight_until = None
@@ -234,7 +240,7 @@ class AdmissionPump:
             self._inflight_until = None
             self._inflight_n = None
             return None
-        if set(message) == {"op", "kind", "n"} and message["op"] == "admit" and message["kind"] == "http":
+        if set(message) == {"op", "kind", "n"} and message["op"] == "admit" and message["kind"] == self.kind:
             if self.inflight or number != self._last_n + 1:
                 # One connection at a time and strictly sequential requests.
                 return self._fail("admission_protocol_violation")
@@ -342,8 +348,11 @@ class AdmissionRefused(Exception):
 class ChildAdmission:
     """Scanner-side client of the supervisor socket. Holds no key and no state of record."""
 
-    def __init__(self, sock, *, monotonic=time.monotonic):
+    def __init__(self, sock, *, kind="http", monotonic=time.monotonic):
+        if kind not in {"http", "control"}:
+            raise ValueError("invalid_admission_kind")
         self.sock = sock
+        self.kind = kind
         self._monotonic = monotonic
         self._granted_at = None
         self._valid_seconds = 0.0
@@ -389,7 +398,7 @@ class ChildAdmission:
         self._n += 1
         try:
             self.sock.settimeout(5.0)
-            self.sock.sendall(json.dumps({"op": "admit", "kind": "http", "n": self._n}, separators=(",", ":")).encode("ascii") + b"\n")
+            self.sock.sendall(json.dumps({"op": "admit", "kind": self.kind, "n": self._n}, separators=(",", ":")).encode("ascii") + b"\n")
         except OSError:
             self._poison("admission_channel_failed")
         try:

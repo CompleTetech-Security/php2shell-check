@@ -113,7 +113,7 @@ class SubprocessRunner:
         self._popen = popen
         self._monotonic = monotonic
 
-    def run(self, target: str, *, timeout: float = MAX_WALL_SECONDS, stop_event=None, gate=None) -> dict:
+    def run(self, target: str, *, timeout: float = MAX_WALL_SECONDS, stop_event=None, gate=None, task=None) -> dict:
         # Fail closed by construction: without an admission gate there is no scan.
         if gate is None:
             raise ScannerFailure("admission_guard_required")
@@ -129,7 +129,10 @@ class SubprocessRunner:
             raise ScannerFailure("invalid_target") from exc
         if normalized != target:
             raise ScannerFailure("invalid_target")
-        payload = json.dumps({"target": normalized}, separators=(",", ":")).encode("utf-8")
+        if task not in {None, "control_dns", "control_https"}:
+            raise ScannerFailure("invalid_scanner_task")
+        message = {"target": normalized} if task is None else {"target": normalized, "task": task}
+        payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
         if len(payload) > MAX_SCANNER_INPUT:
             raise ScannerFailure("scanner_input_too_large")
         env = {
@@ -167,7 +170,7 @@ class SubprocessRunner:
             child_sock.close()
             raise ScannerFailure("scanner_start_failed") from exc
         child_sock.close()
-        pump = AdmissionPump(parent_sock, gate)
+        pump = AdmissionPump(parent_sock, gate, kind="http" if task is None else "control")
 
         try:
             buffers = {"stdout": bytearray(), "stderr": bytearray()}
@@ -267,6 +270,8 @@ class SubprocessRunner:
             if process.returncode != 0:
                 child_error = self._parse_child_error(bytes(buffers["stdout"]))
                 raise ScannerFailure(child_error or "scanner_process_failed")
+            if task is not None:
+                return self._parse_control_success(bytes(buffers["stdout"]), task)
             return self._parse_success(bytes(buffers["stdout"]), target, scope)
         finally:
             parent_sock.close()
@@ -301,6 +306,27 @@ class SubprocessRunner:
             return None
         error = parsed.get("error")
         return error if parsed.get("ok") is False and isinstance(error, str) and SAFE_ERROR_RE.fullmatch(error) else None
+
+    @classmethod
+    def _parse_control_success(cls, output: bytes, task: str):
+        parsed = cls._parse_json_line(output)
+        if set(parsed) != {"ok", "control"} or parsed["ok"] is not True or not isinstance(parsed["control"], dict):
+            raise ScannerFailure("scanner_invalid_output")
+        control = parsed["control"]
+        method = "dns_txt" if task == "control_dns" else "https_file"
+        observed = control.get("observed")
+        if (
+            set(control) != {"method", "outcome", "observed"}
+            or control["method"] != method
+            or control["outcome"] not in {"observed", "not_found", "error"}
+            or not isinstance(observed, list)
+            or len(observed) > 8
+            or any(not isinstance(item, str) for item in observed)
+            or sum(len(item.encode("utf-8")) for item in observed) > 4096
+            or (control["outcome"] != "observed" and observed)
+        ):
+            raise ScannerFailure("scanner_result_schema")
+        return control
 
     @classmethod
     def _parse_success(cls, output: bytes, target: str, scope: RequestOrigin):

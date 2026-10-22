@@ -20,6 +20,7 @@ file_put_contents( $private_config, '<?php return ' . var_export( array(
 	'target_daily_limit'        => 100,
 	'bound_terms_versions'      => getenv( 'CT_TEST_BOUND' ) ? array( '2026-10-21-r2' ) : array(),
 	'send_accepted_copy'        => '1' === getenv( 'CT_TEST_COPY' ),
+	'target_control_versions'   => '1' === getenv( 'CT_TEST_CONTROL' ) ? array( '2026-10-21-r2' ) : array(),
 ), true ) . ';' );
 define( 'CT_SCAN_PRIVATE_CONFIG', $private_config );
 register_shutdown_function( static function () use ( $private_config ) { @unlink( $private_config ); } );
@@ -186,4 +187,9 @@ function ct_test_running_job_for_bound( $host ) {
 	$start = ct_test_rest_call( 'ct_scan_start', '/ct-scan/v1/start', array( 'id' => $job['id'], 'lease' => $job['lease'], 'scope_hash' => $job['scope_hash'] ) );
 	ct_test_assert( 200 === $start->get_status(), 'Bound fixture job did not start.' );
 	return array( 'request_id' => $request_id, 'fields' => $fields, 'job_id' => (int) $event['job_id'], 'job' => $job );
+}
+
+function ct_test_end_job( $job_id ) {
+	global $wpdb;
+	$wpdb->update( ct_scan_jobs_table(), array( 'status' => 'failed', 'outcome' => 'failed', 'finished_at' => ct_scan_utc_now(), 'lease_hash' => null, 'lease_until' => null ), array( 'job_id' => (int) $job_id ) );
 }

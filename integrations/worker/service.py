@@ -231,7 +231,7 @@ class WorkerService:
             return f"claim_failed_{exc.slug}"
         self.spool.write_heartbeat(now)
         if claim is None:
-            return "idle"
+            return self._process_control()
 
         try:
             scope, normalized = RequestOrigin.from_target(claim.target)
@@ -273,6 +273,41 @@ class WorkerService:
         if callbacks:
             return self._flush_one(*callbacks[0], int(self.clock()))
         return "callback_spooled"
+
+    def _process_control(self):
+        """Run at most one customer-requested target-control check (one query), if one is due."""
+        try:
+            task = self.api.control_claim()
+        except APIError as exc:
+            return f"control_claim_failed_{exc.slug}"
+        if task is None:
+            return "idle"
+        try:
+            RequestOrigin.from_target(task.target)
+        except ValueError:
+            return "control_rejected_target"
+        remaining = min(task.expires_at.timestamp(), task.lease_until.timestamp()) - self.clock()
+        timeout = min(30.0, remaining - CALLBACK_RESERVE_SECONDS)
+        if timeout <= 0:
+            return "control_stale"
+        gate = AdmissionGate(self.api, task, kind="control", stop_event=self.stop_event, clock=self.clock)
+        runner_task = "control_dns" if task.method == "dns_txt" else "control_https"
+        try:
+            control = self.runner.run(task.target, timeout=timeout, stop_event=self.stop_event, gate=gate, task=runner_task)
+            outcome, observed = control["outcome"], control["observed"]
+        except ScannerFailure as exc:
+            if exc.slug.startswith("admission_"):
+                # Refused or cancelled: nothing was checked. WordPress releases the lease; no result is posted.
+                return f"control_{exc.slug}"
+            outcome, observed = "error", []
+        except (TypeError, ValueError, KeyError):
+            outcome, observed = "error", []
+        try:
+            self.api.control_result(task, outcome, observed)
+        except APIError as exc:
+            # The attempt was already spent at admission; there is no retry and no rescan.
+            return f"control_result_failed_{exc.slug}"
+        return f"control_{outcome}"
 
     def run_forever(self, poll_seconds: int):
         while not self.stop_event.is_set():
