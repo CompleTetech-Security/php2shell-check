@@ -50,7 +50,7 @@ ct_test_assert( false !== strpos( $copy['message'], $meta['_ct_terms_sha256'] ) 
 $attachment = end( $captured_attachments );
 ct_test_assert( $attachment && $attachment['bytes'] === $meta['_ct_terms_snapshot'] && hash( 'sha256', $attachment['bytes'] ) === $meta['_ct_terms_sha256'] && 0 === strpos( $attachment['name'], 'accepted-terms-' . $event['job_id'] . '-2026-10-21-r2-' ), 'The attached terms are not the exact retained bytes.' );
 ct_test_assert( 'accepted' === ct_scan_row( $event['job_id'] )->accepted_copy_status && 'queued' === ct_scan_row( $event['job_id'] )->status, 'The copy changed the job state or was not recorded as transport-accepted.' );
-ct_test_assert( empty( glob( sys_get_temp_dir() . '/accepted-terms-*' ) ), 'A temporary copy of the terms was left on disk.' );
+ct_test_assert( empty( glob( sys_get_temp_dir() . '/ctat-*' ) ), 'A temporary copy of the terms was left on disk.' );
 
 // Idempotent: a duplicate confirmation callback sends nothing more, and cannot touch the scan.
 $count = count( $mail );
@@ -70,6 +70,35 @@ foreach ( array( false, 'throw' ) as $mode ) {
 	ct_test_assert( 'unknown' === $result && 'unknown' === ct_scan_row( $fevent['job_id'] )->accepted_copy_status && 'queued' === ct_scan_row( $fevent['job_id'] )->status, 'A mail failure was reported as sent or changed the job.' );
 	ct_test_assert( 'already_handled' === ct_scan_send_accepted_copy( $fevent['job_id'] ) && count( $mail ) === $count, 'An uncertain accepted copy was resent automatically.' );
 }
+
+// The requirement is frozen into each job. A job created before the version was listed as requiring
+// bound evidence keeps working when the configuration later requires it, and one created bound keeps
+// needing it: configuration can neither cancel nor relax an authorization already given.
+$wpdb->query( "UPDATE {$jobs} SET status = 'cancelled', error_code = 'test_cleanup' WHERE status IN ('queued','leased','running')" );
+list( $old_id, $old_fields ) = ct_test_request( 'strict-frozen.example.net' );
+$request_ids[] = $old_id;
+ct_test_bind( $old_id, $old_fields );
+$old_event = ct_scan_on_request_ready( $old_id, $old_fields );
+ct_test_queue_job( $old_event['job_id'] );
+ct_test_assert( 1 === (int) ct_scan_row( $old_event['job_id'] )->bound_required, 'A job created under a bound-only version did not freeze that requirement.' );
+foreach ( array( '_ct_terms_binding', '_ct_terms_snapshot', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
+	delete_post_meta( $old_id, $key );
+}
+$claim = ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() )->get_data()['job'];
+ct_test_assert( null === $claim && 'cancelled' === ct_scan_row( $old_event['job_id'] )->status, 'Removing the retained evidence did not end a job that was created bound.' );
+// A job that predates the requirement (frozen not-required, no evidence) keeps working under the strict config.
+list( $legacy_id, $legacy_fields ) = ct_test_request( 'strict-predates.example.net' );
+$request_ids[] = $legacy_id;
+ct_test_bind( $legacy_id, $legacy_fields );
+$legacy_event = ct_scan_on_request_ready( $legacy_id, $legacy_fields );
+foreach ( array( '_ct_terms_binding', '_ct_terms_snapshot', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
+	delete_post_meta( $legacy_id, $key );
+}
+$wpdb->update( $jobs, array( 'bound_required' => 0, 'summary_sha256' => null ), array( 'job_id' => $legacy_event['job_id'] ) );
+ct_test_queue_job( $legacy_event['job_id'] );
+$claim = ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() )->get_data()['job'];
+ct_test_assert( is_array( $claim ) && (int) $claim['id'] === (int) $legacy_event['job_id'], 'A job that predates the bound-evidence requirement was cancelled by it.' );
+ct_test_end_job( $legacy_event['job_id'] );
 
 // A cancelled (stopped) job still keeps its record; the copy does not resurrect or alter it.
 foreach ( $request_ids as $id ) {

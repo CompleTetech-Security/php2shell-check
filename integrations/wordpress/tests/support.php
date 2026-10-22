@@ -187,3 +187,8 @@ function ct_test_running_job_for_bound( $host ) {
 	ct_test_assert( 200 === $start->get_status(), 'Bound fixture job did not start.' );
 	return array( 'request_id' => $request_id, 'fields' => $fields, 'job_id' => (int) $event['job_id'], 'job' => $job );
 }
+
+function ct_test_end_job( $job_id ) {
+	global $wpdb;
+	$wpdb->update( ct_scan_jobs_table(), array( 'status' => 'failed', 'outcome' => 'failed', 'finished_at' => ct_scan_utc_now(), 'lease_hash' => null, 'lease_until' => null ), array( 'job_id' => (int) $job_id ) );
+}

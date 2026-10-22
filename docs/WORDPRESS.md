@@ -186,21 +186,26 @@ carried. The site recorder writes these post meta keys:
 | `_ct_summary_text` | the Target Summary as displayed, `Label: value` lines (at most 8 KiB) |
 | `_ct_summary_sha256`, `_ct_summary_shown_digest` | its digest, and the digest the form carried |
 
-The Summary must contain exactly one each of `Website (scan scope)`,
-`Client contact`, `Client email` (equal to the authorized request fields) and
-`Profile` (the job's profile). Any missing, oversized, mismatched, stale,
-repeated or partial piece refuses the job (`ct_scan_binding_mismatch` /
-`ct_scan_binding_required`), and the job row stores the summary digest, so a
-later edit of the retained evidence makes the authorization no longer live and
-cancels a queued or running job. Config `bound_terms_versions` (default empty)
-lists terms versions whose acceptance **must** be bound; an unbound acceptance
-of any other version is accepted as before, but unbound pieces without the
-marker are always refused. Nothing in the plugin fetches mutable page HTML.
+The Summary must be exactly the canonical four lines of the authorized request
+(LF terminated, in this order, nothing before, between or after):
+`Website (scan scope): <target>`, `Client contact: <name>`,
+`Client email: <email>`, `Profile: <the job's profile>`. Any missing,
+oversized, mismatched, stale, non-canonical or partial piece refuses the job
+(`ct_scan_binding_mismatch` / `ct_scan_binding_required`), and the job row
+stores the summary digest, so a later edit of the retained evidence makes the
+authorization no longer live and cancels a queued or running job. Config
+`bound_terms_versions` (default empty) lists terms versions whose acceptance
+**must** be bound; each job freezes that requirement and its profile when it is
+created, so a later configuration change neither cancels a running
+authorization nor relaxes one. Unbound pieces without the marker are always
+refused. Nothing in the plugin fetches mutable page HTML.
 
 With config `send_accepted_copy` true (default false), a successful mailbox
 confirmation sends the verified contact their copy: the Target Summary, the
 hashes, the filled-in copy and, for a bound acceptance, the exact terms bytes
-as an attachment. It is sent at most once (the status is claimed by
+as an attachment (written to a private temporary directory and attached only if
+it reproduces the recorded hash). The recipient must still be the confirmed,
+authorized address. It is sent at most once (the status is claimed by
 compare-and-set before mail is handed off), only to the verified address, and
 never to a referrer. An uncertain or failed hand-off is recorded as `unknown`
 and never resent automatically; `accepted` means transport acceptance, not
