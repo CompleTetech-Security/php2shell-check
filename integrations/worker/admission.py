@@ -34,7 +34,8 @@ from .protocol import APIError
 
 MAX_VALID_SECONDS = 1.0
 MAX_REQUEST_SECONDS = 10.0
-REQUEST_GRACE_SECONDS = 1.0
+# No grace: a request must be finished within the disclosed ten seconds of the grant.
+REQUEST_GRACE_SECONDS = 0.0
 PROBE_INTERVAL_SECONDS = 2.0
 MAX_ADMIT_WAIT_SECONDS = 4.0
 CALL_BUDGET_SECONDS = 4.0

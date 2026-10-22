@@ -60,6 +60,9 @@ $cases = array(
 	'summary with an indented decoy'      => array( array( 'summary' => " Website (scan scope): https://other.example.net/\n" . ct_test_summary( array( 'target' => 'https://evidence-case.example.net/', 'name' => 'Fixture Reviewer', 'email' => 'fixture@example.com' ) ) ), 'binding_mismatch' ),
 	'summary with a NUL decoy'            => array( array( 'summary' => ct_test_summary( array( 'target' => 'https://evidence-case.example.net/', 'name' => 'Fixture Reviewer', 'email' => 'fixture@example.com' ) ) . "\0Website (scan scope): https://other.example.net/\n" ), 'binding_mismatch' ),
 	'summary with CRLF line ends'         => array( array( 'summary' => str_replace( "\n", "\r\n", ct_test_summary( array( 'target' => 'https://evidence-case.example.net/', 'name' => 'Fixture Reviewer', 'email' => 'fixture@example.com' ) ) ) ), 'binding_mismatch' ),
+	'summary without the limits line'     => array( array( 'summary_drop' => 'Limits' ), 'binding_mismatch' ),
+	'summary with other limits'           => array( array( 'summary' => ct_test_summary( array( 'target' => 'https://evidence-case.example.net/', 'name' => 'Fixture Reviewer', 'email' => 'fixture@example.com' ), array( 'Limits' => 'this website only; at most 2000 requests' ) ) ), 'binding_mismatch' ),
+	'summary without the period line'     => array( array( 'summary_drop' => 'Authorization' ), 'binding_mismatch' ),
 	'bound pieces without the marker'     => array( array( 'meta' => array( '_ct_terms_binding' => null ) ), 'binding_required' ),
 	'marker with another value'           => array( array( 'meta' => array( '_ct_terms_binding' => 'yes' ) ), 'binding_required' ),
 );
@@ -69,6 +72,9 @@ foreach ( $cases as $label => $case ) {
 	list( $case_id, $case_fields ) = ct_test_request( $host );
 	$request_ids[] = $case_id;
 	$mutations = $case[0];
+	if ( isset( $mutations['summary_drop'] ) ) {
+		$mutations = array( 'summary' => implode( "\n", array_filter( explode( "\n", ct_test_summary( $case_fields ) ), static function ( $line ) use ( $mutations ) { return '' !== $line && 0 !== strpos( $line, $mutations['summary_drop'] . ':' ); } ) ) . "\n" );
+	}
 	// Summaries built for "evidence-case" must name this request's website for the other checks to be the only fault.
 	if ( isset( $mutations['summary'] ) ) {
 		$mutations['summary'] = str_replace( 'https://evidence-case.example.net/', $case_fields['target'], $mutations['summary'] );
@@ -76,6 +82,42 @@ foreach ( $cases as $label => $case ) {
 	ct_test_bind( $case_id, $case_fields, $mutations );
 	ct_test_refused_with( $case_id, $case_fields, $case[1], 'Case "' . $label . '"' );
 }
+
+
+// ---- Defaults: strict unless an r2-or-earlier version is explicitly grandfathered -------------------------------
+function ct_test_gate_env( $env ) {
+	$proc = proc_open( array( PHP_BINARY, __DIR__ . '/config-gate.php' ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $pipes, null, array_merge( getenv(), array( 'CT_TEST_WP_ROOT' => getenv( 'CT_TEST_WP_ROOT' ) ?: '/var/www/html' ), $env ) );
+	$out = stream_get_contents( $pipes[1] );
+	stream_get_contents( $pipes[2] );
+	proc_close( $proc );
+	return explode( ' ', trim( $out ) )[0];
+}
+ct_test_assert( 'enabled' === ct_test_gate_env( array( 'CT_TEST_POLICY' => 'legacy' ) ), 'An explicit legacy decision for r2 did not enable.' );
+ct_test_assert( 'enabled' === ct_test_gate_env( array( 'CT_TEST_POLICY' => 'strict' ) ), 'An explicit strict decision for r2 did not enable.' );
+ct_test_assert( 'refused' === ct_test_gate_env( array( 'CT_TEST_POLICY' => 'none' ) ), 'The integration enabled itself with no decision for its terms version.' );
+// Bumping the served version without a decision for it silently dropping the gate is exactly what must not happen.
+ct_test_assert( 'refused' === ct_test_gate_env( array( 'CT_TEST_VERSION' => '2026-12-01-r3', 'CT_TEST_POLICY' => 'none' ) ), 'A bumped terms version enabled without a decision.' );
+ct_test_assert( 'enabled' === ct_test_gate_env( array( 'CT_TEST_VERSION' => '2026-12-01-r3', 'CT_TEST_POLICY' => 'strict' ) ), 'A bumped terms version with a strict decision did not enable.' );
+ct_test_assert( 'refused' === ct_test_gate_env( array( 'CT_TEST_VERSION' => '2026-12-01-r3', 'CT_TEST_POLICY' => 'legacy' ) ), 'A new terms version was allowed to claim the grandfathered flow.' );
+// ...and even if it is asked to, its policy is strict.
+$proc = proc_open( array( PHP_BINARY, __DIR__ . '/config-gate.php' ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $gp, null, array_merge( getenv(), array( 'CT_TEST_WP_ROOT' => getenv( 'CT_TEST_WP_ROOT' ) ?: '/var/www/html', 'CT_TEST_VERSION' => '2026-12-01-r3', 'CT_TEST_POLICY' => 'legacy' ) ) );
+ct_test_assert( 'refused strict' === trim( stream_get_contents( $gp[1] ) ), 'A new version listed as legacy was not treated as strict.' );
+proc_close( $proc );
+ct_test_assert( 'refused' === ct_test_gate_env( array( 'CT_TEST_VERSION' => 'weird', 'CT_TEST_POLICY' => 'legacy' ) ), 'An unparseable version was allowed to claim the grandfathered flow.' );
+// The policy lookup itself: legacy only for an explicitly listed r2-or-earlier version; everything else is strict.
+ct_test_assert( 'legacy' === ct_scan_terms_policy( '2026-10-21-r2' ), 'The explicit legacy decision for r2 was not honoured.' );
+foreach ( array( '2026-10-21-r3', '2026-12-01-r3', 'weird', '', '2026-10-21-r2 ' ) as $other ) {
+	ct_test_assert( 'strict' === ct_scan_terms_policy( $other ), "Version '$other' was not strict by default." );
+}
+ct_test_assert( 'strict' === ct_scan_terms_policy( null ) && 'strict' === ct_scan_terms_policy( array( 'x' ) ), 'A non-string version was not strict.' );
+foreach ( array( '2026-10-21-r1' => true, '2026-01-01-r9' => true, '2026-10-21-r2' => true, '2026-10-21-r3' => false, '2027-06-01-r3' => false, 'weird' => false, '2026-10-21-r2 ' => false ) as $version => $legacy ) {
+	ct_test_assert( $legacy === ct_scan_is_legacy_version( $version ), "Version '$version' was classified wrongly." );
+}
+
+// ---- The Target Summary carries the limits and the authorization period ---------------------------------------
+$canonical = ct_scan_target_summary( 'https://a.example.net/', 'Pat', 'pat@example.com' );
+ct_test_assert( 6 === substr_count( $canonical, "\n" ) && false !== strpos( $canonical, 'at most 20 requests, one at a time, at most one per second, 10 seconds each' ) && false !== strpos( $canonical, 'expires 60 days after acceptance' ), 'The canonical Target Summary omits the limits or the authorization period.' );
+ct_test_assert( '' === ct_scan_target_summary( 'https://a.example.net/', 'Pat', 'pat@example.com', 'external-web-v9' ) && '' === ct_scan_target_summary( array(), 'Pat', 'pat@example.com' ), 'A summary was produced for an unknown profile or bad input.' );
 
 // After a job exists, the retained evidence cannot change: any alteration ends the authorization.
 $running = ct_test_running_job_for_bound( 'evidence-running.example.net' );
@@ -95,7 +137,7 @@ $off = ct_scan_send_accepted_copy( $ok['job_id'] );
 ct_test_assert( 'disabled' === $off && count( $mail ) === $before && 'not_sent' === ct_scan_row( $ok['job_id'] )->accepted_copy_status, 'The accepted copy was sent although it is disabled.' );
 
 // Strict configuration (binding required, copy on) in its own process.
-$env = array_merge( getenv(), array( 'CT_TEST_BOUND' => '1', 'CT_TEST_COPY' => '1', 'CT_TEST_WP_ROOT' => getenv( 'CT_TEST_WP_ROOT' ) ?: '/var/www/html' ) );
+$env = array_merge( getenv(), array( 'CT_TEST_POLICY' => 'strict', 'CT_TEST_COPY' => '1', 'CT_TEST_WP_ROOT' => getenv( 'CT_TEST_WP_ROOT' ) ?: '/var/www/html' ) );
 $strict = proc_open( array( PHP_BINARY, __DIR__ . '/evidence-strict.php' ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $spipes, null, $env );
 $out = stream_get_contents( $spipes[1] );
 $err = stream_get_contents( $spipes[2] );
