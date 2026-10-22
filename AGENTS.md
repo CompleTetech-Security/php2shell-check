@@ -14,6 +14,11 @@ Read [README.md](README.md) for setup and usage,
 - `skills/php2shell-check/SKILL.md`: reusable instructions for agents using the
   checker; `agents/openai.yaml` inside that skill provides discovery metadata.
 - `CLAUDE.md`: points Claude to these shared instructions; keep policy here.
+- `integrations/worker/`: restricted network adapter and authenticated queue
+  controller; the public CLI remains independent of this integration.
+- `integrations/wordpress/`: WordPress MU plugin and database integration tests.
+- `deployment/`: isolated worker container, disposable WordPress fixture, and
+  reviewed CompleteTech site patch. Read `docs/WORDPRESS.md` before deployment.
 
 ## Implementation constraints
 
