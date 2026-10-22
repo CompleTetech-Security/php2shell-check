@@ -127,11 +127,42 @@ $row = ct_scan_row( $event['job_id'] );
 ct_test_assert( hash( 'sha256', $fields['target'] ) === $row->scope_hash, 'Scope hash must cover the exact canonical target.' );
 ct_test_assert( 'accepted' === $row->confirmation_email_status, 'Confirmation mail acceptance state was not recorded.' );
 ct_test_assert( false !== strpos( $mail_calls[0]['message'], 'token=' ), 'Confirmation link missing from the captured fixture email.' );
+ct_test_assert( 1 === preg_match( '/[?&]stop=([a-f0-9]{64})/', $mail_calls[0]['message'], $stop_match ), 'Stop link missing from the captured fixture email.' );
+ct_test_assert( 1 === preg_match( '/token=([a-f0-9]{64})/', $mail_calls[0]['message'], $confirm_match ) && $confirm_match[1] !== $stop_match[1], 'Stop and confirmation tokens must differ.' );
+ct_test_assert( hash( 'sha256', $stop_match[1] ) === $row->stop_token_hash && false === strpos( wp_json_encode( $row ), $stop_match[1] ), 'Only the stop token hash may be stored.' );
 
 // Duplicate hook delivery is database-idempotent even when the event meta is absent.
 delete_post_meta( $request_id, '_ct_scan_event_recorded' );
 $duplicate = ct_scan_on_request_ready( $request_id, $fields );
 ct_test_assert( ! is_wp_error( $duplicate ) && ! empty( $duplicate['duplicate'] ) && (int) $duplicate['job_id'] === (int) $event['job_id'], 'Duplicate event created a second job or changed state.' );
+
+// Customer stop: wrong tokens fail, a finished job is not reopened, and a stopped job can never be claimed or started.
+list( $stop_id, $stop_fields ) = ct_test_request( 'stop-fixture.example.net' );
+$request_ids[] = $stop_id;
+$mail_before = count( $mail_calls );
+$stop_event = ct_scan_on_request_ready( $stop_id, $stop_fields );
+preg_match( '/[?&]stop=([a-f0-9]{64})/', $mail_calls[ $mail_before ]['message'], $stop_match );
+$stop_token = $stop_match[1];
+$stop_row = ct_scan_row_by_stop_hash( hash( 'sha256', $stop_token ) );
+ct_test_assert( $stop_row && (int) $stop_row->job_id === (int) $stop_event['job_id'], 'Stop token must resolve only to its own job.' );
+ct_test_assert( is_wp_error( ct_scan_customer_stop( $stop_event['job_id'], str_repeat( 'a', 64 ) ) ), 'A wrong stop token was accepted.' );
+ct_test_assert( is_wp_error( ct_scan_customer_stop( $event['job_id'], $stop_token ) ), 'A stop token stopped a different job.' );
+ct_test_assert( 'awaiting_confirmation' === ct_scan_row( $stop_event['job_id'] )->status, 'A rejected stop changed job state.' );
+ct_test_queue_job( $stop_event['job_id'] );
+$stop_claim = ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() );
+$stop_claimed = $stop_claim->get_data()['job'];
+ct_test_assert( (int) $stop_claimed['id'] === (int) $stop_event['job_id'], 'Fixture expected the stop job to be claimed.' );
+ct_test_assert( 'stopped' === ct_scan_customer_stop( $stop_event['job_id'], $stop_token ), 'A leased job was not stopped by its customer.' );
+$stopped = ct_scan_row( $stop_event['job_id'] );
+ct_test_assert( 'cancelled' === $stopped->status && 'customer_stopped' === $stopped->error_code && empty( $stopped->lease_hash ) && empty( $stopped->revoked_at ), 'Customer stop must cancel and clear the lease without operator revocation.' );
+ct_test_assert( 'cancelled' === get_post_meta( $stop_id, '_ct_scan_status', true ), 'Request status did not record the stop.' );
+$late_start = ct_test_rest_call( 'ct_scan_start', '/ct-scan/v1/start', array( 'id' => $stop_claimed['id'], 'lease' => $stop_claimed['lease'], 'scope_hash' => $stop_claimed['scope_hash'] ) );
+ct_test_assert( 410 === $late_start->get_status(), 'A stopped job was started by a stale lease.' );
+$late_result = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', array( 'id' => $stop_claimed['id'], 'lease' => $stop_claimed['lease'], 'scope_hash' => $stop_claimed['scope_hash'], 'outcome' => 'completed', 'result' => ct_test_result( $stop_fields['target'] ), 'error' => '', 'checker_revision' => str_repeat( 'a', 40 ) ) );
+ct_test_assert( 410 === $late_result->get_status(), 'A stopped job accepted a late result.' );
+ct_test_assert( 'already_stopped' === ct_scan_customer_stop( $stop_event['job_id'], $stop_token ), 'Repeated stop must be idempotent.' );
+$no_claim = ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() );
+ct_test_assert( 200 === $no_claim->get_status() && empty( $no_claim->get_data()['job'] ), 'A stopped job must never be claimed again.' );
 
 // Confirmed queue: claim, start-before-work, validated result, and exact receipt retry.
 ct_test_queue_job( $event['job_id'] );

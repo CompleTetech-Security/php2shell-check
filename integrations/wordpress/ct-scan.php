@@ -17,7 +17,7 @@ if ( ! defined( 'CT_SCAN_DEFAULT_TERMS_VERSION' ) ) {
 }
 
 if ( ! defined( 'CT_SCAN_SCHEMA_VERSION' ) ) {
-	define( 'CT_SCAN_SCHEMA_VERSION', '1' );
+	define( 'CT_SCAN_SCHEMA_VERSION', '2' );
 }
 
 /** Load the secret-bearing settings without ever rendering their values. */
@@ -107,6 +107,7 @@ function ct_scan_maybe_install_schema() {
 		status varchar(32) NOT NULL,
 		created_at datetime NOT NULL,
 		confirmation_token_hash char(64) NULL,
+		stop_token_hash char(64) NULL,
 		confirmation_expires_at datetime NULL,
 		confirmation_email_status varchar(16) NOT NULL DEFAULT 'pending',
 		confirmed_at datetime NULL,
@@ -132,7 +133,8 @@ function ct_scan_maybe_install_schema() {
 		KEY status_created (status,created_at),
 		KEY scope_created (scope_hash,created_at),
 		KEY authorization_expires_at (authorization_expires_at),
-		KEY confirmation_token_hash (confirmation_token_hash)
+		KEY confirmation_token_hash (confirmation_token_hash),
+		KEY stop_token_hash (stop_token_hash)
 	) {$charset};";
 	dbDelta( $sql );
 	$sql = "CREATE TABLE {$nonces} (
@@ -143,7 +145,7 @@ function ct_scan_maybe_install_schema() {
 	) {$charset};";
 	dbDelta( $sql );
 	$required = array(
-		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at' ),
+		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
 	);
 	foreach ( $required as $table => $columns ) {
@@ -382,6 +384,8 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 	}
 	$config = ct_scan_config();
 	$token  = bin2hex( random_bytes( 32 ) );
+	// Separate long-lived token for the customer's Stop link; only its hash is stored.
+	$stop_token = bin2hex( random_bytes( 32 ) );
 	$now    = time();
 	$ttl    = max( 1, min( 168, absint( $config['confirmation_ttl_hours'] ) ) );
 	$created = gmdate( 'Y-m-d H:i:s', $now );
@@ -434,8 +438,9 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 				'created_at'               => $created,
 				'confirmation_token_hash'  => hash( 'sha256', $token ),
 				'confirmation_expires_at'  => $confirm_expires,
+				'stop_token_hash'          => hash( 'sha256', $stop_token ),
 			),
-			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
+			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
 		if ( 1 !== $inserted ) {
 			$existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$jobs} WHERE request_id = %d LIMIT 1", $request_id ) );
@@ -461,10 +466,16 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 		array( 'action' => 'ct_scan_confirm', 'token' => $token ),
 		admin_url( 'admin-post.php' )
 	);
+	$stop_url = add_query_arg(
+		array( 'action' => 'ct_scan_stop', 'stop' => $stop_token ),
+		admin_url( 'admin-post.php' )
+	);
 	$subject = 'Confirm your authorized PHP2Shell screening';
 	$message = "A request was saved to screen the website you authorized.\n\n"
 		. "To confirm and allow one passive check of " . wp_parse_url( $accepted['target'], PHP_URL_HOST ) . ", open this link and press Confirm. Opening the link alone does not authorize a scan:\n\n"
-		. $url . "\n\nThis confirmation expires in {$ttl} hours. If you did not submit this request, ignore this message. Mailbox confirmation shows control of this email address; it does not independently prove domain ownership.\n";
+		. $url . "\n\nThis confirmation expires in {$ttl} hours. If you did not submit this request, ignore this message. Mailbox confirmation shows control of this email address; it does not independently prove domain ownership.\n\n"
+		. "To stop this screening at any time, open this link and press Stop. Opening the link alone changes nothing:\n\n"
+		. $stop_url . "\n";
 	$mail_status = 'unknown';
 	$pending = $wpdb->update( $jobs, array( 'confirmation_email_status' => 'unknown' ), array( 'job_id' => $job_id, 'confirmation_email_status' => 'pending' ), array( '%s' ), array( '%d', '%s' ) );
 	if ( 1 !== $pending ) {
@@ -684,6 +695,103 @@ function ct_scan_row_by_confirmation_hash( $hash ) {
 }
 add_action( 'admin_post_nopriv_ct_scan_confirm', 'ct_scan_confirmation_handler' );
 add_action( 'admin_post_ct_scan_confirm', 'ct_scan_confirmation_handler' );
+
+function ct_scan_stop_token_from_request( $source ) {
+	if ( ! isset( $source['stop'] ) || ! is_string( $source['stop'] ) ) {
+		return '';
+	}
+	$token = wp_unslash( $source['stop'] );
+	return preg_match( '/\A[a-f0-9]{64}\z/i', $token ) ? strtolower( $token ) : '';
+}
+
+function ct_scan_row_by_stop_hash( $hash ) {
+	global $wpdb;
+	$table = ct_scan_jobs_table();
+	return $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE stop_token_hash = %s LIMIT 1", $hash ) );
+}
+
+/**
+ * Customer stop: request-bound and idempotent, serialized with claims, starts and results
+ * by the queue lock. A cancelled job is rejected by the start and result endpoints. A check
+ * the worker already started may finish its current requests; no new screening starts.
+ * Returns 'stopped', 'already_stopped', 'already_finished', or a WP_Error.
+ */
+function ct_scan_customer_stop( $job_id, $token ) {
+	if ( ! ct_scan_lock_acquire() ) {
+		return new WP_Error( 'queue_busy', 'The request is temporarily busy. Please try again.' );
+	}
+	global $wpdb;
+	$table = ct_scan_jobs_table();
+	try {
+		$row = ct_scan_row( $job_id );
+		if ( ! $row || empty( $row->stop_token_hash ) || '' === $token || ! hash_equals( $row->stop_token_hash, hash( 'sha256', $token ) ) ) {
+			return new WP_Error( 'stop_link_invalid', 'This stop link is invalid.' );
+		}
+		if ( 'cancelled' === $row->status ) {
+			return 'already_stopped';
+		}
+		if ( ct_scan_terminal_status( $row->status ) ) {
+			return 'already_finished';
+		}
+		$now = ct_scan_utc_now();
+		$updated = $wpdb->update(
+			$table,
+			array( 'status' => 'cancelled', 'error_code' => 'customer_stopped', 'finished_at' => $now, 'confirmation_token_hash' => null, 'confirmation_expires_at' => null, 'lease_hash' => null, 'lease_until' => null ),
+			array( 'job_id' => (int) $row->job_id, 'status' => $row->status ),
+			null,
+			array( '%d', '%s' )
+		);
+		if ( 1 !== $updated ) {
+			return new WP_Error( 'stop_write_failed', 'The stop could not be recorded. Please try again or contact support@complete.tech.' );
+		}
+		ct_scan_mark_request_status( (int) $row->request_id, 'cancelled', 'customer_stopped' );
+	} finally {
+		ct_scan_lock_release();
+	}
+	return 'stopped';
+}
+
+function ct_scan_stop_markup( $job_id, $token, $nonce, $target ) {
+	$action = esc_url( admin_url( 'admin-post.php' ) );
+	return '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stop website screening</title><body><main><h1>Stop your website screening</h1><p>Stop the screening of this website:</p><p><strong>' . esc_html( $target ) . '</strong></p><p>No new screening will start after you press Stop. A check that has already started may finish its current requests. Opening this page alone changes nothing.</p><form method="post" action="' . $action . '"><input type="hidden" name="action" value="ct_scan_stop"><input type="hidden" name="job_id" value="' . esc_attr( (string) $job_id ) . '"><input type="hidden" name="stop" value="' . esc_attr( $token ) . '"><input type="hidden" name="_wpnonce" value="' . esc_attr( $nonce ) . '"><button type="submit">Stop screening</button></form></main></body></html>';
+}
+
+function ct_scan_stop_handler() {
+	$method = isset( $_SERVER['REQUEST_METHOD'] ) && is_string( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( $_SERVER['REQUEST_METHOD'] ) : '';
+	if ( 'GET' === $method ) {
+		$token = ct_scan_stop_token_from_request( $_GET );
+		$row   = '' === $token ? null : ct_scan_row_by_stop_hash( hash( 'sha256', $token ) );
+		if ( ! $row ) {
+			ct_scan_send_confirmation_page( 'This stop link is invalid.', 404 );
+		}
+		if ( ct_scan_terminal_status( $row->status ) ) {
+			ct_scan_send_confirmation_page( 'cancelled' === $row->status ? 'This screening is already stopped.' : 'This screening has already finished. Nothing further will run.' );
+		}
+		$nonce = wp_create_nonce( 'ct_scan_stop_' . (int) $row->job_id . '_' . $token );
+		ct_scan_send_confirmation_page( '', 200, ct_scan_stop_markup( (int) $row->job_id, $token, $nonce, $row->target_origin ) );
+	}
+	if ( 'POST' !== $method ) {
+		ct_scan_send_confirmation_page( 'Use the stop form to continue.', 405 );
+	}
+	$token  = ct_scan_stop_token_from_request( $_POST );
+	$job_id = isset( $_POST['job_id'] ) && is_scalar( $_POST['job_id'] ) ? absint( wp_unslash( $_POST['job_id'] ) ) : 0;
+	if ( ! $job_id || '' === $token || ! isset( $_POST['_wpnonce'] ) || ! is_string( $_POST['_wpnonce'] )
+		|| ! wp_verify_nonce( wp_unslash( $_POST['_wpnonce'] ), 'ct_scan_stop_' . $job_id . '_' . $token ) ) {
+		ct_scan_send_confirmation_page( 'This stop form is invalid or expired. Open the stop link again.', 403 );
+	}
+	$result = ct_scan_customer_stop( $job_id, $token );
+	if ( is_wp_error( $result ) ) {
+		ct_scan_send_confirmation_page( $result->get_error_message(), 'queue_busy' === $result->get_error_code() ? 503 : 410 );
+	}
+	$messages = array(
+		'stopped'          => 'Your screening is stopped. No new screening will start.',
+		'already_stopped'  => 'This screening is already stopped.',
+		'already_finished' => 'This screening has already finished. Nothing further will run.',
+	);
+	ct_scan_send_confirmation_page( $messages[ $result ] );
+}
+add_action( 'admin_post_nopriv_ct_scan_stop', 'ct_scan_stop_handler' );
+add_action( 'admin_post_ct_scan_stop', 'ct_scan_stop_handler' );
 
 function ct_scan_rest_response( $status, $payload ) {
 	return new WP_REST_Response( $payload, (int) $status );
