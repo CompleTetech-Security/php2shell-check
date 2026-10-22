@@ -29,3 +29,13 @@ data, tokens, cookies, or private URLs.
 Document changes to command arguments and output fields. Run the tests before
 submitting a pull request. Never include real outreach lists, workbooks, scan
 results, or credentials in a contribution.
+
+## Licensing of contributions
+
+php2shell-check is dual licensed under AGPL-3.0 and a CompleteTech LLC
+commercial license (see [LICENSING.md](LICENSING.md)). By submitting a
+contribution, you confirm that you have the right to submit it. You license
+it to the public under AGPL-3.0. You also grant CompleteTech LLC a perpetual,
+worldwide, royalty-free, irrevocable license to use, modify, sublicense and
+distribute it under any license, including the commercial license. You keep
+the copyright in your contribution.

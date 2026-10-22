@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/CompleteTech-LLC/php2shell-check/actions/workflows/tests.yml/badge.svg)](https://github.com/CompleteTech-LLC/php2shell-check/actions/workflows/tests.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](../LICENSE)
+[![License: AGPL-3.0 or commercial](https://img.shields.io/badge/license-AGPL--3.0%20%7C%20commercial-blue.svg)](../LICENSING.md)
 
 A **single-file, dependency-free Python CLI** for passive PHP2Shell exposure
 triage: **CVE-2026-109618 and CVE-2026-109619**. It compares publicly advertised
@@ -299,4 +299,4 @@ The WordPress REST marker follows WordPress's documented
 
 ## License
 
-[MIT](../LICENSE).
+Dual licensed under [AGPL-3.0](../LICENSE) or a commercial license; see [LICENSING.md](../LICENSING.md).
