@@ -577,6 +577,7 @@ class OpenerGuardTests(unittest.TestCase):
         self.assertEqual(recorder.requests, [])
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "descriptor semantics differ outside Linux")
 class ScannerChannelTests(unittest.TestCase):
     def test_scanner_has_no_channel_without_a_valid_unix_socket(self):
         from integrations.worker import scanner
