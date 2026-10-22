@@ -460,9 +460,11 @@ maintenance (which runs on every worker claim and on the admin queue page):
   `Y-m-d H:i:s` date no earlier than 2020 (zero dates and other restore debris
   are refused), the stored deletion date to be no earlier than the one derived
   from the row today and no earlier than three years after the job's creation,
-  and the job to be in a terminal state. A job whose base date cannot be trusted
+  (less a day) and the job to be in a terminal state. A job whose base date cannot be trusted
   keeps `retain_until` empty and is shown as "unknown (kept)" in the admin queue.
-  Each run deletes at most 50 jobs, so the queue lock is held briefly.
+  Each run examines at most 50 due jobs, and a job judged doubtful is looked at
+  again at most daily (`retention_checked_at`), so doubtful rows cannot hide due
+  ones and the queue lock is held briefly.
 - **Narrow preservation hold** (admin queue): one job, a stated purpose of 20 to
   190 characters, a mandatory expiry of at most 730 days, recorded with who set
   it and when (and who released it). While it stands nothing about that job is
@@ -476,8 +478,8 @@ maintenance (which runs on every worker claim and on the admin queue page):
   matches on its ids, scope and creation time; a restored request post matches
   only on its opaque identity and only when no job row currently uses that request
   or job id (auto-increment ids can be recycled after a restore and must never
-  reach a live record). Jobs created before the identity existed are recognised by
-  their job row only. Tombstones are kept 120 days, longer than the 90-day backup
+  reach a live record). Jobs created before the identity existed are given one
+  (adopting what their request already carries) by the next maintenance run. Tombstones are kept 120 days, longer than the 90-day backup
   rotation, then purged.
 - Deletion scrubs the contact fields first, then deletes the private request and
   the job row; if any step fails the record stays (and is retried) rather than

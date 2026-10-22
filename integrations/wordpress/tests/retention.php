@@ -24,7 +24,7 @@ function ct_test_aged_job( $host, $status, $accepted, $closed, $version = '2026-
 	$request_ids[] = $request_id;
 	$event = ct_scan_on_request_ready( $request_id, $fields );
 	ct_test_assert( is_array( $event ), 'Retention fixture job was not created.' );
-	$update = array( 'status' => $status, 'terms_accepted_at' => ct_test_old( $accepted ), 'created_at' => ct_test_old( $accepted ), 'terms_version' => $version, 'confirmation_token_hash' => null );
+	$update = array( 'status' => $status, 'terms_accepted_at' => ct_test_old( $accepted ), 'created_at' => ( new DateTimeImmutable( ct_test_old( $accepted ), new DateTimeZone( 'UTC' ) ) )->modify( '+30 seconds' )->format( 'Y-m-d H:i:s' ), 'terms_version' => $version, 'confirmation_token_hash' => null );
 	if ( null !== $closed ) {
 		$update['finished_at'] = ct_test_old( $closed );
 		$update['result_json'] = '{"fixture":true}';
@@ -277,6 +277,97 @@ ct_scan_maintenance_locked();
 ct_test_assert( ! ct_test_exists( $rel ) && ct_test_exists( $damaged ), 'Release did not allow deletion, or a damaged hold allowed it.' );
 wp_set_current_user( 0 );
 ct_test_assert( 'hold_forbidden' === ct_scan_admin_release_hold( $damaged['job_id'] )->get_error_code() && ct_test_exists( $damaged ) && ! empty( ct_scan_row( $damaged['job_id'] )->hold_reason ), 'An anonymous caller released a hold.' );
+
+
+// ---- Second review: no starvation, identity backfill, damaged holds, far-future dates ---------------------------
+// Doubtful rows (a deletion date a year short of the floor) are judged once a day and cannot hide a due job.
+$doubtful = array();
+for ( $i = 0; $i < 52; $i++ ) {
+	$d = ct_test_aged_job( "ret-doubtful-$i.example.net", 'failed', '-3 years -1 day', '-1 day' );
+	$wpdb->update( $jobs, array( 'created_at' => ct_test_old( '-1 day' ) ), array( 'job_id' => $d['job_id'] ) );
+	$doubtful[] = $d;
+}
+$due_behind = ct_test_aged_job( 'ret-behind-doubtful.example.net', 'failed', '-3 years -2 days', '-2 days' );
+$wpdb->update( $jobs, array( 'retain_until' => ct_test_old( '-1 year' ) ), array( 'job_id' => $due_behind['job_id'] ) ); // sorts first, but is itself doubtful
+// Due only after all the doubtful rows in date order (so a 50-row window would never reach it).
+$really_due = ct_test_aged_job( 'ret-really-due.example.net', 'failed', '-3 years -2 hours', '-1 hour' );
+for ( $run = 0; $run < 3; $run++ ) {
+	ct_scan_maintenance_locked();
+}
+ct_test_assert( ! ct_test_exists( $really_due ), 'Doubtful rows starved a due job.' );
+ct_test_assert( 52 === count( array_filter( $doubtful, 'ct_test_exists' ) ) && ct_test_exists( $due_behind ), 'Doubtful rows were deleted.' );
+ct_test_assert( ! empty( ct_scan_row( $doubtful[0]['job_id'] )->retention_checked_at ), 'A doubtful row was not marked as examined.' );
+foreach ( array_merge( $doubtful, array( $due_behind ) ) as $d ) {
+	$wpdb->delete( $jobs, array( 'job_id' => $d['job_id'] ) );
+	wp_delete_post( $d['request_id'], true );
+}
+
+// A job from before the identity existed gets one (adopting what its request carries), so a restore can be recognised.
+$legacy = ct_test_aged_job( 'ret-preidentity.example.net', 'failed', '-3 years -2 days', '-2 days' );
+$wpdb->update( $jobs, array( 'identity' => null, 'retain_until' => ct_test_old( '+1 day' ) ), array( 'job_id' => $legacy['job_id'] ) );
+delete_post_meta( $legacy['request_id'], '_ct_scan_identity' );
+ct_scan_maintenance_locked();
+$identity = ct_scan_row( $legacy['job_id'] )->identity;
+ct_test_assert( 1 === preg_match( '/\A[a-f0-9]{32}\z/', (string) $identity ) && $identity === ct_scan_meta_string( $legacy['request_id'], '_ct_scan_identity' ), 'A job without an identity was not given one together with its request.' );
+$carried = ct_test_aged_job( 'ret-carried.example.net', 'failed', '-3 years -2 days', '-2 days' );
+$wpdb->update( $jobs, array( 'identity' => null, 'retain_until' => ct_test_old( '+1 day' ) ), array( 'job_id' => $carried['job_id'] ) );
+update_post_meta( $carried['request_id'], '_ct_scan_identity', str_repeat( 'a', 32 ) );
+ct_scan_maintenance_locked();
+ct_test_assert( str_repeat( 'a', 32 ) === ct_scan_row( $carried['job_id'] )->identity && str_repeat( 'a', 32 ) === ct_scan_meta_string( $carried['request_id'], '_ct_scan_identity' ), 'An identity the request already carried was replaced.' );
+// Then delete it and restore the post: it is recognised and deleted again.
+$wpdb->update( $jobs, array( 'retain_until' => ct_test_old( '-1 hour' ) ), array( 'job_id' => $legacy['job_id'] ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ! ct_test_exists( $legacy ) && ! get_post( $legacy['request_id'] ), 'Fixture expected the pre-identity job to be deleted.' );
+wp_insert_post( array( 'import_id' => $legacy['request_id'], 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'restored' ) );
+update_post_meta( $legacy['request_id'], '_ct_scan_job_id', $legacy['job_id'] );
+update_post_meta( $legacy['request_id'], '_ct_scan_identity', $identity );
+ct_scan_maintenance_locked();
+ct_test_assert( ! get_post( $legacy['request_id'] ), 'The restored request of a pre-identity job was not deleted again.' );
+// The duplicate-event path restores the identity meta of a request that lost it.
+list( $dup_id, $dup_fields ) = ct_test_request( 'ret-dup.example.net' );
+$request_ids[] = $dup_id;
+$dup_event = ct_scan_on_request_ready( $dup_id, $dup_fields );
+$dup_identity = ct_scan_row( $dup_event['job_id'] )->identity;
+ct_test_assert( 1 === preg_match( '/\A[a-f0-9]{32}\z/', (string) $dup_identity ) && $dup_identity === ct_scan_meta_string( $dup_id, '_ct_scan_identity' ), 'A new job does not carry its identity on the request.' );
+delete_post_meta( $dup_id, '_ct_scan_identity' );
+delete_post_meta( $dup_id, '_ct_scan_event_recorded' );
+ct_scan_on_request_ready( $dup_id, $dup_fields );
+ct_test_assert( $dup_identity === ct_scan_meta_string( $dup_id, '_ct_scan_identity' ), 'The duplicate-event path left the request without its identity.' );
+
+// A damaged hold (zero expiry) also protects the findings.
+$zero_hold = ct_test_aged_job( 'ret-zero-hold.example.net', 'completed', '-2 years', '-13 months' );
+$wpdb->update( $jobs, array( 'hold_reason' => 'Preserving for a dispute (damaged expiry).', 'hold_until' => '0000-00-00 00:00:00' ), array( 'job_id' => $zero_hold['job_id'] ) );
+ct_scan_maintenance_locked();
+ct_test_assert( null !== ct_scan_row( $zero_hold['job_id'] )->result_json, 'A hold with a zero expiry did not protect the findings.' );
+
+// A far-future creation date does not defeat the creation floor.
+$future = ct_test_aged_job( 'ret-future.example.net', 'failed', '-3 years -2 days', '-2 days' );
+$wpdb->update( $jobs, array( 'created_at' => '9999-01-01 00:00:00' ), array( 'job_id' => $future['job_id'] ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ct_test_exists( $future ) && ! ct_scan_valid_datetime( '9999-01-01 00:00:00' ) && ! ct_scan_valid_datetime( '10000-01-01 00:00:00' ), 'A far-future date was accepted.' );
+
+// A restored request hidden behind many newer tombstones that point at live records is still found.
+$buried = ct_test_aged_job( 'ret-buried.example.net', 'failed', '-3 years -2 days', '-2 days' );
+ct_scan_maintenance_locked();
+ct_test_assert( ! ct_test_exists( $buried ), 'Fixture expected the buried job to be deleted.' );
+$buried_stone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $buried['job_id'] ) );
+for ( $i = 0; $i < 55; $i++ ) {
+	$wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => 770000000 + $i, 'request_id' => 780000000 + $i, 'scope_hash' => str_repeat( 'd', 64 ), 'created_at' => ct_test_old( '-1 hour' ), 'deleted_at' => ct_test_old( '-1 minute' ), 'reason' => 'retention', 'identity' => bin2hex( random_bytes( 16 ) ) ) );
+}
+wp_insert_post( array( 'import_id' => $buried['request_id'], 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'restored' ) );
+update_post_meta( $buried['request_id'], '_ct_scan_job_id', $buried['job_id'] );
+update_post_meta( $buried['request_id'], '_ct_scan_identity', $buried_stone->identity );
+ct_scan_maintenance_locked();
+ct_test_assert( ! get_post( $buried['request_id'] ), 'Newer tombstones hid a restored request from cleanup.' );
+
+wp_set_current_user( 1 );
+// Placing a new hold clears the audit of an earlier release.
+$reheld = ct_test_aged_job( 'ret-reheld.example.net', 'failed', '-1 day', '-1 hour' );
+ct_scan_admin_set_hold( $reheld['job_id'], 'First preservation purpose for this job.', 10 );
+ct_scan_admin_release_hold( $reheld['job_id'] );
+ct_scan_admin_set_hold( $reheld['job_id'], 'Second preservation purpose for this job.', 10 );
+$rh = ct_scan_row( $reheld['job_id'] );
+ct_test_assert( null === $rh->hold_released_by && null === $rh->hold_released_at && 'Second preservation purpose for this job.' === $rh->hold_reason, 'A new hold kept the audit of an earlier release.' );
 
 // Deletion that cannot complete leaves the record (and its tombstone) rather than half-deleting.
 $stuck = ct_test_aged_job( 'ret-stuck.example.net', 'failed', '-3 years -1 day', '-1 day' );
