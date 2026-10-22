@@ -317,6 +317,9 @@ class WorkerNetworkTests(unittest.TestCase):
                 return None
 
         class TLSContext:
+            verify_mode = network.ssl.CERT_REQUIRED
+            check_hostname = True
+
             def wrap_socket(self, raw, *, server_hostname):
                 calls.append(server_hostname)
                 return raw
