@@ -72,6 +72,35 @@ Thresholds come from the PHP project's advisories for [CVE-2026-109618](https://
 
 Check only websites you are authorized to assess, and keep real target lists and results out of version control.
 
+## Agent skill
+
+The [php2shell-check skill](skills/php2shell-check/SKILL.md) guides an agent
+through authorized passive checks, report creation, interpretation of uncertain
+results, and preservation of interrupted runs. It uses the existing CLI and
+contains no separate scanner or runtime dependencies.
+
+Copy the entire `skills/php2shell-check/` directory into your agent's skill
+directory, keeping `SKILL.md` and `agents/openai.yaml` together. For Codex, use
+`$CODEX_HOME/skills/php2shell-check/` (normally
+`~/.codex/skills/php2shell-check/`) for a personal installation, or
+`.agents/skills/php2shell-check/` in the project where you want to use it.
+Check for an existing installation before copying so local edits are preserved.
+Reload the agent session if needed to discover the skill.
+
+The skill can be installed independently, but running checks still requires
+Python 3.10+ and a checkout of this repository or its `wordpress_check.py` file.
+It explains how to locate or obtain the checker; do not assume it lives beside
+the installed skill. Then ask, for example:
+
+```text
+Use $php2shell-check with my local checker checkout to assess the authorized
+websites in /path/to/authorized-sites.txt. Save JSON to a new file outside the
+repository, summarize the evidence and unknown results, and report the rule date.
+```
+
+For agents contributing to this repository, [AGENTS.md](AGENTS.md) contains the
+shared development instructions; [CLAUDE.md](CLAUDE.md) points Claude to them.
+
 ## Documentation
 
 - [Full reference](docs/REFERENCE.md): every CLI option, output field, and request rule
