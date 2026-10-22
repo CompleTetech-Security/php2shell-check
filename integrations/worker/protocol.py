@@ -21,6 +21,9 @@ API_SITE_URL = "https://complete.tech"
 API_HOST = "complete.tech"
 API_BASE_PATH = "/wp-json/ct-scan/v1"
 AUTH_ROUTE_PREFIX = "/ct-scan/v1"
+ROUTES = frozenset(
+    f"{AUTH_ROUTE_PREFIX}/{name}" for name in ("claim", "start", "admit", "result")
+)
 API_MAX_BODY = 64 * 1024
 API_MAX_RESPONSE = 16 * 1024
 MAX_JOB_ID = 2**63 - 1
@@ -33,10 +36,12 @@ JOB_ERROR_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 class APIError(Exception):
     """A transport or protocol failure with a log-safe category."""
 
-    def __init__(self, slug: str, *, status: int | None = None):
+    def __init__(self, slug: str, *, status: int | None = None, payload=None):
         super().__init__(slug)
         self.slug = slug
         self.status = status
+        # Parsed JSON object of a non-2xx answer, when one was returned (never logged).
+        self.payload = payload
 
 
 @dataclass(frozen=True)
@@ -51,7 +56,7 @@ class JobClaim:
 
 
 def auth_headers(secret: bytes, timestamp: int, nonce: str, route: str, raw_body: bytes) -> dict[str, str]:
-    if route not in {f"{AUTH_ROUTE_PREFIX}/claim", f"{AUTH_ROUTE_PREFIX}/start", f"{AUTH_ROUTE_PREFIX}/result"}:
+    if route not in ROUTES:
         raise ValueError("invalid_route")
     timestamp_text = str(timestamp)
     body_hash = hashlib.sha256(raw_body).hexdigest()
@@ -129,15 +134,15 @@ class APIClient:
         self._nonce_factory = nonce_factory or (lambda: secrets.token_hex(16))
         self._transport = transport or PinnedOpener(RequestOrigin(API_HOST, "https", 443))
 
-    def post(self, route: str, payload):
+    def post(self, route: str, payload, *, timeout: float = 10.0):
         try:
             raw_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         except (TypeError, ValueError, UnicodeError) as exc:
             raise APIError("invalid_api_payload") from exc
-        return self.post_raw(route, raw_body)
+        return self.post_raw(route, raw_body, timeout=timeout)
 
-    def post_raw(self, route: str, raw_body: bytes):
-        if route not in {"/ct-scan/v1/claim", "/ct-scan/v1/start", "/ct-scan/v1/result"}:
+    def post_raw(self, route: str, raw_body: bytes, *, timeout: float = 10.0):
+        if route not in ROUTES:
             raise APIError("invalid_route")
         if not isinstance(raw_body, bytes) or len(raw_body) > API_MAX_BODY:
             raise APIError("api_payload_too_large")
@@ -149,7 +154,7 @@ class APIClient:
         full_url = API_SITE_URL + "/wp-json" + route
         request = Request(full_url, data=raw_body, headers=headers, method="POST")
         try:
-            response = self._transport.open(request, timeout=10.0)
+            response = self._transport.open(request, timeout=timeout)
         except (http.client.HTTPException, OSError, URLError, TimeoutError, ValueError) as exc:
             raise APIError("api_network_error") from exc
         try:
@@ -160,12 +165,12 @@ class APIClient:
             raise APIError("api_network_error") from exc
         if len(raw_response) > API_MAX_RESPONSE:
             raise APIError("api_response_too_large", status=status)
-        if not 200 <= status < 300:
-            raise APIError(f"api_http_{status}", status=status)
         try:
             decoded = json.loads(raw_response.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise APIError("invalid_api_response", status=status) from exc
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            decoded = None
+        if not 200 <= status < 300:
+            raise APIError(f"api_http_{status}", status=status, payload=decoded if isinstance(decoded, dict) else None)
         if not isinstance(decoded, dict):
             raise APIError("invalid_api_response", status=status)
         return decoded
@@ -180,6 +185,19 @@ class APIClient:
             {"id": claim.job_id, "lease": claim.lease, "scope_hash": claim.scope_hash},
         )
         return type(response.get("ok")) is bool and response["ok"] is True
+
+    def admit(self, claim: JobClaim, kind: str) -> dict:
+        """Ask WordPress to admit one request ("http") or report liveness ("probe").
+
+        A short timeout keeps a slow store from stalling the supervisor; a timeout is a refusal.
+        """
+        if kind not in {"http", "probe"}:
+            raise APIError("invalid_admission_kind")
+        return self.post(
+            "/ct-scan/v1/admit",
+            {"id": claim.job_id, "lease": claim.lease, "scope_hash": claim.scope_hash, "kind": kind},
+            timeout=5.0,
+        )
 
     def result(self, body: bytes) -> dict:
         response = self.post_raw("/ct-scan/v1/result", body)

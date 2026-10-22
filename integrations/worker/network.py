@@ -206,26 +206,32 @@ def _connect_socket(family, address: str, port: int, timeout, source_address=Non
 
 
 class PinnedHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, host, port, *, pinned_family, pinned_address, timeout=None, **kwargs):
+    def __init__(self, host, port, *, pinned_family, pinned_address, timeout=None, before_connect=None, **kwargs):
         super().__init__(host, port, timeout=timeout, **kwargs)
         self._pinned_family = pinned_family
         self._pinned_address = pinned_address
+        self._before_connect = before_connect
 
     def connect(self):
+        if self._before_connect is not None:
+            self._before_connect()
         self.sock = _connect_socket(
             self._pinned_family, self._pinned_address, self.port, self.timeout, self.source_address
         )
 
 
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, port, *, pinned_family, pinned_address, timeout=None, context=None, **kwargs):
+    def __init__(self, host, port, *, pinned_family, pinned_address, timeout=None, context=None, before_connect=None, **kwargs):
         super().__init__(host, port, timeout=timeout, context=context or ssl.create_default_context(), **kwargs)
         self._pinned_family = pinned_family
         self._pinned_address = pinned_address
+        self._before_connect = before_connect
 
     def connect(self):
         if self._tunnel_host:
             raise OSError("tunnels are disabled")
+        if self._before_connect is not None:
+            self._before_connect()
         raw = _connect_socket(
             self._pinned_family, self._pinned_address, self.port, self.timeout, self.source_address
         )
@@ -238,9 +244,10 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 class _ManagedResponse:
-    def __init__(self, response, connection):
+    def __init__(self, response, connection, on_close=None):
         self._response = response
         self._connection = connection
+        self._on_close = on_close
         self.code = response.status
         self.headers = response.headers
 
@@ -251,7 +258,11 @@ class _ManagedResponse:
         try:
             self._response.close()
         finally:
-            self._connection.close()
+            try:
+                self._connection.close()
+            finally:
+                if self._on_close is not None:
+                    self._on_close()
 
     def __enter__(self):
         return self
@@ -261,12 +272,19 @@ class _ManagedResponse:
 
 
 class PinnedOpener:
-    """urllib-compatible single request transport with no proxies or auto-redirects."""
+    """urllib-compatible single request transport with no proxies or auto-redirects.
 
-    def __init__(self, scope: RequestOrigin, *, resolver=socket.getaddrinfo, ssl_context=None):
+    With an admission ``guard`` (the scanner child), every request first obtains a
+    one-request admission from the supervisor, re-checks that it is still fresh
+    immediately before connecting, and reports completion. Without a guard (the
+    fixed WordPress API client and offline tests) no target is contacted.
+    """
+
+    def __init__(self, scope: RequestOrigin, *, resolver=socket.getaddrinfo, ssl_context=None, guard=None):
         self.scope = scope
         self.resolver = resolver
         self.ssl_context = ssl_context or ssl.create_default_context()
+        self.guard = guard
 
     def open(self, request, timeout=None):
         url = request.full_url if hasattr(request, "full_url") else str(request)
@@ -275,19 +293,30 @@ class PinnedOpener:
         scheme, port, host, target = self.scope.validate_request(url)
         answers = _public_addresses(host, port, self.resolver)
         family, address = answers[0]
-        connection_type = PinnedHTTPSConnection if scheme == "https" else PinnedHTTPConnection
-        kwargs = {"pinned_family": family, "pinned_address": address, "timeout": timeout}
-        if scheme == "https":
-            kwargs["context"] = self.ssl_context
-        connection = connection_type(host, port, **kwargs)
-        headers = dict(request.header_items()) if hasattr(request, "header_items") else {}
-        headers["Connection"] = "close"
-        method = request.get_method() if hasattr(request, "get_method") else "GET"
-        body = getattr(request, "data", None)
+        guard = self.guard
+        if guard is not None:
+            # No grant, no connection. Raises before any socket is opened.
+            guard.admit()
         try:
-            connection.request(method, target, body=body, headers=headers)
-            response = connection.getresponse()
-            return _ManagedResponse(response, connection)
+            connection_type = PinnedHTTPSConnection if scheme == "https" else PinnedHTTPConnection
+            kwargs = {"pinned_family": family, "pinned_address": address, "timeout": timeout}
+            if guard is not None:
+                kwargs["before_connect"] = guard.ensure_fresh
+            if scheme == "https":
+                kwargs["context"] = self.ssl_context
+            connection = connection_type(host, port, **kwargs)
+            headers = dict(request.header_items()) if hasattr(request, "header_items") else {}
+            headers["Connection"] = "close"
+            method = request.get_method() if hasattr(request, "get_method") else "GET"
+            body = getattr(request, "data", None)
+            try:
+                connection.request(method, target, body=body, headers=headers)
+                response = connection.getresponse()
+                return _ManagedResponse(response, connection, guard.done if guard is not None else None)
+            except BaseException:
+                connection.close()
+                raise
         except BaseException:
-            connection.close()
+            if guard is not None:
+                guard.done()
             raise

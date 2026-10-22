@@ -32,11 +32,12 @@ flowchart LR
   confirm. Mailbox control is not independent proof of domain ownership.
 - The confirmation email also carries a separate Stop link, also hashed at
   rest. GET only shows a Stop form; a nonce-protected POST cancels the job
-  (`customer_stopped`) under the queue lock. Claims and starts then refuse it
-  and late results are rejected. A check the worker already started may finish
-  its current requests: there is not yet a per-request admission guard. Stopping
-  a finished job changes nothing and does not block its report. Schema 2 adds
-  `stop_token_hash`; the upgrade runs automatically on `init`.
+  (`customer_stopped`) under the queue lock. Claims, starts, results and
+  request admissions then refuse it (see "Per-request admission"). A request
+  already admitted when the Stop is recorded may finish within its ten-second
+  timeout; no further request is admitted. Stopping a finished job changes
+  nothing and does not block its report. Schema 2 added `stop_token_hash`;
+  upgrades run automatically on `init`.
 - Jobs have atomic claims. A claim that was never started can be recovered;
   a started job with an uncertain outcome is not automatically scanned again.
   A lost result acknowledgement retries the stored receipt, not the scan.
@@ -57,7 +58,7 @@ flowchart LR
 
 ## Worker protocol
 
-The three POST routes are `claim`, `start` and `result`, under
+The four POST routes are `claim`, `start`, `admit` and `result`, under
 `/wp-json/ct-scan/v1/`.
 Each request carries `X-CT-Timestamp` (Unix seconds), `X-CT-Nonce` (32 lowercase
 hex characters), and `X-CT-Signature` (HMAC-SHA256 hex). The signed string is the
@@ -74,6 +75,68 @@ and `scope_hash`. `result` accepts those plus `outcome`, `result`, `error` and
 `result:null` and a safe error category. Acknowledgements are `{"ok":true}`.
 The scan output is bounded to 32 KiB. A replayed identical receipt is accepted
 idempotently; changing its contents is a conflict.
+
+## Per-request admission
+
+The scanner subprocess holds no key. Before every connection to the customer's
+site it asks the root supervisor over a private socket pair; the supervisor
+calls the signed `admit` route; WordPress decides under the same queue lock
+that serializes Stop, operator revocation, expiry, claims, starts and results.
+`admit` accepts `id`, `lease`, `scope_hash` and `kind` (`http` or `probe`).
+
+`http` is granted only if all of these hold at that moment: the job is
+`running` with the presented lease and scope hash, the lease has not lapsed,
+the recipient was confirmed, the saved authorization still reads back
+unchanged and unexpired (including operator revocation), the job's frozen
+profile is known, the previous grant is at least one second old, and fewer than
+the profile's budget of requests (20 for `r2-header-v1`: robots.txt up to six
+hops plus the homepage up to six hops with one HTTP-to-HTTPS change) were
+reserved. The reservation and its time are written in the same compare-and-set
+update as the decision, so a lost worker lease, a duplicate delivery or a
+restart cannot create a fresh budget. A grant is consumed when issued, is
+valid for one second and covers one connection and one request. `probe` only
+reports whether the job is still live; it takes no budget and has no pacing.
+Refusals use `410` (permanent: cancelled, expired, revoked, lease, profile,
+unconfirmed, clock anomaly), `409` (`budget_exhausted`), `429` (`rate_wait`
+with `retry_after_ms`, bounded retries) and `503` (`queue_busy`, the lock is
+held elsewhere). A `503` for a disabled integration or a schema mismatch also
+refuses. Nothing is admitted unless WordPress says so.
+
+Enforcement in the supervisor and scanner:
+
+- No grant, no connection: the network adapter asks for admission after
+  destination validation and before opening any socket, re-checks that the
+  grant is under one second old immediately before connecting, and reports
+  completion. A scanner started without the supervisor socket refuses to run.
+- One grant is outstanding at a time. A second request, an unexpected message
+  or an oversized message ends the scan (`admission_protocol_violation`).
+- The supervisor measures the disclosed ten-second request bound from the
+  grant (plus one second of grace) and kills the scanner on overrun
+  (`request_deadline_exceeded`).
+- While the scanner runs, the supervisor probes the job about every two
+  seconds, including during backoff, and kills the scanner as soon as
+  WordPress reports that it is cancelled, expired or revoked. The abort is
+  therefore bounded by the probe interval plus the five-second probe timeout,
+  and by the ten-second request bound in any case.
+- An unreachable guard refuses the next admission (`admission_guard_unavailable`)
+  and does not extend the bound on a request already admitted. Expired
+  authorization is refused locally without a call.
+- `SubprocessRunner.run` refuses to start without a gate.
+
+A refusal fails the run with an `admission_<reason>` category (for example
+`admission_job_cancelled`, `admission_budget_exhausted`). The result for a job
+already cancelled is rejected by WordPress as before. A budget or time stop is
+a failed receipt, never a clean result, and no automatic rescan follows.
+
+What this does not do: it cannot constrain a compromised scanner that ignores
+the protocol and opens its own sockets. The unprivileged UID and the
+memory/process limits help, but egress filtering at the host or container
+network layer (allow only the customer's HTTP/80 and HTTPS/443 destinations,
+deny private, link-local and metadata ranges) is the necessary second boundary.
+`deployment/compose.yaml` does not itself enforce it; that is a deployment
+responsibility. DNS lookups of the already authorized hostname happen before
+admission and are not treated as target requests. The supervisor therefore also
+enforces the deadline and the stop by killing the scanner's process group.
 
 Receipt retries stop at authorization expiry or one hour after lease expiry,
 whichever comes first. Permanent rejection keeps the receipt in the private
@@ -211,6 +274,10 @@ The default configuration is disabled, and no historical request sweep exists.
 5. Apply the reviewed site patch/terms update, then set `enabled` true. The
    runner must authenticate successfully before accepting live submissions.
    A matching revision and key are required; mismatches fail closed.
+
+Schema 3 adds `profile_id`, `http_admitted` and `last_admit_ms` to the jobs
+table (existing rows default to `r2-header-v1` with empty counters); the
+upgrade runs on `init` and the worker API refuses requests until it completes.
 
 The healthcheck requires a successful authenticated exchange in the last ten
 minutes. Use `docker compose -p ct-php2shell -f deployment/compose.yaml ps` and
