@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import html
 import json
 import math
+import mimetypes
 import re
 import socket
 import sys
@@ -490,15 +493,123 @@ def csv_safe(value):
     return value
 
 
+DEFAULT_LOGO = Path(__file__).resolve().parent / "assets" / "logo.png"
+STATUS_ORDER = {"potentially_affected": 0, "unknown": 1, "fixed_version_reported": 2}
+STATUS_LABELS = {
+    "potentially_affected": "Potentially affected",
+    "fixed_version_reported": "Fixed version reported",
+    "unknown": "Unknown",
+}
+REPORT_CSS = """
+:root{--bg:#F8FAFC;--surface:#FFFFFF;--surface-2:#EEF2FF;--ink:#0F172A;--ink-2:#1E293B;--ink-3:#64748B;--line:#E2E8F0;
+--accent:#1E3A8A;--accent-text:#1E3A8A;--on-accent:#FFFFFF;--bad:#B42318;--bad-bg:#FEE4E2;--ok:#067647;--ok-bg:#DCFAE6;--unk:#475467;--unk-bg:#EAECF0}
+@media (prefers-color-scheme:dark){:root{--bg:#0F172A;--surface:#1E293B;--surface-2:#273449;--ink:#F1F5F9;--ink-2:#CBD5E1;--ink-3:#94A3B8;
+--line:#334155;--accent-text:#93C5FD;--bad:#FDA29B;--bad-bg:#55160C;--ok:#75E0A7;--ok-bg:#053321;--unk:#D0D5DD;--unk-bg:#344054}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Arial,system-ui,sans-serif}
+main{max-width:1080px;margin:0 auto;padding:24px 16px 48px}
+header{display:flex;gap:20px;align-items:center;padding:20px 0;border-bottom:3px solid var(--accent);margin-bottom:20px}
+header img{height:64px;width:auto;border-radius:8px;background:#F8FAFC;padding:4px}
+.eyebrow{font-size:12px;letter-spacing:.12em;font-weight:700;color:var(--accent-text);text-transform:uppercase}
+h1{margin:2px 0;font-size:26px}.sub{color:var(--ink-3);margin:0}h2{margin:32px 0 10px;font-size:18px;color:var(--ink-2)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px}
+.tile b{display:block;font-size:28px;color:var(--accent-text)}.tile span{color:var(--ink-3);font-size:13px}
+.tile.bad b{color:var(--bad)}.tile.ok b{color:var(--ok)}
+.wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line)}
+table.narrow{max-width:360px}
+th{background:var(--accent);color:var(--on-accent);text-align:left;padding:8px 10px;font-size:13px;white-space:nowrap}
+td{padding:8px 10px;border-top:1px solid var(--line);vertical-align:top;font-size:14px}tr:nth-child(even) td{background:var(--surface-2)}
+td.site{overflow-wrap:anywhere;min-width:200px}td.notes{color:var(--ink-3);font-size:13px;min-width:240px}
+code{font:13px Consolas,monospace}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+.pill.potentially_affected{color:var(--bad);background:var(--bad-bg)}.pill.fixed_version_reported{color:var(--ok);background:var(--ok-bg)}
+.pill.unknown{color:var(--unk);background:var(--unk-bg)}
+.callout{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:12px 16px;color:var(--ink-2)}
+footer{margin-top:40px;padding-top:12px;border-top:1px solid var(--line);color:var(--ink-3);font-size:12px}
+a{color:var(--accent-text)}
+@media print{body{background:#fff}tr,.tile{break-inside:avoid}}
+"""
+
+
+def logo_data_uri(path) -> str:
+    """Inline a local logo so the report stays a single offline file; a missing logo is omitted."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return ""
+    mime = mimetypes.guess_type(str(path))[0] or "image/png"
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def render_html(rows, *, logo=DEFAULT_LOGO, brand="CompleteTech LLC", generated_at=None) -> str:
+    """Render result dictionaries as a self-contained, script-free HTML report."""
+    def esc(value):
+        return html.escape("" if value is None else str(value))
+
+    generated_at = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    rows = sorted(rows, key=lambda row: STATUS_ORDER.get(row.get("php2shell_status"), 1))
+    counts = {key: sum(row.get("php2shell_status") == key for row in rows) for key in STATUS_ORDER}
+    tiles = (
+        ("", len(rows), "Websites checked"),
+        ("bad", counts["potentially_affected"], "Potentially affected"),
+        ("ok", counts["fixed_version_reported"], "Fixed version reported"),
+        ("", counts["unknown"], "Unknown / not disclosed"),
+        ("", sum(row.get("status") in ("wordpress", "likely_wordpress") for row in rows), "WordPress detected"),
+    )
+    body = []
+    for row in rows:
+        status = row.get("php2shell_status") or "unknown"
+        notes = row.get("php2shell_notes") or []
+        body.append(
+            "<tr>"
+            f"<td class=site>{esc(row.get('final_url') or row.get('input_url'))}</td>"
+            f"<td><span class='pill {esc(status)}'>{esc(STATUS_LABELS.get(status, status))}</span></td>"
+            f"<td><code>{esc(row.get('php_version') or '—')}</code></td>"
+            f"<td><code>{esc(row.get('php2shell_fixed_version') or '—')}</code></td>"
+            f"<td>{esc(row.get('status'))}</td>"
+            f"<td>{esc(row.get('http_status') or '—')}</td>"
+            f"<td class=notes>{esc(notes[-1] if notes else row.get('php2shell_recommendation'))}</td>"
+            "</tr>"
+        )
+    fixes = "".join(f"<tr><td>{major}.{minor}</td><td><code>{major}.{minor}.{patch}</code></td></tr>" for (major, minor), patch in PHP2SHELL_FIXES.items())
+    logo_uri = logo_data_uri(logo) if logo else ""
+    logo_html = f"<img src='{logo_uri}' alt='{esc(brand)} logo'>" if logo_uri else ""
+    tile_html = "".join(f"<div class='tile {cls}'><b>{value}</b><span>{esc(label)}</span></div>" for cls, value, label in tiles)
+    sources = " · ".join(f"<a href='{esc(url)}'>{esc(url.rsplit('/', 1)[-1])}</a>" for url in PHP2SHELL_SOURCES)
+    empty = "<tr><td colspan=7>No results.</td></tr>"
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">
+<title>PHP2Shell Exposure Report</title><style>{REPORT_CSS}</style></head>
+<body><main>
+<header>{logo_html}<div><div class="eyebrow">{esc(brand)}</div><h1>PHP2Shell Exposure Report</h1>
+<p class="sub">{' &amp; '.join(PHP2SHELL_CVES)} · generated {esc(generated_at)} · rules as of {PHP2SHELL_RULES_DATE}</p></div></header>
+<div class="tiles">{tile_html}</div>
+<h2>Results</h2>
+<div class="wrap"><table><thead><tr><th>Website</th><th>PHP2Shell</th><th>PHP reported</th><th>Upstream fix</th><th>Detection</th><th>HTTP</th><th>Notes</th></tr></thead>
+<tbody>{''.join(body) or empty}</tbody></table></div>
+<h2>Upstream fix thresholds</h2>
+<div class="wrap"><table class="narrow"><thead><tr><th>Branch</th><th>Fixed in</th></tr></thead><tbody>{fixes}</tbody></table></div>
+<h2>How to read this report</h2>
+<p class="callout"><b>Potential exposure is not confirmed exploitability.</b> Results compare PHP versions that servers advertise
+in public headers with upstream fix releases. No exploit payloads were sent. Distributions can backport fixes without changing the
+version number, and hidden versions are reported as unknown, not safe. Administrators should verify the installed package and runtime.</p>
+<footer>{esc(brand)} · Generated by php2shell-check · Sources: {sources}</footer>
+</main></body></html>
+"""
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("urls", nargs="*", help="Website URLs or bare domains (defaults to HTTPS)")
     parser.add_argument("--input", type=Path, help="UTF-8 text file: one URL per line; # comments allowed")
     parser.add_argument("--output", type=Path, help="Save results here; otherwise write to stdout")
-    parser.add_argument("--format", choices=("csv", "json"), default="csv")
+    parser.add_argument("--format", choices=("csv", "json", "html"), default="csv", help="csv, json, or a branded html report")
     parser.add_argument("--delay", type=positive_float, default=1.0, help="Minimum seconds between requests to an origin (default: 1)")
     parser.add_argument("--timeout", type=positive_float, default=15.0, help="Socket timeout per request (default: 15 seconds)")
     parser.add_argument("--contact", default="", help="Public contact URL/email to include in the honest User-Agent")
+    parser.add_argument("--logo", type=Path, default=DEFAULT_LOGO, help="Logo image for the html report (default: assets/logo.png)")
+    parser.add_argument("--brand", default="CompleteTech LLC", help="Organization name shown on the html report")
     args = parser.parse_args(argv)
     if any(ord(c) < 32 or ord(c) == 127 for c in args.contact):
         parser.error("--contact must not contain control characters")
@@ -516,10 +627,11 @@ def main(argv=None) -> int:
     checker = Checker(timeout=args.timeout, delay=args.delay, contact=args.contact)
     output = args.output.open("w", encoding="utf-8", newline="") if args.output else sys.stdout
     writer = csv.DictWriter(output, fieldnames=list(Result.__dataclass_fields__)) if args.format == "csv" else None
+    report_rows = []
     try:
         if writer:
             writer.writeheader()
-        else:
+        elif args.format == "json":
             output.write("[\n")
         for index, url in enumerate(urls):
             result = checker.check(url)
@@ -527,14 +639,19 @@ def main(argv=None) -> int:
             row = asdict(result)
             if writer:
                 writer.writerow({key: csv_safe(value) for key, value in row.items()})
+            elif args.format == "html":
+                report_rows.append(row)
             else:
                 if index:
                     output.write(",\n")
                 output.write(json.dumps(row, ensure_ascii=False, indent=2))
             output.flush()
-        if not writer:
+        if args.format == "json":
             output.write("\n]\n")
     finally:
+        # An interrupted html run still reports the websites that completed.
+        if args.format == "html":
+            output.write(render_html(report_rows, logo=args.logo, brand=args.brand))
         if args.output:
             output.close()
     return 0

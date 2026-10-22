@@ -156,6 +156,20 @@ class HeaderAndWorkflowTests(unittest.TestCase):
             self.assertEqual(rows[0]['php2shell_status'], 'potentially_affected')
             self.assertEqual(rows[0]['php2shell_exploitability'], 'not_tested')
 
+    def test_cli_html_report_is_branded_escaped_and_script_free(self):
+        replies = [Response(200, {}, 'User-agent: *\nAllow: /', False),
+                   Response(200, {'x-powered-by': 'PHP/8.2.34'}, '<p>test</p>', False)]
+        output = io.StringIO()
+        with patch.object(Checker, 'request', side_effect=replies), redirect_stdout(output), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(['https://example.test/?q=<b>', '--format', 'html', '--brand', 'Acme & Co']), 0)
+        report = output.getvalue()
+        self.assertIn('Potentially affected', report)
+        self.assertIn('8.2.35', report)
+        self.assertIn('Acme &amp; Co', report)
+        self.assertIn('data:image/png;base64,', report)
+        self.assertNotIn('?q=<b>', report)
+        self.assertNotIn('<script', report)
+
 
 if __name__ == '__main__':
     unittest.main()
