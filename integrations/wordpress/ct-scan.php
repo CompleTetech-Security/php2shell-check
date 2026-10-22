@@ -1242,6 +1242,10 @@ function ct_scan_admin_send_report( $job_id ) {
 			|| '' === trim( (string) $row->manual_remainder_notes ) ) {
 			return new WP_Error( 'report_not_ready', 'Complete and review the manual remainder before sending.' );
 		}
+		// Detailed findings go only to a recipient who confirmed the request, whatever the terminal state.
+		if ( empty( $row->confirmed_at ) ) {
+			return new WP_Error( 'report_recipient_unconfirmed', 'The recipient never confirmed this request. Detailed findings cannot be sent.' );
+		}
 		if ( ! is_email( $row->contact_email )
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_scan_email' ) !== $row->contact_email
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_version' ) !== $row->terms_version

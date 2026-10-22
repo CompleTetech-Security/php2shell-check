@@ -180,10 +180,22 @@ ct_test_assert( 'accepted' === ct_scan_row( $event['job_id'] )->report_notificat
 ct_test_assert( is_wp_error( ct_scan_admin_save_manual_remainder( $event['job_id'], 'Edited after send' ) ), 'Report details must freeze after a send attempt.' );
 ct_test_assert( true === ct_scan_admin_record_delivery( $event['job_id'] ), 'Independently confirmed delivery did not persist.' );
 
+// An expired, never-confirmed request cannot receive detailed findings, even after manual review.
+list( $unconfirmed_id, $unconfirmed_fields ) = ct_test_request( 'unconfirmed-report-fixture.example.net' );
+$request_ids[] = $unconfirmed_id;
+$unconfirmed_event = ct_scan_on_request_ready( $unconfirmed_id, $unconfirmed_fields );
+$wpdb->update( $jobs, array( 'status' => 'expired', 'error_code' => 'confirmation_expired', 'finished_at' => ct_scan_utc_now(), 'confirmation_token_hash' => null ), array( 'job_id' => (int) $unconfirmed_event['job_id'] ) );
+ct_test_assert( true === ct_scan_admin_save_manual_remainder( $unconfirmed_event['job_id'], 'Operator notes entered after expiry.' ), 'Unconfirmed fixture manual notes failed.' );
+$mail_count = count( $mail_calls );
+$unconfirmed_send = ct_scan_admin_send_report( $unconfirmed_event['job_id'] );
+ct_test_assert( is_wp_error( $unconfirmed_send ) && 'report_recipient_unconfirmed' === $unconfirmed_send->get_error_code(), 'An unconfirmed recipient was allowed a detailed report.' );
+ct_test_assert( count( $mail_calls ) === $mail_count && 'not_sent' === ct_scan_row( $unconfirmed_event['job_id'] )->report_notification_status, 'A refused unconfirmed report must not send or change send state.' );
+
 // Unknown mail outcomes remain one-shot; independently confirmed delivery can still be recorded.
 list( $unknown_id, $unknown_fields ) = ct_test_request( 'unknown-mail-fixture.example.net' );
 $request_ids[] = $unknown_id;
 $unknown_event = ct_scan_on_request_ready( $unknown_id, $unknown_fields );
+ct_test_queue_job( $unknown_event['job_id'] );
 $wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $unknown_event['job_id'] ) );
 ct_test_assert( true === ct_scan_admin_save_manual_remainder( $unknown_event['job_id'], 'No remaining work was performed in this fixture.' ), 'Unknown-mail fixture manual notes failed.' );
 $mail_mode = false;
