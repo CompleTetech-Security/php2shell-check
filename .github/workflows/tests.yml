@@ -31,3 +31,40 @@ jobs:
         run: python -m unittest -v
       - name: Check CLI help
         run: python wordpress_check.py --help
+
+  wordpress:
+    name: WordPress queue and authorization
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Start isolated WordPress fixture
+        run: docker compose -p php2shell-ci -f deployment/compose.test.yaml up -d --wait
+      - name: Install disposable WordPress
+        run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/deployment/test-bootstrap.php
+      - name: Test queue, confirmation and receipts
+        run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/integration.php
+      - name: Test Python to WordPress over HTTP with synthetic scan responses
+        run: |
+          fixture=$(docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/deployment/test-http-fixture.php setup)
+          token=$(printf '%s' "$fixture" | jq -r .token)
+          docker run --rm --network php2shell-ci_fixture -v "$PWD:/app:ro" -w /app -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/app -e CT_FIXTURE_TOKEN="$token" python:3.12-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70 python deployment/test-http-worker.py
+          docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/deployment/test-http-fixture.php cleanup
+      - name: Test worker under Linux container privileges
+        run: >-
+          docker run --rm --network none --read-only --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add KILL
+          --security-opt no-new-privileges --pids-limit 32 --memory 384m
+          --tmpfs /tmp:rw,noexec,nosuid,size=32m,mode=1777
+          -v "$PWD:/app:ro" -w /app -e PYTHONDONTWRITEBYTECODE=1
+          python:3.12-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
+          python -m unittest -v test_scan_worker
+      - name: Build and check packaged isolation
+        run: |
+          docker build --build-arg CHECKER_REVISION="$GITHUB_SHA" -f deployment/Dockerfile -t ct-worker-fixture .
+          docker run --rm --network none --read-only --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add KILL --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=16m,mode=1777 -v "$PWD/deployment/test-runtime-image.py:/smoke.py:ro" -e PYTHONPATH=/app --entrypoint python ct-worker-fixture /smoke.py
+      - name: Stop disposable fixture
+        if: always()
+        run: docker compose -p php2shell-ci -f deployment/compose.test.yaml down --volumes

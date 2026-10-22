@@ -12,3 +12,6 @@ results*.json
 websites.txt
 .DS_Store
 Thumbs.db
+.work/
+artifacts/
+deployment/private/

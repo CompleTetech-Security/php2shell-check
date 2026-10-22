@@ -3,3 +3,5 @@
 *.md text eol=lf
 *.yml text eol=lf
 *.txt text eol=lf
+# Unified patch context includes a leading space before source indentation.
+deployment/*.patch -whitespace

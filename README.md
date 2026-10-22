@@ -105,6 +105,8 @@ shared development instructions; [CLAUDE.md](CLAUDE.md) points Claude to them.
 
 - [Full reference](docs/REFERENCE.md): every CLI option, output field, and request rule
 - [Assessment methodology](docs/PHP2SHELL.md): how each version is classified
+- [WordPress free-scan integration](docs/WORDPRESS.md): signed requests, confirmation,
+  private job queue, restricted worker, deployment and recovery
 - [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)
 
 ```sh
