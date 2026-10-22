@@ -17,7 +17,7 @@ if ( ! defined( 'CT_SCAN_DEFAULT_TERMS_VERSION' ) ) {
 }
 
 if ( ! defined( 'CT_SCAN_SCHEMA_VERSION' ) ) {
-	define( 'CT_SCAN_SCHEMA_VERSION', '5' );
+	define( 'CT_SCAN_SCHEMA_VERSION', '6' );
 }
 
 /**
@@ -87,6 +87,12 @@ function ct_scan_config() {
 		// Terms versions whose jobs must prove control of the exact target (DNS TXT, HTTPS file,
 		// or a recorded manual authority review) before any scan can be claimed.
 		'target_control_versions'  => array(),
+		// Owner decisions (2026-10-22): findings 12 months; signed authorization evidence 6 years
+		// after request closure, except r2 and earlier acceptances, which keep 3 years from acceptance.
+		'evidence_retention_years' => 6,
+		'legacy_retention_years'   => array( '2026-10-21-r2' => 3 ),
+		// How long a deletion tombstone is kept: longer than the longest backup rotation (90 days).
+		'tombstone_retention_days' => 120,
 	);
 
 	$path = defined( 'CT_SCAN_PRIVATE_CONFIG' )
@@ -124,6 +130,11 @@ function ct_scan_enabled() {
 function ct_scan_jobs_table() {
 	global $wpdb;
 	return $wpdb->prefix . 'ct_scan_jobs';
+}
+
+function ct_scan_tombstones_table() {
+	global $wpdb;
+	return $wpdb->prefix . 'ct_scan_tombstones';
 }
 
 function ct_scan_nonces_table() {
@@ -198,15 +209,37 @@ function ct_scan_maybe_install_schema() {
 		control_verified_at datetime NULL,
 		control_valid_until datetime NULL,
 		control_evidence text NULL,
+		closed_at datetime NULL,
+		retain_until datetime NULL,
+		hold_reason varchar(190) NULL,
+		hold_until datetime NULL,
+		hold_set_by bigint(20) unsigned NULL,
+		hold_set_at datetime NULL,
 		PRIMARY KEY  (job_id),
 		UNIQUE KEY request_id (request_id),
 		KEY status_created (status,created_at),
 		KEY scope_created (scope_hash,created_at),
 		KEY authorization_expires_at (authorization_expires_at),
 		KEY confirmation_token_hash (confirmation_token_hash),
-		KEY stop_token_hash (stop_token_hash)
+		KEY stop_token_hash (stop_token_hash),
+		KEY retain_until (retain_until)
 	) {$charset};";
 	dbDelta( $sql );
+	// Deletion tombstones: identifiers only, no personal data. A restored backup cannot resurrect a
+	// deleted record because maintenance deletes anything that matches a tombstone again.
+	$tombstones = ct_scan_tombstones_table();
+	dbDelta( "CREATE TABLE {$tombstones} (
+		tombstone_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+		job_id bigint(20) unsigned NOT NULL,
+		request_id bigint(20) unsigned NOT NULL,
+		scope_hash char(64) NOT NULL,
+		created_at datetime NOT NULL,
+		deleted_at datetime NOT NULL,
+		reason varchar(32) NOT NULL,
+		PRIMARY KEY  (tombstone_id),
+		UNIQUE KEY identity (job_id,request_id,scope_hash,created_at),
+		KEY deleted_at (deleted_at)
+	) {$charset};" );
 	$sql = "CREATE TABLE {$nonces} (
 		nonce_hash char(64) NOT NULL,
 		expires_at datetime NOT NULL,
@@ -215,8 +248,9 @@ function ct_scan_maybe_install_schema() {
 	) {$charset};";
 	dbDelta( $sql );
 	$required = array(
-		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_attempts', 'control_last_attempt_ms', 'control_lease_hash', 'control_verified_at', 'control_valid_until', 'control_evidence' ),
+		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_attempts', 'control_last_attempt_ms', 'control_lease_hash', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
+		$tombstones => array( 'tombstone_id', 'job_id', 'request_id', 'scope_hash', 'created_at', 'deleted_at', 'reason' ),
 	);
 	foreach ( $required as $table => $columns ) {
 		$found = $wpdb->get_col( "SHOW COLUMNS FROM {$table}", 0 );
@@ -729,38 +763,202 @@ function ct_scan_maintenance_locked() {
 	$nonce_table = ct_scan_nonces_table();
 	$wpdb->query( $wpdb->prepare( "DELETE FROM {$nonce_table} WHERE expires_at < %s", gmdate( 'Y-m-d H:i:s', time() - 600 ) ) );
 
-	$result_cutoff = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '-12 months' )->format( 'Y-m-d H:i:s' );
-	$wpdb->query( $wpdb->prepare(
-		"UPDATE {$table} SET result_json = NULL, manual_remainder_notes = NULL WHERE (result_json IS NOT NULL OR manual_remainder_notes IS NOT NULL) AND finished_at IS NOT NULL AND finished_at < %s",
-		$result_cutoff
+	ct_scan_retention_locked( $now );
+}
+
+/** Statuses from which a job never runs again; reaching one is the request's closure. */
+function ct_scan_terminal_sql() {
+	return "'completed','failed','failed_unknown','cancelled','expired','blocked'";
+}
+
+/**
+ * When the signed authorization evidence of a job may be deleted. r2 and earlier acceptances keep
+ * their promised three years from acceptance; every other version keeps six years after the
+ * request's closure (owner decision, 2026-10-22). Never less than three years, whatever the config.
+ */
+function ct_scan_retain_until( $row ) {
+	$config = ct_scan_config();
+	$legacy = (array) $config['legacy_retention_years'];
+	if ( isset( $legacy[ $row->terms_version ] ) ) {
+		$years = max( 3, (int) $legacy[ $row->terms_version ] );
+		$base  = $row->terms_accepted_at;
+	} else {
+		$years = max( 3, (int) $config['evidence_retention_years'] );
+		$base  = $row->closed_at;
+	}
+	if ( ! is_string( $base ) || '' === $base ) {
+		return false;
+	}
+	try {
+		return ( new DateTimeImmutable( $base, new DateTimeZone( 'UTC' ) ) )->modify( '+' . $years . ' years' )->format( 'Y-m-d H:i:s' );
+	} catch ( Throwable $error ) {
+		return false;
+	}
+}
+
+/**
+ * Is this job under a preservation hold? An unexpired hold preserves; a hold with a purpose but no
+ * expiry (not creatable through the admin action) also preserves, so a damaged hold never causes a
+ * deletion. Only an expired or absent hold lets retention proceed.
+ */
+function ct_scan_job_on_hold( $row, $now ) {
+	return ! empty( $row->hold_reason ) && ( empty( $row->hold_until ) || $row->hold_until > $now );
+}
+
+/** Remember a deleted record by identifier only, so a restored backup cannot bring it back. */
+function ct_scan_record_tombstone( $row, $reason ) {
+	global $wpdb;
+	$result = $wpdb->query( $wpdb->prepare(
+		'INSERT IGNORE INTO ' . ct_scan_tombstones_table() . ' (job_id, request_id, scope_hash, created_at, deleted_at, reason) VALUES (%d, %d, %s, %s, %s, %s)',
+		(int) $row->job_id,
+		(int) $row->request_id,
+		$row->scope_hash,
+		$row->created_at,
+		ct_scan_utc_now(),
+		substr( sanitize_key( $reason ), 0, 32 )
 	) );
-	$request_cutoff = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '-3 years' )->format( 'Y-m-d H:i:s' );
-	$old_rows = $wpdb->get_results( $wpdb->prepare( "SELECT job_id,request_id FROM {$table} WHERE terms_accepted_at < %s AND status IN ('completed','failed','failed_unknown','cancelled','expired')", $request_cutoff ) );
-	foreach ( (array) $old_rows as $row ) {
-		$post = get_post( (int) $row->request_id );
-		$personal_scrubbed = $wpdb->update(
-			$table,
-			array( 'contact_email' => '', 'contact_name' => '' ),
-			array( 'job_id' => (int) $row->job_id ),
-			array( '%s', '%s' ),
-			array( '%d' )
-		);
-		if ( false === $personal_scrubbed ) {
+	return false !== $result;
+}
+
+/** Delete one job and its linked private request. Returns true only if both are gone and a tombstone exists. */
+function ct_scan_delete_job_records( $row, $reason ) {
+	global $wpdb;
+	$table = ct_scan_jobs_table();
+	if ( ! ct_scan_record_tombstone( $row, $reason ) ) {
+		return false;
+	}
+	$post = get_post( (int) $row->request_id );
+	// Scrub personal fields first so a failure part-way never leaves contact data behind a deleted link.
+	$personal_scrubbed = $wpdb->update( $table, array( 'contact_email' => '', 'contact_name' => '' ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%s' ), array( '%d' ) );
+	if ( false === $personal_scrubbed ) {
+		return false;
+	}
+	if ( 0 === $personal_scrubbed ) {
+		$scrubbed = $wpdb->get_row( $wpdb->prepare( "SELECT contact_email,contact_name FROM {$table} WHERE job_id = %d", (int) $row->job_id ) );
+		if ( ! $scrubbed || '' !== $scrubbed->contact_email || '' !== $scrubbed->contact_name ) {
+			return false;
+		}
+	}
+	if ( $post && 'ct_promo_request' === $post->post_type && 'private' === $post->post_status && (int) $post->ID === (int) $row->request_id ) {
+		if ( ! wp_delete_post( (int) $row->request_id, true ) ) {
+			return false;
+		}
+	}
+	return false !== $wpdb->delete( $table, array( 'job_id' => (int) $row->job_id ), array( '%d' ) );
+}
+
+/**
+ * Closure, findings retention (12 months), evidence retention (retain_until), narrow holds, and
+ * tombstones. Held jobs keep everything; nothing is deleted before its promised period.
+ */
+function ct_scan_retention_locked( $now ) {
+	global $wpdb;
+	$table    = ct_scan_jobs_table();
+	$terminal = ct_scan_terminal_sql();
+	// 1. Closure is explicit: the first time a job is seen terminal it is stamped.
+	$wpdb->query( $wpdb->prepare( "UPDATE {$table} SET closed_at = COALESCE(finished_at, %s) WHERE closed_at IS NULL AND status IN ({$terminal})", $now ) );
+	// 2. The evidence deletion date is fixed once, at closure.
+	$unset = $wpdb->get_results( "SELECT job_id,terms_version,terms_accepted_at,closed_at FROM {$table} WHERE closed_at IS NOT NULL AND retain_until IS NULL" );
+	foreach ( (array) $unset as $row ) {
+		$when = ct_scan_retain_until( $row );
+		if ( false !== $when ) {
+			$wpdb->update( $table, array( 'retain_until' => $when ), array( 'job_id' => (int) $row->job_id, 'retain_until' => null ), array( '%s' ), array( '%d', '%s' ) );
+		}
+	}
+	// 3. Findings: twelve months after closure, unless held.
+	$findings_cutoff = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-12 months' )->format( 'Y-m-d H:i:s' );
+	$wpdb->query( $wpdb->prepare(
+		"UPDATE {$table} SET result_json = NULL, manual_remainder_notes = NULL WHERE (result_json IS NOT NULL OR manual_remainder_notes IS NOT NULL) AND closed_at IS NOT NULL AND closed_at < %s AND NOT (hold_reason IS NOT NULL AND hold_until > %s)",
+		$findings_cutoff,
+		$now
+	) );
+	// 4. Evidence: delete what has outlived its retain_until, except under a hold.
+	$due = $wpdb->get_results( $wpdb->prepare(
+		"SELECT * FROM {$table} WHERE retain_until IS NOT NULL AND retain_until <= %s AND closed_at IS NOT NULL AND status IN ({$terminal}) AND NOT (hold_reason IS NOT NULL AND hold_until > %s)",
+		$now,
+		$now
+	) );
+	foreach ( (array) $due as $row ) {
+		if ( ct_scan_job_on_hold( $row, $now ) ) {
 			continue;
 		}
-		if ( 0 === $personal_scrubbed ) {
-			$scrubbed = $wpdb->get_row( $wpdb->prepare( "SELECT contact_email,contact_name FROM {$table} WHERE job_id = %d", (int) $row->job_id ) );
-			if ( ! $scrubbed || '' !== $scrubbed->contact_email || '' !== $scrubbed->contact_name ) {
-				continue;
-			}
-		}
-		if ( $post && 'ct_promo_request' === $post->post_type && 'private' === $post->post_status && (int) $post->ID === (int) $row->request_id ) {
-			if ( ! wp_delete_post( (int) $row->request_id, true ) ) {
-				continue;
-			}
-		}
-		$wpdb->delete( $table, array( 'job_id' => (int) $row->job_id ), array( '%d' ) );
+		ct_scan_delete_job_records( $row, 'retention' );
 	}
+	// 5. A restored backup must not resurrect deleted records: delete matches again.
+	ct_scan_apply_tombstones( $now );
+	$wpdb->query( $wpdb->prepare( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE deleted_at < %s', ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . max( 90, (int) ct_scan_config()['tombstone_retention_days'] ) . ' days' )->format( 'Y-m-d H:i:s' ) ) );
+}
+
+/** Delete again any job row (and linked private request) that matches a deletion tombstone. */
+function ct_scan_apply_tombstones( $now ) {
+	global $wpdb;
+	$table = ct_scan_jobs_table();
+	$ghosts = $wpdb->get_results( 'SELECT j.* FROM ' . $table . ' j INNER JOIN ' . ct_scan_tombstones_table() . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.scope_hash = j.scope_hash AND t.created_at = j.created_at' );
+	foreach ( (array) $ghosts as $row ) {
+		ct_scan_delete_job_records( $row, 'restored' );
+	}
+	// A restored request post whose job row was never restored: same identity through its saved job id.
+	$stones = $wpdb->get_results( 'SELECT job_id,request_id FROM ' . ct_scan_tombstones_table() . ' ORDER BY tombstone_id DESC LIMIT 500' );
+	foreach ( (array) $stones as $stone ) {
+		$post = get_post( (int) $stone->request_id );
+		if ( $post && 'ct_promo_request' === $post->post_type && 'private' === $post->post_status && (string) $stone->job_id === ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_job_id' ) ) {
+			wp_delete_post( (int) $stone->request_id, true );
+		}
+	}
+}
+
+/**
+ * Narrow preservation hold for one job: a stated purpose and a mandatory expiry (at most two years).
+ * While it stands, nothing about that job is deleted or scrubbed. Administrators only; recorded with
+ * who set it and when.
+ */
+function ct_scan_admin_set_hold( $job_id, $reason, $days ) {
+	global $wpdb;
+	$user = wp_get_current_user();
+	if ( ! $user || ! $user->exists() || ! current_user_can( 'manage_options' ) ) {
+		return new WP_Error( 'hold_forbidden', 'Only an administrator can place a hold.' );
+	}
+	$reason = is_string( $reason ) ? trim( wp_strip_all_tags( $reason ) ) : '';
+	$days   = is_numeric( $days ) ? (int) $days : 0;
+	if ( strlen( $reason ) < 20 || strlen( $reason ) > 190 || $days < 1 || $days > 730 ) {
+		return new WP_Error( 'hold_invalid', 'State the purpose (20 to 190 characters) and a duration of 1 to 730 days.' );
+	}
+	if ( ! ct_scan_lock_acquire( 3 ) ) {
+		return new WP_Error( 'queue_busy', 'The queue is temporarily busy.' );
+	}
+	try {
+		$row = ct_scan_row( $job_id );
+		if ( ! $row ) {
+			return new WP_Error( 'hold_unavailable', 'This job no longer exists.' );
+		}
+		$until   = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '+' . $days . ' days' )->format( 'Y-m-d H:i:s' );
+		$updated = $wpdb->update( ct_scan_jobs_table(), array( 'hold_reason' => $reason, 'hold_until' => $until, 'hold_set_by' => (int) $user->ID, 'hold_set_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%s', '%d', '%s' ), array( '%d' ) );
+		if ( false === $updated ) {
+			return new WP_Error( 'hold_write_failed', 'The hold could not be recorded.' );
+		}
+	} finally {
+		ct_scan_lock_release();
+	}
+	return true;
+}
+
+function ct_scan_admin_release_hold( $job_id ) {
+	global $wpdb;
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return new WP_Error( 'hold_forbidden', 'Only an administrator can release a hold.' );
+	}
+	if ( ! ct_scan_lock_acquire( 3 ) ) {
+		return new WP_Error( 'queue_busy', 'The queue is temporarily busy.' );
+	}
+	try {
+		$updated = $wpdb->update( ct_scan_jobs_table(), array( 'hold_reason' => null, 'hold_until' => null ), array( 'job_id' => absint( $job_id ) ), array( '%s', '%s' ), array( '%d' ) );
+		if ( false === $updated ) {
+			return new WP_Error( 'hold_write_failed', 'The hold could not be released.' );
+		}
+	} finally {
+		ct_scan_lock_release();
+	}
+	return true;
 }
 
 function ct_scan_maintain() {
@@ -2286,7 +2484,7 @@ function ct_scan_admin_action_handler() {
 	}
 	$job_id = isset( $_POST['job_id'] ) ? absint( wp_unslash( $_POST['job_id'] ) ) : 0;
 	$action = isset( $_POST['ct_scan_operation'] ) && is_string( $_POST['ct_scan_operation'] ) ? sanitize_key( wp_unslash( $_POST['ct_scan_operation'] ) ) : '';
-	if ( ! $job_id || ! in_array( $action, array( 'revoke', 'manual_complete', 'send_report', 'record_delivery', 'authority_review' ), true ) ) {
+	if ( ! $job_id || ! in_array( $action, array( 'revoke', 'manual_complete', 'send_report', 'record_delivery', 'authority_review', 'set_hold', 'release_hold' ), true ) ) {
 		wp_die( esc_html__( 'The requested action is invalid.', 'ct-scan' ), '', array( 'response' => 400 ) );
 	}
 	check_admin_referer( 'ct_scan_admin_' . $action . '_' . $job_id );
@@ -2296,6 +2494,8 @@ function ct_scan_admin_action_handler() {
 		'send_report'     => 'ct_scan_send_confirm',
 		'record_delivery' => 'ct_scan_delivery_confirm',
 		'authority_review' => 'ct_scan_authority_confirm',
+		'set_hold'        => 'ct_scan_hold_confirm',
+		'release_hold'    => 'ct_scan_hold_release_confirm',
 	);
 	$confirm_key = $confirmations[ $action ];
 	if ( ! isset( $_POST[ $confirm_key ] ) || ! is_string( $_POST[ $confirm_key ] ) || '1' !== wp_unslash( $_POST[ $confirm_key ] ) ) {
@@ -2307,6 +2507,10 @@ function ct_scan_admin_action_handler() {
 		$result = ct_scan_admin_save_manual_remainder( $job_id, isset( $_POST['manual_remainder_notes'] ) && is_string( $_POST['manual_remainder_notes'] ) ? $_POST['manual_remainder_notes'] : '' );
 	} elseif ( 'send_report' === $action ) {
 		$result = ct_scan_admin_send_report( $job_id );
+	} elseif ( 'set_hold' === $action ) {
+		$result = ct_scan_admin_set_hold( $job_id, isset( $_POST['ct_scan_hold_reason'] ) && is_string( $_POST['ct_scan_hold_reason'] ) ? wp_unslash( $_POST['ct_scan_hold_reason'] ) : '', isset( $_POST['ct_scan_hold_days'] ) && is_scalar( $_POST['ct_scan_hold_days'] ) ? wp_unslash( $_POST['ct_scan_hold_days'] ) : 0 );
+	} elseif ( 'release_hold' === $action ) {
+		$result = ct_scan_admin_release_hold( $job_id );
 	} elseif ( 'authority_review' === $action ) {
 		$result = ct_scan_admin_record_authority_review( $job_id, isset( $_POST['ct_scan_authority_note'] ) && is_string( $_POST['ct_scan_authority_note'] ) ? wp_unslash( $_POST['ct_scan_authority_note'] ) : '' );
 	} else {
@@ -2403,6 +2607,11 @@ function ct_scan_admin_page() {
 		}
 		if ( 'awaiting_control' === $row->status && empty( $row->revoked_at ) ) {
 			echo ct_scan_admin_form( (int) $row->job_id, 'authority_review', 'Record authority review', '<br><textarea name="ct_scan_authority_note" rows="3" cols="42" maxlength="1000" placeholder="Evidence reviewed that this client controls this exact website (who, what, when)."></textarea><br><label><input type="checkbox" name="ct_scan_authority_confirm" value="1" required> I reviewed evidence that this client controls the exact website above.</label> ' );
+		}
+		if ( ct_scan_job_on_hold( $row, ct_scan_utc_now() ) ) {
+			echo '<p>Preservation hold until ' . esc_html( $row->hold_until ) . ' UTC: ' . esc_html( $row->hold_reason ) . '</p>' . ct_scan_admin_form( (int) $row->job_id, 'release_hold', 'Release hold', '<label><input type="checkbox" name="ct_scan_hold_release_confirm" value="1" required> Release this hold.</label> ' );
+		} else {
+			echo ct_scan_admin_form( (int) $row->job_id, 'set_hold', 'Place preservation hold', '<br><input type="text" name="ct_scan_hold_reason" maxlength="190" size="40" placeholder="Narrow purpose, e.g. dispute #123 about this job"> <input type="number" name="ct_scan_hold_days" min="1" max="730" value="90"> days<br><label><input type="checkbox" name="ct_scan_hold_confirm" value="1" required> Preserve this job\'s records for this stated purpose only.</label> ' );
 		}
 		if ( empty( $row->revoked_at ) && empty( $row->report_delivered_at ) ) {
 			echo ct_scan_admin_form( (int) $row->job_id, 'revoke', 'Revoke authorization', '<label><input type="checkbox" name="ct_scan_revoke_confirm" value="1" required> Revoke this request and block further execution or report sending.</label> ' );

@@ -425,7 +425,39 @@ site files, restore the scoped backups; existing accepted contracts and queue
 evidence must remain available. A started job with a missing receipt needs
 operator investigation, not a blind retry.
 
-Retention follows the accepted policy: scan results twelve months, and request
-and acceptance records three years. Maintenance must preserve current work and
-must not delete unrelated WordPress content. Authentication replay records and
-bounded controller logs have shorter operational lifetimes.
+Retention follows the owner's decisions of 2026-10-22, implemented in
+maintenance (which runs on every worker claim and on the admin queue page):
+
+- **Closure is explicit.** The first time a job is seen in a terminal state
+  (`completed`, `failed`, `failed_unknown`, `cancelled`, `expired`, `blocked`)
+  it is stamped `closed_at`; an accepted request that was never confirmed or
+  never showed target control closes when it expires. A job that can still run
+  is never closed or deleted, however old its acceptance.
+- **Findings** (`result_json`, manual remainder notes): cleared twelve months
+  after closure. The signed evidence stays.
+- **Signed authorization evidence** (the job row and its linked private request):
+  deleted at `retain_until`, fixed once at closure: **six years after closure**,
+  except that r2 and earlier acceptances keep their promised **three years from
+  acceptance** (config `legacy_retention_years`). Never less than three years,
+  whatever the configuration. The archive (issue 11) can read `retain_until` per
+  accepted version.
+- **Narrow preservation hold** (admin queue): one job, a stated purpose of 20 to
+  190 characters, a mandatory expiry of at most 730 days, recorded with who set
+  it and when. While it stands nothing about that job is cleared or deleted; an
+  expired or released hold lets retention proceed, and a damaged hold (purpose
+  without an expiry) preserves rather than deletes.
+- **Tombstones.** Deleting a job writes an identifier-only tombstone (job id,
+  request id, scope hash, creation time, time and reason; no personal or
+  customer data) before the deletion. If a restored backup brings the rows back,
+  the next maintenance run deletes them again, and a restored private request is
+  deleted only if its saved job id is the tombstoned one. Tombstones are kept 120
+  days, longer than the 90-day backup rotation, then purged.
+- Deletion scrubs the contact fields first, then deletes the private request and
+  the job row; if any step fails the record stays (and is retried) rather than
+  being half-deleted.
+
+Not covered here: backup rotation itself, the contract archive's historical Git
+objects and clones (issue 11), unsigned caller leads (there is no lead record in
+this plugin; the current form saves nothing without a signature), and deletion
+from mail systems. Authentication replay records and bounded controller logs
+have shorter operational lifetimes.

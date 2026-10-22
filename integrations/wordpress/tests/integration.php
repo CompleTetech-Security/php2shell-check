@@ -207,7 +207,7 @@ ct_scan_maintenance_locked();
 $retained = ct_scan_row( $retention_event['job_id'] );
 ct_test_assert( $retained && null === $retained->result_json && null === $retained->manual_remainder_notes && get_post( $retention_id ), '12-month cleanup must clear result/manual data but retain the request evidence.' );
 $three_years = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '-3 years -1 day' )->format( 'Y-m-d H:i:s' );
-$wpdb->update( $jobs, array( 'terms_accepted_at' => $three_years, 'finished_at' => $three_years ), array( 'job_id' => (int) $retention_event['job_id'] ) );
+$wpdb->update( $jobs, array( 'terms_accepted_at' => $three_years, 'finished_at' => $three_years, 'closed_at' => $three_years, 'retain_until' => null ), array( 'job_id' => (int) $retention_event['job_id'] ) );
 $hold_delete = static function ( $check, $post ) use ( $retention_id ) {
 	return (int) $retention_id === (int) $post->ID ? false : $check;
 };
