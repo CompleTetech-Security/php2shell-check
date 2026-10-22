@@ -117,7 +117,10 @@ Enforcement in the supervisor and scanner:
   pacing and busy retries, takes at most about eight seconds.
 - The grant's one-second lifetime and ten-second request bound are measured
   from just before the call WordPress granted, not from delivery to the
-  scanner. A grant that aged out while the supervisor waited is not delivered.
+  scanner. A grant that took more than 0.6 s to come back is discarded and
+  asked for again (the discarded slot stays spent), at most twice; after that
+  the admission is refused (`admission_expired`). No admission is requested
+  after the scan's own deadline, and a shutdown interrupts a slow guard call.
 - One grant is outstanding at a time. A second request, an out-of-sequence or
   unexpected message or an oversized message ends the scan
   (`admission_protocol_violation`).

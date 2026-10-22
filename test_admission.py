@@ -181,6 +181,52 @@ class GateTests(unittest.TestCase):
                 self.assertLess(len(self.api.calls), 100)
                 self.assertLessEqual(self.clock.now - 1000.0, admission.MAX_ADMIT_WAIT_SECONDS + 1.1)
 
+    def test_a_grant_that_came_back_too_slowly_is_discarded_and_asked_for_again(self):
+        slow = [0.7, 0.7]
+
+        class SlowAPI(_AdmitAPI):
+            def admit(inner, claim, kind):
+                if slow:
+                    self.clock.now += slow.pop(0)
+                return super().admit(claim, kind)
+
+        self.api = SlowAPI(GRANT, dict(GRANT, sequence=2), dict(GRANT, sequence=3))
+        gate = AdmissionGate(self.api, _claim(expires_at=NOW + 7200), stop_event=self.stop, clock=lambda: NOW, monotonic=self.clock)
+        grant = gate.admit()
+        self.assertEqual(grant.sequence, 3, "the two slow slots are spent, the third is delivered")
+        self.assertEqual(self.api.calls, ["http", "http", "http"])
+        # Persistently slow: refused rather than delivering a grant with no lifetime left.
+        slow.extend([0.7] * 5)
+        self.api = SlowAPI(*([GRANT] * 5))
+        gate = AdmissionGate(self.api, _claim(expires_at=NOW + 7200), stop_event=self.stop, clock=lambda: NOW, monotonic=self.clock)
+        with self.assertRaises(AdmissionDenied) as denied:
+            gate.admit()
+        self.assertEqual(denied.exception.slug, "admission_expired")
+        self.assertEqual(len(self.api.calls), 3)
+
+    def test_no_admission_is_requested_after_the_scan_deadline(self):
+        gate = AdmissionGate(_AdmitAPI(GRANT), _claim(expires_at=NOW + 7200), deadline=NOW - 1, clock=lambda: NOW, monotonic=self.clock)
+        with self.assertRaises(AdmissionDenied) as denied:
+            gate.admit()
+        self.assertEqual(denied.exception.slug, "scan_deadline")
+
+    def test_shutdown_interrupts_a_slow_guard_call(self):
+        release = threading.Event()
+
+        class Hang:
+            def admit(self_inner, claim, kind):
+                release.wait(5)
+
+        stop = threading.Event()
+        gate = AdmissionGate(Hang(), _claim(expires_at=NOW + 7200), stop_event=stop, clock=lambda: NOW)
+        threading.Timer(0.2, stop.set).start()
+        started = time.monotonic()
+        with self.assertRaises(AdmissionDenied) as denied:
+            gate.admit()
+        release.set()
+        self.assertEqual(denied.exception.slug, "worker_shutdown")
+        self.assertLess(time.monotonic() - started, 2.0)
+
     def test_expired_authorization_is_refused_locally_without_asking(self):
         gate = self.gate(GRANT, claim=_claim(expires_at=NOW - 1), wall=lambda: NOW)
         with self.assertRaises(AdmissionDenied) as denied:
