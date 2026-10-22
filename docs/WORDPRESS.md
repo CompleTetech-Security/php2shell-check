@@ -167,6 +167,43 @@ Before upgrading the pinned revision or rotating the key, stop accepting new
 work, drain/reconcile existing receipts and stop the controller. Do not change
 the expected revision while old receipts are awaiting acknowledgement.
 
+## Bound acceptance evidence and the accepted copy
+
+A request is queued only if its saved acceptance reads back completely. A
+**bound** acceptance additionally retains the exact terms bytes the signer was
+shown and the exact Target Summary, each next to the digest the signer's form
+carried. The site recorder writes these post meta keys:
+
+| Key | Meaning |
+|---|---|
+| `_ct_terms_binding` | `1` marks the acceptance as bound |
+| `_ct_terms_snapshot` | the terms bytes as displayed (at most 512 KiB) |
+| `_ct_terms_sha256` | SHA-256 of those bytes |
+| `_ct_terms_shown_digest` | the digest the rendered form carried; must equal the hash |
+| `_ct_summary_text` | the Target Summary as displayed, `Label: value` lines (at most 8 KiB) |
+| `_ct_summary_sha256`, `_ct_summary_shown_digest` | its digest, and the digest the form carried |
+
+The Summary must contain exactly one each of `Website (scan scope)`,
+`Client contact`, `Client email` (equal to the authorized request fields) and
+`Profile` (the job's profile). Any missing, oversized, mismatched, stale,
+repeated or partial piece refuses the job (`ct_scan_binding_mismatch` /
+`ct_scan_binding_required`), and the job row stores the summary digest, so a
+later edit of the retained evidence makes the authorization no longer live and
+cancels a queued or running job. Config `bound_terms_versions` (default empty)
+lists terms versions whose acceptance **must** be bound; an unbound acceptance
+of any other version is accepted as before, but unbound pieces without the
+marker are always refused. Nothing in the plugin fetches mutable page HTML.
+
+With config `send_accepted_copy` true (default false), a successful mailbox
+confirmation sends the verified contact their copy: the Target Summary, the
+hashes, the filled-in copy and, for a bound acceptance, the exact terms bytes
+as an attachment. It is sent at most once (the status is claimed by
+compare-and-set before mail is handed off), only to the verified address, and
+never to a referrer. An uncertain or failed hand-off is recorded as `unknown`
+and never resent automatically; `accepted` means transport acceptance, not
+receipt. A failure cannot cancel, delay or repeat a scan. The wording of that
+message has not been reviewed by the owner.
+
 ## Repository and site ownership
 
 The maintained integration is published in this repository. The CompleteTech
@@ -294,8 +331,9 @@ The default configuration is disabled, and no historical request sweep exists.
    A matching revision and key are required; mismatches fail closed.
 
 Schema 3 adds `profile_id`, `http_admitted` and `last_admit_ms` to the jobs
-table (existing rows default to `r2-header-v1` with empty counters); the
-upgrade runs on `init` and the worker API refuses requests until it completes.
+table (existing rows default to `r2-header-v1` with empty counters); schema 4
+adds `summary_sha256`, `accepted_copy_status` and `accepted_copy_at`. Upgrades
+run on `init` and the worker API refuses requests until they complete.
 
 The healthcheck requires a successful authenticated exchange in the last ten
 minutes. Use `docker compose -p ct-php2shell -f deployment/compose.yaml ps` and

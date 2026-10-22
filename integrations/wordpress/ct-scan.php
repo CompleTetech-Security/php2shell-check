@@ -17,7 +17,7 @@ if ( ! defined( 'CT_SCAN_DEFAULT_TERMS_VERSION' ) ) {
 }
 
 if ( ! defined( 'CT_SCAN_SCHEMA_VERSION' ) ) {
-	define( 'CT_SCAN_SCHEMA_VERSION', '3' );
+	define( 'CT_SCAN_SCHEMA_VERSION', '4' );
 }
 
 /**
@@ -65,6 +65,10 @@ function ct_scan_config() {
 		'global_daily_limit'       => 20,
 		'target_daily_limit'       => 1,
 		'job_retention_days'       => 365,
+		// Terms versions whose acceptance MUST carry a bound snapshot and Target Summary.
+		'bound_terms_versions'     => array(),
+		// Email the verified contact their accepted copy after confirmation (off by default).
+		'send_accepted_copy'       => false,
 	);
 
 	$path = defined( 'CT_SCAN_PRIVATE_CONFIG' )
@@ -159,6 +163,9 @@ function ct_scan_maybe_install_schema() {
 		profile_id varchar(32) NOT NULL DEFAULT 'r2-header-v1',
 		http_admitted smallint(5) unsigned NOT NULL DEFAULT 0,
 		last_admit_ms bigint(20) unsigned NULL,
+		summary_sha256 char(64) NULL,
+		accepted_copy_status varchar(16) NOT NULL DEFAULT 'not_sent',
+		accepted_copy_at datetime NULL,
 		PRIMARY KEY  (job_id),
 		UNIQUE KEY request_id (request_id),
 		KEY status_created (status,created_at),
@@ -176,7 +183,7 @@ function ct_scan_maybe_install_schema() {
 	) {$charset};";
 	dbDelta( $sql );
 	$required = array(
-		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms' ),
+		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'accepted_copy_status', 'accepted_copy_at' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
 	);
 	foreach ( $required as $table => $columns ) {
@@ -275,6 +282,73 @@ function ct_scan_meta_string( $post_id, $key ) {
 	return is_string( $value ) ? $value : '';
 }
 
+/**
+ * Evidence binding. A "bound" acceptance retains the exact terms bytes that the signer was
+ * shown and the exact Target Summary, each next to the digest the signer's form carried:
+ *
+ *   _ct_terms_binding        '1' marks the acceptance as bound
+ *   _ct_terms_snapshot       the terms bytes as displayed (the immutable artifact)
+ *   _ct_terms_sha256         SHA-256 of those bytes
+ *   _ct_terms_shown_digest   the digest the rendered form carried (must equal the above)
+ *   _ct_summary_text         the Target Summary as displayed ("Label: value" lines)
+ *   _ct_summary_sha256       SHA-256 of that text
+ *   _ct_summary_shown_digest the digest the form carried for the summary
+ *
+ * Any partial or mismatched set refuses the job (and cancels a queued or running one via
+ * ct_scan_authorization_is_live). Versions listed in config `bound_terms_versions` must be bound.
+ * An unbound legacy acceptance is accepted only for versions that are not listed.
+ */
+function ct_scan_check_bound_evidence( $request_id, $terms_version, $terms_hash, $identity ) {
+	$config   = ct_scan_config();
+	$required = in_array( $terms_version, (array) $config['bound_terms_versions'], true );
+	$marker   = ct_scan_meta_string( $request_id, '_ct_terms_binding' );
+	$partial  = false;
+	foreach ( array( '_ct_terms_snapshot', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
+		if ( '' !== ct_scan_meta_string( $request_id, $key ) ) {
+			$partial = true;
+		}
+	}
+	if ( '1' !== $marker ) {
+		if ( $required || '' !== $marker || $partial ) {
+			return new WP_Error( 'ct_scan_binding_required', 'The saved acceptance does not carry the required bound evidence.' );
+		}
+		return array( 'bound' => false, 'summary_sha256' => null );
+	}
+	$snapshot = ct_scan_meta_string( $request_id, '_ct_terms_snapshot' );
+	$summary  = ct_scan_meta_string( $request_id, '_ct_summary_text' );
+	if ( '' === $snapshot || strlen( $snapshot ) > 524288 || '' === $summary || strlen( $summary ) > 8192 ) {
+		return new WP_Error( 'ct_scan_binding_mismatch', 'The retained terms or Target Summary is missing or oversized.' );
+	}
+	$snapshot_hash = hash( 'sha256', $snapshot );
+	$summary_hash  = hash( 'sha256', $summary );
+	$checks = array(
+		$snapshot_hash => array( $terms_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_terms_shown_digest' ) ) ),
+		$summary_hash  => array( strtolower( ct_scan_meta_string( $request_id, '_ct_summary_sha256' ) ), strtolower( ct_scan_meta_string( $request_id, '_ct_summary_shown_digest' ) ) ),
+	);
+	foreach ( $checks as $computed => $recorded ) {
+		foreach ( $recorded as $value ) {
+			if ( ! is_string( $value ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $value ) || ! hash_equals( $computed, $value ) ) {
+				return new WP_Error( 'ct_scan_binding_mismatch', 'The retained evidence does not match the digest the signer was shown.' );
+			}
+		}
+	}
+	$expected = array(
+		'Website (scan scope)' => $identity['target'],
+		'Client email'         => $identity['email'],
+		'Client contact'       => $identity['name'],
+		'Profile'              => ct_scan_current_profile(),
+	);
+	foreach ( $expected as $label => $value ) {
+		if ( ! preg_match( '/^' . preg_quote( $label, '/' ) . ': (.*)$/m', $summary, $match ) || $match[1] !== $value ) {
+			return new WP_Error( 'ct_scan_binding_mismatch', 'The retained Target Summary does not match the authorized request.' );
+		}
+		if ( preg_match_all( '/^' . preg_quote( $label, '/' ) . ':/m', $summary ) !== 1 ) {
+			return new WP_Error( 'ct_scan_binding_mismatch', 'The retained Target Summary repeats a field.' );
+		}
+	}
+	return array( 'bound' => true, 'summary_sha256' => $summary_hash );
+}
+
 /** Check the saved request and acceptance snapshot before any job is created. */
 function ct_scan_validate_saved_request( $request_id, $fields, $require_current_terms = true, $frozen_expiry = '' ) {
 	$config = ct_scan_config();
@@ -342,6 +416,10 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 	if ( false === strpos( $post->post_content, $contract ) ) {
 		return new WP_Error( 'ct_scan_contract_readback_mismatch', 'The saved acceptance copy could not be read back from the request.' );
 	}
+	$bound = ct_scan_check_bound_evidence( $request_id, $terms_version, $terms_hash, array( 'target' => $target, 'email' => $email, 'name' => $name ) );
+	if ( is_wp_error( $bound ) ) {
+		return $bound;
+	}
 	if ( $require_current_terms ) {
 		$window_end = ct_scan_utc_parse( $config['authorization_end_at'] );
 		if ( ! $window_end ) {
@@ -377,6 +455,7 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 		'terms_hash'            => $terms_hash,
 		'terms_accepted_at'     => $accepted_at->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' ),
 		'authorization_expires' => $expires->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' ),
+		'summary_sha256'        => $bound['summary_sha256'],
 	);
 }
 
@@ -481,8 +560,9 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 				'confirmation_expires_at'  => $confirm_expires,
 				'stop_token_hash'          => hash( 'sha256', $stop_token ),
 				'profile_id'               => ct_scan_current_profile(),
+				'summary_sha256'           => $accepted['summary_sha256'],
 			),
-			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
+			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
 		if ( 1 !== $inserted ) {
 			$existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$jobs} WHERE request_id = %d LIMIT 1", $request_id ) );
@@ -564,7 +644,11 @@ function ct_scan_authorization_is_live( $row ) {
 		&& hash_equals( $row->terms_hash, $accepted['terms_hash'] )
 		&& $row->terms_version === $accepted['terms_version']
 		&& $row->terms_accepted_at === $accepted['terms_accepted_at']
-		&& $row->authorization_expires_at === $accepted['authorization_expires'];
+		&& $row->authorization_expires_at === $accepted['authorization_expires']
+		// The retained Target Summary is part of the authorization: it cannot change afterwards.
+		&& ( null === $accepted['summary_sha256']
+			? empty( $row->summary_sha256 )
+			: ( is_string( $row->summary_sha256 ) && hash_equals( $row->summary_sha256, $accepted['summary_sha256'] ) ) );
 }
 
 /** Reconcile bounded leases and apply the published data-retention windows. */
@@ -591,7 +675,7 @@ function ct_scan_maintenance_locked() {
 		$now,
 		$now
 	) );
-	$queued = $wpdb->get_results( "SELECT job_id,request_id,target_origin,scope_hash,terms_version,terms_hash,terms_accepted_at,authorization_expires_at,contact_email,contact_name,referrer,revoked_at,report_delivered_at FROM {$table} WHERE status = 'queued'" );
+	$queued = $wpdb->get_results( "SELECT job_id,request_id,target_origin,scope_hash,terms_version,terms_hash,terms_accepted_at,authorization_expires_at,contact_email,contact_name,referrer,revoked_at,report_delivered_at,summary_sha256 FROM {$table} WHERE status = 'queued'" );
 	foreach ( (array) $queued as $row ) {
 		if ( ! ct_scan_authorization_is_live( $row ) ) {
 			$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => $now, 'lease_hash' => null, 'lease_until' => null ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%s', '%s', '%s', '%s' ), array( '%d' ) );
@@ -727,7 +811,99 @@ function ct_scan_confirmation_handler() {
 	} finally {
 		ct_scan_lock_release();
 	}
+	if ( 200 === $response_status ) {
+		try {
+			ct_scan_send_accepted_copy( $job_id );
+		} catch ( Throwable $error ) {
+			// The copy is independent of the confirmed, queued job.
+			unset( $error );
+		}
+	}
 	ct_scan_send_confirmation_page( $message, $response_status );
+}
+
+/**
+ * Send the verified contact a retainable copy of what they accepted. Runs after mailbox
+ * confirmation, independently of scanning: a failure here never cancels, delays or repeats a
+ * scan, and a send is attempted at most once per job (the status is claimed with a
+ * compare-and-set before mail is handed off, and an uncertain outcome is never resent).
+ * Transport acceptance is not receipt. Off unless config `send_accepted_copy` is true.
+ * TODO(owner): review the wording of this message before enabling.
+ * Returns 'disabled', 'sent', 'unknown', 'already_handled', or a WP_Error.
+ */
+function ct_scan_send_accepted_copy( $job_id ) {
+	global $wpdb;
+	if ( ! ct_scan_enabled() || empty( ct_scan_config()['send_accepted_copy'] ) ) {
+		return 'disabled';
+	}
+	$table = ct_scan_jobs_table();
+	if ( ! ct_scan_lock_acquire( 3 ) ) {
+		return new WP_Error( 'queue_busy', 'The queue is temporarily busy.' );
+	}
+	try {
+		$row = ct_scan_row( $job_id );
+		if ( ! $row || empty( $row->confirmed_at ) || '' === (string) $row->contact_email ) {
+			return new WP_Error( 'accepted_copy_unavailable', 'The accepted copy requires a confirmed recipient.' );
+		}
+		$claimed = $wpdb->update(
+			$table,
+			array( 'accepted_copy_status' => 'unknown', 'accepted_copy_at' => ct_scan_utc_now() ),
+			array( 'job_id' => (int) $row->job_id, 'accepted_copy_status' => 'not_sent' ),
+			array( '%s', '%s' ),
+			array( '%d', '%s' )
+		);
+		if ( 1 !== $claimed ) {
+			return 'already_handled';
+		}
+	} finally {
+		ct_scan_lock_release();
+	}
+	$request_id = (int) $row->request_id;
+	$contract   = ct_scan_meta_string( $request_id, '_ct_terms_contract' );
+	$snapshot   = ct_scan_meta_string( $request_id, '_ct_terms_snapshot' );
+	$summary    = ct_scan_meta_string( $request_id, '_ct_summary_text' );
+	$bound      = '1' === ct_scan_meta_string( $request_id, '_ct_terms_binding' ) && $row->summary_sha256 === hash( 'sha256', $summary ) && hash( 'sha256', $snapshot ) === $row->terms_hash;
+	$lines = array(
+		'This is the copy of the free PHP2Shell screening agreement and scope that you accepted. Please keep it for your records.',
+		'',
+		'Website (scan scope): ' . $row->target_origin,
+		'Terms version: ' . $row->terms_version,
+		'Terms SHA-256: ' . $row->terms_hash,
+		'Accepted (UTC): ' . $row->terms_accepted_at,
+		'Mailbox confirmed (UTC): ' . $row->confirmed_at,
+		'Authorization expires (UTC): ' . $row->authorization_expires_at,
+	);
+	$attachments = array();
+	$tempfile    = '';
+	if ( $bound ) {
+		$lines[] = 'Target Summary SHA-256: ' . $row->summary_sha256;
+		$lines[] = '';
+		$lines[] = 'Target Summary as shown to you:';
+		$lines[] = $summary;
+		$tempfile = tempnam( sys_get_temp_dir(), 'ctat' ); // created mode 0600
+		if ( is_string( $tempfile ) && '' !== $tempfile && false !== file_put_contents( $tempfile, $snapshot ) ) {
+			$named = dirname( $tempfile ) . '/accepted-terms-' . (int) $row->job_id . '-' . preg_replace( '/[^A-Za-z0-9._-]/', '', $row->terms_version ) . '-' . substr( $row->terms_hash, 0, 12 ) . '.html';
+			if ( @rename( $tempfile, $named ) ) {
+				$tempfile = $named;
+			}
+			$attachments[] = $tempfile;
+			$lines[]       = 'The attached file contains the exact terms text you were shown; its SHA-256 is the value above.';
+		}
+	}
+	$lines[] = '';
+	$lines[] = $contract;
+	$status  = 'unknown';
+	try {
+		$sent   = wp_mail( $row->contact_email, 'Your accepted PHP2Shell screening agreement', implode( "\n", $lines ), '', $attachments );
+		$status = $sent ? 'accepted' : 'unknown';
+	} catch ( Throwable $error ) {
+		$status = 'unknown';
+	}
+	if ( '' !== $tempfile ) {
+		@unlink( $tempfile );
+	}
+	$wpdb->update( $table, array( 'accepted_copy_status' => $status ), array( 'job_id' => (int) $row->job_id, 'accepted_copy_status' => 'unknown' ), array( '%s' ), array( '%d', '%s' ) );
+	return 'accepted' === $status ? 'sent' : 'unknown';
 }
 
 function ct_scan_row_by_confirmation_hash( $hash ) {

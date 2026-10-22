@@ -18,6 +18,8 @@ file_put_contents( $private_config, '<?php return ' . var_export( array(
 	'confirmation_ttl_hours'    => 24,
 	'global_daily_limit'        => 1000,
 	'target_daily_limit'        => 100,
+	'bound_terms_versions'      => getenv( 'CT_TEST_BOUND' ) ? array( '2026-10-21-r2' ) : array(),
+	'send_accepted_copy'        => '1' === getenv( 'CT_TEST_COPY' ),
 ), true ) . ';' );
 define( 'CT_SCAN_PRIVATE_CONFIG', $private_config );
 register_shutdown_function( static function () use ( $private_config ) { @unlink( $private_config ); } );
@@ -132,4 +134,56 @@ function ct_test_purge_fixtures() {
 			wp_delete_post( (int) $old_id, true );
 		}
 	}
+}
+
+/** The Target Summary text a bound acceptance would carry for a fixture request. */
+function ct_test_summary( $fields, $overrides = array() ) {
+	$lines = array_merge( array(
+		'Website (scan scope)' => $fields['target'],
+		'Client contact'       => $fields['name'],
+		'Client email'         => $fields['email'],
+		'Profile'              => ct_scan_current_profile(),
+	), $overrides );
+	$text = '';
+	foreach ( $lines as $label => $value ) {
+		$text .= $label . ': ' . $value . "\n";
+	}
+	return $text;
+}
+
+/** Turn a fixture request's acceptance into a bound one. $mutations may break any single piece. */
+function ct_test_bind( $request_id, $fields, $mutations = array() ) {
+	$snapshot = $mutations['snapshot'] ?? "<h1>Terms as displayed</h1>\n<p>Exact bytes \xe2\x80\x94 including \"quotes\" & entities.</p>\n";
+	$summary  = $mutations['summary'] ?? ct_test_summary( $fields );
+	$meta = array(
+		'_ct_terms_binding'        => '1',
+		'_ct_terms_snapshot'       => $snapshot,
+		'_ct_terms_sha256'         => hash( 'sha256', $snapshot ),
+		'_ct_terms_shown_digest'   => hash( 'sha256', $snapshot ),
+		'_ct_summary_text'         => $summary,
+		'_ct_summary_sha256'       => hash( 'sha256', $summary ),
+		'_ct_summary_shown_digest' => hash( 'sha256', $summary ),
+	);
+	foreach ( array_merge( $meta, $mutations['meta'] ?? array() ) as $key => $value ) {
+		if ( null === $value ) {
+			delete_post_meta( $request_id, $key );
+		} else {
+			update_post_meta( $request_id, $key, wp_slash( $value ) );
+		}
+	}
+	return $meta;
+}
+
+/** Like ct_test_running_job(), but the acceptance is bound before the job is created. */
+function ct_test_running_job_for_bound( $host ) {
+	list( $request_id, $fields ) = ct_test_request( $host );
+	ct_test_bind( $request_id, $fields );
+	$event = ct_scan_on_request_ready( $request_id, $fields );
+	ct_test_assert( is_array( $event ) && empty( $event['duplicate'] ), 'Bound fixture job was not created.' );
+	ct_test_queue_job( $event['job_id'] );
+	$job   = ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() )->get_data()['job'];
+	ct_test_assert( is_array( $job ) && (int) $job['id'] === (int) $event['job_id'], 'Bound fixture expected to claim its own job.' );
+	$start = ct_test_rest_call( 'ct_scan_start', '/ct-scan/v1/start', array( 'id' => $job['id'], 'lease' => $job['lease'], 'scope_hash' => $job['scope_hash'] ) );
+	ct_test_assert( 200 === $start->get_status(), 'Bound fixture job did not start.' );
+	return array( 'request_id' => $request_id, 'fields' => $fields, 'job_id' => (int) $event['job_id'], 'job' => $job );
 }
