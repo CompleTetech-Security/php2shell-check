@@ -269,6 +269,8 @@ class SubprocessRunner:
                 raise ScannerFailure(child_error or "scanner_process_failed")
             return self._parse_success(bytes(buffers["stdout"]), target, scope)
         finally:
+            # Let an in-flight liveness probe finish before the socket and the API client are reused.
+            pump.wait_probe(5.0)
             parent_sock.close()
 
     @staticmethod
