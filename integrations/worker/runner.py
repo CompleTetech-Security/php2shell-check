@@ -274,6 +274,8 @@ class SubprocessRunner:
                 return self._parse_control_success(bytes(buffers["stdout"]), task)
             return self._parse_success(bytes(buffers["stdout"]), target, scope)
         finally:
+            # Let an in-flight liveness probe finish before the socket and the API client are reused.
+            pump.wait_probe(5.0)
             parent_sock.close()
 
     @staticmethod

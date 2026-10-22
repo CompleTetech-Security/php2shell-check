@@ -38,6 +38,10 @@ REQUEST_GRACE_SECONDS = 1.0
 PROBE_INTERVAL_SECONDS = 2.0
 MAX_ADMIT_WAIT_SECONDS = 4.0
 CALL_BUDGET_SECONDS = 4.0
+# A grant that took longer than this to come back is discarded and asked for again (the
+# discarded slot stays spent): the child must still have most of its one second.
+MAX_GRANT_AGE_SECONDS = 0.6
+MAX_STALE_REGRANTS = 2
 BUSY_RETRY_SECONDS = 0.15
 MAX_MESSAGE_BYTES = 256
 CHILD_REPLY_TIMEOUT_SECONDS = 15.0
@@ -105,13 +109,15 @@ def parse_refusal(error: APIError) -> AdmissionDenied:
 class AdmissionGate:
     """Supervisor-side client for the WordPress admission route."""
 
-    def __init__(self, api, claim, *, kind="http", stop_event=None, clock=time.time, monotonic=time.monotonic):
+    def __init__(self, api, claim, *, kind="http", stop_event=None, deadline=None, clock=time.time, monotonic=time.monotonic):
         if kind not in {"http", "control"}:
             raise ValueError("invalid_admission_kind")
         self.api = api
         self.claim = claim
         self.kind = kind
         self.stop_event = stop_event
+        # Wall-clock (epoch) time after which no further admission is requested at all.
+        self.deadline = deadline
         self._clock = clock
         self._monotonic = monotonic
 
@@ -127,6 +133,8 @@ class AdmissionGate:
             raise AdmissionDenied("worker_shutdown")
         if self._clock() >= self.claim.expires_at.timestamp():
             raise AdmissionDenied("authorization_expired")
+        if self.deadline is not None and self._clock() >= self.deadline:
+            raise AdmissionDenied("scan_deadline")
 
     def _call(self, kind: str):
         """One WordPress call under a hard wall-clock budget (a slow store is a refusal)."""
@@ -140,9 +148,14 @@ class AdmissionGate:
 
         worker = threading.Thread(target=run, daemon=True)
         worker.start()
-        worker.join(CALL_BUDGET_SECONDS)
-        if worker.is_alive():
-            raise AdmissionDenied("guard_timeout")
+        budget_end = self._monotonic() + CALL_BUDGET_SECONDS
+        while worker.is_alive():
+            # Sliced so shutdown interrupts a slow store; a late answer from an abandoned call is ignored.
+            worker.join(0.05)
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise AdmissionDenied("worker_shutdown")
+            if worker.is_alive() and self._monotonic() >= budget_end:
+                raise AdmissionDenied("guard_timeout")
         error = box.get("error")
         if isinstance(error, APIError):
             if error.status is None:
@@ -155,11 +168,19 @@ class AdmissionGate:
     def admit(self) -> Grant:
         """Reserve exactly one request, or raise AdmissionDenied. Retries are bounded."""
         deadline = self._monotonic() + MAX_ADMIT_WAIT_SECONDS
+        stale = 0
         while True:
             self._check_local()
             started = self._monotonic()
             try:
-                return replace(parse_grant(self._call(self.kind)), issued_at=started)
+                grant = replace(parse_grant(self._call(self.kind)), issued_at=started)
+                if self._monotonic() - started > MAX_GRANT_AGE_SECONDS:
+                    # WordPress answered, but too slowly for the one-second lifetime to be useful.
+                    stale += 1
+                    if stale > MAX_STALE_REGRANTS:
+                        raise AdmissionDenied("admission_expired")
+                    continue
+                return grant
             except AdmissionDenied as denied:
                 if self._monotonic() >= deadline:
                     raise

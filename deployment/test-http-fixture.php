@@ -15,6 +15,8 @@ if ('setup' === $mode) {
         'authorization_end_at' => gmdate('Y-m-d\TH:i:s\Z', time() + 86400 * 30),
         'global_daily_limit' => 1000,
         'target_daily_limit' => 10,
+        // `setup control`: the terms version requires proof of control of the exact target.
+        'target_control_versions' => ($argv[2] ?? '') === 'control' ? array('2026-10-21-r2') : array(),
     ), true) . ';');
     chmod($private . '/config.php', 0600);
     foreach (array($private, $private . '/config.php', $private . '/.htaccess') as $path) {
@@ -49,7 +51,11 @@ if ('setup' === $mode) {
 } else {
     $state = json_decode(file_get_contents($state_file), true);
     $row = ct_scan_row($state['job_id']);
-    if ('cleanup' === $mode) {
+    if ('age-control' === $mode) {
+        // Test-only: pretend the last control check happened a minute ago.
+        $wpdb->query($wpdb->prepare('UPDATE ' . ct_scan_jobs_table() . ' SET control_last_attempt_ms = control_last_attempt_ms - 61000 WHERE job_id = %d', $state['job_id']));
+        echo "aged\n";
+    } elseif ('cleanup' === $mode) {
         $wpdb->delete(ct_scan_jobs_table(), array('job_id' => $state['job_id']));
         wp_delete_post($state['request_id'], true);
         unlink($state_file);

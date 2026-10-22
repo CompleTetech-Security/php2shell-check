@@ -58,8 +58,8 @@ flowchart LR
 
 ## Worker protocol
 
-The four POST routes are `claim`, `start`, `admit` and `result`, under
-`/wp-json/ct-scan/v1/`.
+The POST routes are `claim`, `start`, `admit`, `result`, `control/claim` and
+`control/result`, under `/wp-json/ct-scan/v1/`.
 Each request carries `X-CT-Timestamp` (Unix seconds), `X-CT-Nonce` (32 lowercase
 hex characters), and `X-CT-Signature` (HMAC-SHA256 hex). The signed string is the
 timestamp, nonce, `POST`, route without `/wp-json`, and raw-body SHA-256 joined
@@ -117,7 +117,10 @@ Enforcement in the supervisor and scanner:
   pacing and busy retries, takes at most about eight seconds.
 - The grant's one-second lifetime and ten-second request bound are measured
   from just before the call WordPress granted, not from delivery to the
-  scanner. A grant that aged out while the supervisor waited is not delivered.
+  scanner. A grant that took more than 0.6 s to come back is discarded and
+  asked for again (the discarded slot stays spent), at most twice; after that
+  the admission is refused (`admission_expired`). No admission is requested
+  after the scan's own deadline, and a shutdown interrupts a slow guard call.
 - One grant is outstanding at a time. A second request, an out-of-sequence or
   unexpected message or an oversized message ends the scan
   (`admission_protocol_violation`).
@@ -167,6 +170,55 @@ Before upgrading the pinned revision or rotating the key, stop accepting new
 work, drain/reconcile existing receipts and stop the controller. Do not change
 the expected revision while old receipts are awaiting acknowledgement.
 
+## Exact-target control
+
+Mailbox confirmation shows control of an email address, not of the website, and
+a referral code shows neither. Config `target_control_versions` (default empty)
+lists terms versions whose jobs must show control of the exact hostname before
+any scan can be claimed. Each job freezes that requirement when it is created.
+For such a job, confirmation no longer queues it: it waits as
+`awaiting_control`, and the confirmation page shows a one-time challenge token
+(only its hash is stored) with two ways to publish it:
+
+- a DNS TXT record at `_ct-scan-challenge.<hostname>` with the value
+  `ct-scan-verify=<token>`, or
+- the file `https://<hostname>/.well-known/ct-scan-challenge.txt` whose entire
+  content is the token.
+
+The customer's page (address shown once; GET only displays it, a nonce-protected
+POST acts) lets them request a check. The disclosed limits: at most three checks
+per job, at least a minute apart; each check is one TXT lookup or one HTTPS
+request to the fixed path, with no redirects, at most 4096 bytes and a ten-second
+timeout; no probe of any kind is sent to help a failed check pass. A scheduled
+check is taken by the worker (`control/claim`), admitted exactly once through the
+same guard as a scan (`admit` with `kind` `control`; the attempt is consumed in the
+admission's compare-and-set, with its own pacing, budget, cancellation, expiry and
+lease checks, and `control_probe` for liveness), run inside the unprivileged
+child, and reported with `control/result`. The worker relays what it observed
+(untrusted, length-bounded); WordPress compares it with the stored hash. A result
+is accepted only if an admission happened under that lease, so no check can
+count without having been admitted. A match releases the job (`queued`,
+`control_method`, `control_verified_at`, evidence limited to the method, attempt,
+time, target and a hash of the matched value). Three failed checks end the job as
+`blocked` (`target_control_failed`); a blocked job is never scanned and gets no
+detailed report. There is no fallback from a failed challenge to a scan.
+
+An administrator can instead record an **authority review** (admin queue,
+`authority_review`): the evidence reviewed (20 to 1000 characters), the target,
+the reviewer's account, the time and the expiry (the authorization expiry) are
+stored, and the job is released the same way. An expired review ends the
+authorization. Detailed reports (`ct_scan_admin_send_report`) additionally
+require control of the target for jobs that required it, in any terminal state.
+
+DNS answers are parsed defensively (matching id, question and source address; a
+truncated or malformed answer is an error, with no TCP or resolver fallback) and
+come from the container's first configured resolver; they grant no exemption from
+the connection-safety rules, which still apply to the HTTPS check. Control checks
+and the scan share the single worker loop; no check can start while a scan runs.
+Not done: reissuing a challenge after `blocked` (a new request is needed),
+per-contact/domain/IP quotas for fresh challenges, and customer-facing wording
+(the pages are functional placeholders marked `TODO(owner)`).
+
 ## Bound acceptance evidence and the accepted copy
 
 A request is queued only if its saved acceptance reads back completely. A
@@ -183,21 +235,26 @@ carried. The site recorder writes these post meta keys:
 | `_ct_summary_text` | the Target Summary as displayed, `Label: value` lines (at most 8 KiB) |
 | `_ct_summary_sha256`, `_ct_summary_shown_digest` | its digest, and the digest the form carried |
 
-The Summary must contain exactly one each of `Website (scan scope)`,
-`Client contact`, `Client email` (equal to the authorized request fields) and
-`Profile` (the job's profile). Any missing, oversized, mismatched, stale,
-repeated or partial piece refuses the job (`ct_scan_binding_mismatch` /
-`ct_scan_binding_required`), and the job row stores the summary digest, so a
-later edit of the retained evidence makes the authorization no longer live and
-cancels a queued or running job. Config `bound_terms_versions` (default empty)
-lists terms versions whose acceptance **must** be bound; an unbound acceptance
-of any other version is accepted as before, but unbound pieces without the
-marker are always refused. Nothing in the plugin fetches mutable page HTML.
+The Summary must be exactly the canonical four lines of the authorized request
+(LF terminated, in this order, nothing before, between or after):
+`Website (scan scope): <target>`, `Client contact: <name>`,
+`Client email: <email>`, `Profile: <the job's profile>`. Any missing,
+oversized, mismatched, stale, non-canonical or partial piece refuses the job
+(`ct_scan_binding_mismatch` / `ct_scan_binding_required`), and the job row
+stores the summary digest, so a later edit of the retained evidence makes the
+authorization no longer live and cancels a queued or running job. Config
+`bound_terms_versions` (default empty) lists terms versions whose acceptance
+**must** be bound; each job freezes that requirement and its profile when it is
+created, so a later configuration change neither cancels a running
+authorization nor relaxes one. Unbound pieces without the marker are always
+refused. Nothing in the plugin fetches mutable page HTML.
 
 With config `send_accepted_copy` true (default false), a successful mailbox
 confirmation sends the verified contact their copy: the Target Summary, the
 hashes, the filled-in copy and, for a bound acceptance, the exact terms bytes
-as an attachment. It is sent at most once (the status is claimed by
+as an attachment (written to a private temporary directory and attached only if
+it reproduces the recorded hash). The recipient must still be the confirmed,
+authorized address. It is sent at most once (the status is claimed by
 compare-and-set before mail is handed off), only to the verified address, and
 never to a referrer. An uncertain or failed hand-off is recorded as `unknown`
 and never resent automatically; `accepted` means transport acceptance, not

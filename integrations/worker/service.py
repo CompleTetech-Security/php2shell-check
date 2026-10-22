@@ -257,7 +257,7 @@ class WorkerService:
             outcome, result, error = "failed", None, "stale_claim"
         else:
             try:
-                gate = AdmissionGate(self.api, claim, stop_event=self.stop_event, clock=self.clock)
+                gate = AdmissionGate(self.api, claim, stop_event=self.stop_event, deadline=self.clock() + scan_timeout, clock=self.clock)
                 result = self.runner.run(claim.target, timeout=scan_timeout, stop_event=self.stop_event, gate=gate)
                 SubprocessRunner.validate_result(result, claim.target, scope)
                 outcome, error = "completed", ""
