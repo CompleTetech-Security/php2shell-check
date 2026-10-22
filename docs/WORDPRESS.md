@@ -178,7 +178,12 @@ lists terms versions whose jobs must show control of the exact hostname before
 any scan can be claimed. Each job freezes that requirement when it is created.
 For such a job, confirmation no longer queues it: it waits as
 `awaiting_control`, and the confirmation page shows a one-time challenge token
-(only its hash is stored) with two ways to publish it:
+(only its hash is stored) with two ways to publish it. The published challenge
+value and the customer's page capability are two independent secrets: the page
+address (which contains the capability, and is the only way back to the page)
+is never published, and the challenge shown on it is derived from the capability
+with a keyed hash, so someone who reads the published challenge cannot open the
+page, request checks or use up the three attempts:
 
 - a DNS TXT record at `_ct-scan-challenge.<hostname>` with the value
   `ct-scan-verify=<token>`, or
@@ -215,6 +220,14 @@ truncated or malformed answer is an error, with no TCP or resolver fallback) and
 come from the container's first configured resolver; they grant no exemption from
 the connection-safety rules, which still apply to the HTTPS check. Control checks
 and the scan share the single worker loop; no check can start while a scan runs.
+The gate is opt-in per terms version. An operator who enables the worker API
+for a terms version that is not listed in `target_control_versions` gets no
+control requirement for new jobs of that version (a job created earlier keeps
+the requirement it was created with); a profile broader than the r2 header
+screening always requires it. Decide this before activating a new terms version.
+One piece of target traffic runs at a time worker-wide: a scan claim is refused
+while a check is in progress and the reverse, enforced in WordPress. If every
+check is spent but the last result was lost, maintenance blocks the job.
 Not done: reissuing a challenge after `blocked` (a new request is needed),
 per-contact/domain/IP quotas for fresh challenges, and customer-facing wording
 (the pages are functional placeholders marked `TODO(owner)`).

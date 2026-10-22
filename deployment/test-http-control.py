@@ -64,7 +64,7 @@ status, text = page('POST', '/wp-admin/admin-post.php', urlencode(hidden(text)))
 assert status == 200 and 'Show control of your website' in text, text[:300]
 challenge = re.search(r'ct-scan-verify=([a-f0-9]{64})', text).group(1)
 form = hidden(text)
-assert form['ctl'] == challenge and form['job'] and form['_wpnonce']
+assert form['ctl'] != challenge and form['job'] and form['_wpnonce'], 'The page capability must not be the published challenge'
 assert api.claim() is None, 'A job awaiting target control was claimable for scanning'
 assert api.control_claim() is None, 'A check ran before the customer asked for one'
 
@@ -74,7 +74,9 @@ assert status == 200 and 'scheduled' in text, text[:300]
 status, text = page('POST', '/wp-admin/admin-post.php', urlencode(dict(form, method='https_file')))
 assert 'already scheduled' in text, text[:300]
 status, _ = page('POST', '/wp-admin/admin-post.php', urlencode(dict(form, method='dns_txt', ctl='f' * 64)))
-assert status == 410, 'A wrong challenge secret reached the control handler'
+assert status == 410, 'A wrong page capability reached the control handler'
+status, _ = page('POST', '/wp-admin/admin-post.php', urlencode(dict(form, method='dns_txt', ctl=challenge)))
+assert status == 410, 'The published challenge value opened the control page'
 status, _ = page('POST', '/wp-admin/admin-post.php', urlencode({k: v for k, v in dict(form, method='dns_txt').items() if k != '_wpnonce'}))
 assert status == 403, 'A control request without its nonce was accepted'
 
@@ -92,7 +94,8 @@ except APIError as error:
     verified = error
 assert verified is None  # a wrong value is a recorded failure, not an error
 assert api.claim() is None, 'A wrong challenge value released the job'
-text = page('GET', '/wp-admin/admin-post.php?' + urlencode({'action': 'ct_scan_control', 'job': form['job'], 'ctl': challenge}))[1]
+text = page('GET', '/wp-admin/admin-post.php?' + urlencode({'action': 'ct_scan_control', 'job': form['job'], 'ctl': form['ctl']}))[1]
+assert 'ct-scan-verify=' + challenge in text, 'The returning customer is shown the same challenge'
 assert 'Checks used: 1 of 3' in text, text[:400]
 
 # 4. One minute later the customer asks again; the right value releases the job for scanning.

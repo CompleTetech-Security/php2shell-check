@@ -188,6 +188,7 @@ function ct_scan_maybe_install_schema() {
 		control_required tinyint(1) unsigned NOT NULL DEFAULT 0,
 		control_state varchar(12) NOT NULL DEFAULT 'none',
 		control_token_hash char(64) NULL,
+		control_page_hash char(64) NULL,
 		control_requested_method varchar(12) NULL,
 		control_attempts tinyint(3) unsigned NOT NULL DEFAULT 0,
 		control_last_attempt_ms bigint(20) unsigned NULL,
@@ -215,7 +216,7 @@ function ct_scan_maybe_install_schema() {
 	) {$charset};";
 	dbDelta( $sql );
 	$required = array(
-		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_attempts', 'control_last_attempt_ms', 'control_lease_hash', 'control_verified_at', 'control_valid_until', 'control_evidence' ),
+		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
 	);
 	foreach ( $required as $table => $columns ) {
@@ -593,7 +594,8 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 				'summary_sha256'           => $accepted['summary_sha256'],
 				'bound_required'           => $accepted['bound_required'] ? 1 : 0,
 				// Frozen at creation: a later configuration change cannot relax an existing job.
-				'control_required'         => in_array( $accepted['terms_version'], (array) $config['target_control_versions'], true ) ? 1 : 0,
+				// A profile broader than the r2 header screening can never run without target control.
+				'control_required'         => ( in_array( $accepted['terms_version'], (array) $config['target_control_versions'], true ) || 'r2-header-v1' !== ct_scan_current_profile() ) ? 1 : 0,
 			),
 			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d' )
 		);
@@ -697,7 +699,7 @@ function ct_scan_maintenance_locked() {
 	$table = ct_scan_jobs_table();
 	$now   = ct_scan_utc_now();
 	$wpdb->query( $wpdb->prepare(
-		"UPDATE {$table} SET status = 'expired', error_code = 'authorization_expired', finished_at = %s, lease_hash = NULL, lease_until = NULL, confirmation_token_hash = NULL, control_token_hash = NULL, control_lease_hash = NULL, control_lease_until = NULL, control_state = 'none' WHERE status IN ('awaiting_confirmation','awaiting_control','queued','leased','running') AND authorization_expires_at <= %s",
+		"UPDATE {$table} SET status = 'expired', error_code = 'authorization_expired', finished_at = %s, lease_hash = NULL, lease_until = NULL, confirmation_token_hash = NULL, control_token_hash = NULL, control_page_hash = NULL, control_lease_hash = NULL, control_lease_until = NULL, control_state = 'none' WHERE status IN ('awaiting_confirmation','awaiting_control','queued','leased','running') AND authorization_expires_at <= %s",
 		$now,
 		$now
 	) );
@@ -709,6 +711,12 @@ function ct_scan_maintenance_locked() {
 	$wpdb->query( $wpdb->prepare(
 		"UPDATE {$table} SET control_state = 'pending', control_lease_hash = NULL, control_lease_until = NULL WHERE status = 'awaiting_control' AND control_state = 'checking' AND control_lease_until <= %s",
 		$now
+	) );
+	// Every check was spent (even if the last result never arrived): the job is blocked, not left waiting.
+	$wpdb->query( $wpdb->prepare(
+		"UPDATE {$table} SET status = 'blocked', error_code = 'target_control_failed', finished_at = %s, control_state = 'none', control_token_hash = NULL, control_page_hash = NULL, control_lease_hash = NULL, control_lease_until = NULL WHERE status = 'awaiting_control' AND control_state = 'pending' AND control_attempts >= %d",
+		$now,
+		ct_scan_control_limits()['max_attempts']
 	) );
 	$wpdb->query( $wpdb->prepare(
 		"UPDATE {$table} SET status = 'queued', lease_hash = NULL, lease_until = NULL WHERE status = 'leased' AND lease_until <= %s AND attempts = 0",
@@ -735,7 +743,7 @@ function ct_scan_maintenance_locked() {
 		$result_cutoff
 	) );
 	$request_cutoff = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '-3 years' )->format( 'Y-m-d H:i:s' );
-	$old_rows = $wpdb->get_results( $wpdb->prepare( "SELECT job_id,request_id FROM {$table} WHERE terms_accepted_at < %s AND status IN ('completed','failed','failed_unknown','cancelled','expired')", $request_cutoff ) );
+	$old_rows = $wpdb->get_results( $wpdb->prepare( "SELECT job_id,request_id FROM {$table} WHERE terms_accepted_at < %s AND status IN ('completed','failed','failed_unknown','cancelled','expired','blocked')", $request_cutoff ) );
 	foreach ( (array) $old_rows as $row ) {
 		$post = get_post( (int) $row->request_id );
 		$personal_scrubbed = $wpdb->update(
@@ -824,10 +832,14 @@ function ct_scan_confirm_job( $job_id, $token ) {
 			// Mailbox control is not control of the website: a job that requires target control waits
 			// for it. The challenge token is shown once; only its hash is stored.
 			$needs_control = ! empty( $row->control_required );
-			$control_token = $needs_control ? bin2hex( random_bytes( 32 ) ) : '';
+			// Two independent secrets: the challenge value (published by design, so world-readable) and
+			// the page capability that lets the holder request checks (never published).
+			$control_page  = $needs_control ? bin2hex( random_bytes( 32 ) ) : '';
+			$control_token = $needs_control ? ct_scan_control_challenge( $row, $control_page ) : '';
 			$fields        = array( 'status' => $needs_control ? 'awaiting_control' : 'queued', 'confirmed_at' => ct_scan_utc_now(), 'confirmation_token_hash' => null, 'confirmation_expires_at' => null );
 			if ( $needs_control ) {
 				$fields['control_token_hash'] = hash( 'sha256', $control_token );
+				$fields['control_page_hash']  = hash( 'sha256', $control_page );
 				$fields['control_state']      = 'pending';
 			}
 			$updated = $wpdb->update(
@@ -840,7 +852,7 @@ function ct_scan_confirm_job( $job_id, $token ) {
 			if ( 1 === $updated ) {
 				if ( $needs_control ) {
 					ct_scan_mark_request_status( (int) $row->request_id, 'awaiting_control' );
-					$control_markup = ct_scan_control_markup( $row, $control_token, '', 0 );
+					$control_markup = ct_scan_control_markup( $row, $control_page, '', 0 );
 					$message = 'Your email is confirmed. No screening will run until control of the website is shown.';
 				} else {
 					ct_scan_mark_request_status( (int) $row->request_id, 'queued' );
@@ -1004,21 +1016,31 @@ add_action( 'admin_post_ct_scan_confirm', 'ct_scan_confirmation_handler' );
  * challenge never falls back to a scan: after three failures the job is `blocked`.
  * TODO(owner): the wording of these customer-facing pages is functional only.
  */
-function ct_scan_control_markup( $row, $token, $notice, $attempts_used ) {
-	$limits  = ct_scan_control_limits();
-	$host    = (string) wp_parse_url( $row->target_origin, PHP_URL_HOST );
-	$action  = esc_url( admin_url( 'admin-post.php' ) );
-	$nonce   = wp_create_nonce( 'ct_scan_control_' . (int) $row->job_id . '_' . $token );
-	$link    = esc_url( add_query_arg( array( 'action' => 'ct_scan_control', 'job' => (int) $row->job_id, 'ctl' => $token ), admin_url( 'admin-post.php' ) ) );
+/**
+ * The challenge value shown to the customer. It is derived from the page capability with a keyed
+ * hash, so the page can show it again without storing it, while someone who reads the published
+ * challenge learns nothing that lets them open the page and use up the checks.
+ */
+function ct_scan_control_challenge( $row, $page_token ) {
+	return hash_hmac( 'sha256', 'ct-scan-challenge-v1|' . (int) $row->job_id . '|' . $row->scope_hash, $page_token );
+}
+
+function ct_scan_control_markup( $row, $page_token, $notice, $attempts_used ) {
+	$limits    = ct_scan_control_limits();
+	$host      = (string) wp_parse_url( $row->target_origin, PHP_URL_HOST );
+	$challenge = ct_scan_control_challenge( $row, $page_token );
+	$action    = esc_url( admin_url( 'admin-post.php' ) );
+	$nonce     = wp_create_nonce( 'ct_scan_control_' . (int) $row->job_id . '_' . $page_token );
+	$link      = esc_url( add_query_arg( array( 'action' => 'ct_scan_control', 'job' => (int) $row->job_id, 'ctl' => $page_token ), admin_url( 'admin-post.php' ) ) );
 	$html  = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Show control of your website</title><body><main><h1>Show control of your website</h1>';
 	if ( '' !== $notice ) {
 		$html .= '<p><strong>' . esc_html( $notice ) . '</strong></p>';
 	}
 	$html .= '<p>No screening runs until control of <strong>' . esc_html( $host ) . '</strong> is shown. Publish ONE of the following, then press Check.</p>';
-	$html .= '<p>DNS TXT record at <code>' . esc_html( $limits['dns_label'] . '.' . $host ) . '</code> with the value:<br><code>' . esc_html( $limits['dns_prefix'] . $token ) . '</code></p>';
-	$html .= '<p>or the file <code>https://' . esc_html( $host . $limits['path'] ) . '</code> whose entire content is:<br><code>' . esc_html( $token ) . '</code></p>';
-	$html .= '<p>Keep this page\'s address: it is the only way to return here. Checks used: ' . (int) $attempts_used . ' of ' . (int) $limits['max_attempts'] . '; at least one minute apart.</p>';
-	$html .= '<form method="post" action="' . $action . '"><input type="hidden" name="action" value="ct_scan_control"><input type="hidden" name="job" value="' . esc_attr( (string) (int) $row->job_id ) . '"><input type="hidden" name="ctl" value="' . esc_attr( $token ) . '"><input type="hidden" name="_wpnonce" value="' . esc_attr( $nonce ) . '">';
+	$html .= '<p>DNS TXT record at <code>' . esc_html( $limits['dns_label'] . '.' . $host ) . '</code> with the value:<br><code>' . esc_html( $limits['dns_prefix'] . $challenge ) . '</code></p>';
+	$html .= '<p>or the file <code>https://' . esc_html( $host . $limits['path'] ) . '</code> whose entire content is:<br><code>' . esc_html( $challenge ) . '</code></p>';
+	$html .= '<p>Keep this page\'s address private: it is the only way to return here and to request checks. Checks used: ' . (int) $attempts_used . ' of ' . (int) $limits['max_attempts'] . '; at least one minute apart.</p>';
+	$html .= '<form method="post" action="' . $action . '"><input type="hidden" name="action" value="ct_scan_control"><input type="hidden" name="job" value="' . esc_attr( (string) (int) $row->job_id ) . '"><input type="hidden" name="ctl" value="' . esc_attr( $page_token ) . '"><input type="hidden" name="_wpnonce" value="' . esc_attr( $nonce ) . '">';
 	$html .= '<label><input type="radio" name="method" value="dns_txt" checked> I published the DNS record</label><br><label><input type="radio" name="method" value="https_file"> I published the file</label><br><button type="submit">Check now</button></form>';
 	$html .= '<p><small>Return address: ' . $link . '</small></p></main></body></html>';
 	return $html;
@@ -1045,7 +1067,7 @@ function ct_scan_request_control_check( $job_id, $token, $method ) {
 	$table = ct_scan_jobs_table();
 	try {
 		$row = ct_scan_row( $job_id );
-		if ( ! $row || 'awaiting_control' !== $row->status || empty( $row->control_token_hash ) || ! hash_equals( $row->control_token_hash, hash( 'sha256', $token ) )
+		if ( ! $row || 'awaiting_control' !== $row->status || empty( $row->control_page_hash ) || ! hash_equals( $row->control_page_hash, hash( 'sha256', $token ) )
 			|| ! ct_scan_authorization_is_live( $row ) ) {
 			return new WP_Error( 'control_link_invalid', 'This link is invalid or expired.' );
 		}
@@ -1087,7 +1109,7 @@ function ct_scan_control_handler() {
 		ct_scan_send_confirmation_page( 'This link is invalid or expired.', 404 );
 	}
 	$row = ct_scan_row( $job_id );
-	if ( ! $row || 'awaiting_control' !== $row->status || empty( $row->control_token_hash ) || ! hash_equals( $row->control_token_hash, hash( 'sha256', $token ) ) || ! ct_scan_authorization_is_live( $row ) ) {
+	if ( ! $row || 'awaiting_control' !== $row->status || empty( $row->control_page_hash ) || ! hash_equals( $row->control_page_hash, hash( 'sha256', $token ) ) || ! ct_scan_authorization_is_live( $row ) ) {
 		ct_scan_send_confirmation_page( 'This link is invalid or expired.', 410 );
 	}
 	if ( 'GET' === $method_http ) {
@@ -1146,9 +1168,9 @@ function ct_scan_admin_record_authority_review( $job_id, $evidence_note ) {
 		), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
 		$updated  = $wpdb->update(
 			$table,
-			array( 'status' => 'queued', 'control_state' => 'none', 'control_method' => 'manual_review', 'control_verified_at' => $now, 'control_valid_until' => $row->authorization_expires_at, 'control_evidence' => $evidence, 'control_token_hash' => null, 'control_lease_hash' => null, 'control_lease_until' => null ),
+			array( 'status' => 'queued', 'control_state' => 'none', 'control_method' => 'manual_review', 'control_verified_at' => $now, 'control_valid_until' => $row->authorization_expires_at, 'control_evidence' => $evidence, 'control_token_hash' => null, 'control_page_hash' => null, 'control_lease_hash' => null, 'control_lease_until' => null ),
 			array( 'job_id' => (int) $row->job_id, 'status' => 'awaiting_control' ),
-			array( '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' ),
+			array_fill( 0, 10, '%s' ),
 			array( '%d', '%s' )
 		);
 		if ( 1 !== $updated ) {
@@ -1203,7 +1225,7 @@ function ct_scan_customer_stop( $job_id, $token ) {
 		$now = ct_scan_utc_now();
 		$updated = $wpdb->update(
 			$table,
-			array( 'status' => 'cancelled', 'error_code' => 'customer_stopped', 'finished_at' => $now, 'confirmation_token_hash' => null, 'confirmation_expires_at' => null, 'lease_hash' => null, 'lease_until' => null, 'control_token_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null ),
+			array( 'status' => 'cancelled', 'error_code' => 'customer_stopped', 'finished_at' => $now, 'confirmation_token_hash' => null, 'confirmation_expires_at' => null, 'lease_hash' => null, 'lease_until' => null, 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null ),
 			array( 'job_id' => (int) $row->job_id, 'status' => $row->status ),
 			null,
 			array( '%d', '%s' )
@@ -1340,7 +1362,8 @@ function ct_scan_claim( WP_REST_Request $request ) {
 	$table = ct_scan_jobs_table();
 	try {
 		ct_scan_maintenance_locked();
-		$active = $wpdb->get_var( "SELECT job_id FROM {$table} WHERE status IN ('leased','running') LIMIT 1" );
+		// One piece of target traffic at a time worker-wide: a scan, or a control check in progress.
+		$active = $wpdb->get_var( "SELECT job_id FROM {$table} WHERE status IN ('leased','running') OR (status = 'awaiting_control' AND control_state = 'checking') LIMIT 1" );
 		if ( $active ) {
 			return ct_scan_rest_response( 200, array( 'job' => null ) );
 		}
@@ -1777,7 +1800,7 @@ function ct_scan_admit_control_locked( $data, $now_ms ) {
 		return $refuse( 410, 'job_not_found' );
 	}
 	if ( 'awaiting_control' === $row->status && strtotime( $row->authorization_expires_at . ' UTC' ) <= time() ) {
-		$wpdb->update( $table, array( 'status' => 'expired', 'error_code' => 'authorization_expired', 'finished_at' => ct_scan_utc_now(), 'control_token_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null ), array( 'job_id' => (int) $row->job_id, 'status' => 'awaiting_control' ), null, array( '%d', '%s' ) );
+		$wpdb->update( $table, array( 'status' => 'expired', 'error_code' => 'authorization_expired', 'finished_at' => ct_scan_utc_now(), 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null ), array( 'job_id' => (int) $row->job_id, 'status' => 'awaiting_control' ), null, array( '%d', '%s' ) );
 		ct_scan_mark_request_status( (int) $row->request_id, 'expired', 'authorization_expired' );
 		return $refuse( 410, 'job_expired' );
 	}
@@ -1798,7 +1821,7 @@ function ct_scan_admit_control_locked( $data, $now_ms ) {
 		return $refuse( 410, 'recipient_unconfirmed' );
 	}
 	if ( ! ct_scan_authorization_is_live( $row ) ) {
-		$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => ct_scan_utc_now(), 'control_token_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null ), array( 'job_id' => (int) $row->job_id ), null, array( '%d' ) );
+		$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => ct_scan_utc_now(), 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null ), array( 'job_id' => (int) $row->job_id ), null, array( '%d' ) );
 		ct_scan_mark_request_status( (int) $row->request_id, 'cancelled', 'authorization_changed' );
 		return $refuse( 410, 'authorization_revoked_or_expired' );
 	}
@@ -1857,12 +1880,16 @@ function ct_scan_control_claim( WP_REST_Request $request ) {
 	$limits = ct_scan_control_limits();
 	try {
 		ct_scan_maintenance_locked();
+		$busy = $wpdb->get_var( "SELECT job_id FROM {$table} WHERE status IN ('leased','running') OR (status = 'awaiting_control' AND control_state = 'checking') LIMIT 1" );
+		if ( $busy ) {
+			return ct_scan_rest_response( 200, array( 'task' => null ) );
+		}
 		$row = $wpdb->get_row( "SELECT * FROM {$table} WHERE status = 'awaiting_control' AND control_state = 'requested' ORDER BY job_id ASC LIMIT 1" );
 		if ( ! $row ) {
 			return ct_scan_rest_response( 200, array( 'task' => null ) );
 		}
 		if ( ! ct_scan_authorization_is_live( $row ) || empty( $row->confirmed_at ) || ! in_array( $row->control_requested_method, array( 'dns_txt', 'https_file' ), true ) ) {
-			$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => ct_scan_utc_now(), 'control_token_hash' => null, 'control_state' => 'none' ), array( 'job_id' => (int) $row->job_id ), null, array( '%d' ) );
+			$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => ct_scan_utc_now(), 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none' ), array( 'job_id' => (int) $row->job_id ), null, array( '%d' ) );
 			ct_scan_mark_request_status( (int) $row->request_id, 'cancelled', 'authorization_changed' );
 			return ct_scan_rest_response( 200, array( 'task' => null ) );
 		}
@@ -1957,7 +1984,7 @@ function ct_scan_control_result( WP_REST_Request $request ) {
 			return ct_scan_rest_error( 409, 'no_admission' );
 		}
 		if ( ! ct_scan_authorization_is_live( $row ) ) {
-			$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => ct_scan_utc_now(), 'control_token_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null ), array( 'job_id' => (int) $row->job_id ), null, array( '%d' ) );
+			$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => ct_scan_utc_now(), 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null ), array( 'job_id' => (int) $row->job_id ), null, array( '%d' ) );
 			ct_scan_mark_request_status( (int) $row->request_id, 'cancelled', 'authorization_changed' );
 			return ct_scan_rest_error( 410, 'authorization_revoked_or_expired' );
 		}
@@ -1979,10 +2006,10 @@ function ct_scan_control_result( WP_REST_Request $request ) {
 				'target'          => $row->target_origin,
 				'observed_sha256' => hash( 'sha256', $matched ),
 			), JSON_UNESCAPED_SLASHES );
-			$update = array( 'status' => 'queued', 'control_state' => 'none', 'control_method' => $data['method'], 'control_verified_at' => $now, 'control_valid_until' => $row->authorization_expires_at, 'control_evidence' => $evidence, 'control_token_hash' => null, 'control_lease_hash' => null, 'control_lease_until' => null );
+			$update = array( 'status' => 'queued', 'control_state' => 'none', 'control_method' => $data['method'], 'control_verified_at' => $now, 'control_valid_until' => $row->authorization_expires_at, 'control_evidence' => $evidence, 'control_token_hash' => null, 'control_page_hash' => null, 'control_lease_hash' => null, 'control_lease_until' => null );
 			$state  = 'queued';
 		} elseif ( (int) $row->control_attempts >= $limits['max_attempts'] ) {
-			$update = array( 'status' => 'blocked', 'error_code' => 'target_control_failed', 'finished_at' => $now, 'control_state' => 'none', 'control_token_hash' => null, 'control_lease_hash' => null, 'control_lease_until' => null, 'control_evidence' => wp_json_encode( array( 'method' => $data['method'], 'attempt' => (int) $row->control_attempts, 'last_outcome' => $data['outcome'] ) ) );
+			$update = array( 'status' => 'blocked', 'error_code' => 'target_control_failed', 'finished_at' => $now, 'control_state' => 'none', 'control_token_hash' => null, 'control_page_hash' => null, 'control_lease_hash' => null, 'control_lease_until' => null, 'control_evidence' => wp_json_encode( array( 'method' => $data['method'], 'attempt' => (int) $row->control_attempts, 'last_outcome' => $data['outcome'] ) ) );
 			$state  = 'blocked';
 		} else {
 			$update = array( 'control_state' => 'pending', 'control_lease_hash' => null, 'control_lease_until' => null, 'control_evidence' => wp_json_encode( array( 'method' => $data['method'], 'attempt' => (int) $row->control_attempts, 'last_outcome' => $data['outcome'] ) ) );
@@ -2136,7 +2163,7 @@ function ct_scan_admin_revoke( $job_id ) {
 			return new WP_Error( 'job_unavailable', 'This job cannot be revoked.' );
 		}
 		$now = ct_scan_utc_now();
-		$update = array( 'revoked_at' => $now, 'confirmation_token_hash' => null, 'lease_hash' => null, 'lease_until' => null, 'control_token_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null );
+		$update = array( 'revoked_at' => $now, 'confirmation_token_hash' => null, 'lease_hash' => null, 'lease_until' => null, 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null );
 		if ( ! ct_scan_terminal_status( $row->status ) ) {
 			$update['status'] = 'cancelled';
 			$update['error_code'] = 'operator_revoked';
@@ -2324,6 +2351,15 @@ function ct_scan_admin_form( $job_id, $operation, $label, $extra = '' ) {
 	return '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" style="display:inline-block;margin:4px 8px 4px 0"><input type="hidden" name="action" value="ct_scan_admin_action"><input type="hidden" name="job_id" value="' . esc_attr( (string) $job_id ) . '"><input type="hidden" name="ct_scan_operation" value="' . esc_attr( $operation ) . '">' . $nonce . $extra . '<button class="button" type="submit">' . esc_html( $label ) . '</button></form>';
 }
 
+/** One line summarizing a recorded manual authority review, for the admin queue. */
+function ct_scan_control_evidence_line( $row ) {
+	$evidence = json_decode( (string) $row->control_evidence, true );
+	if ( ! is_array( $evidence ) ) {
+		return 'unreadable';
+	}
+	return sprintf( '%s at %s UTC, valid until %s UTC: %s', (string) ( $evidence['reviewer'] ?? '?' ), (string) ( $evidence['reviewed_at'] ?? '?' ), (string) ( $evidence['valid_until'] ?? '?' ), (string) ( $evidence['evidence'] ?? '' ) );
+}
+
 function ct_scan_admin_result_details( $row ) {
 	if ( ! is_object( $row ) || 'completed' !== $row->status || ! is_string( $row->result_json ) || '' === $row->result_json ) {
 		return '';
@@ -2378,7 +2414,7 @@ function ct_scan_admin_page() {
 	foreach ( $rows as $row ) {
 		$request_url = admin_url( 'post.php?post=' . (int) $row->request_id . '&action=edit' );
 		$host = wp_parse_url( $row->target_origin, PHP_URL_HOST );
-		$exec = 'Status: ' . $row->status . "\nAttempts: " . (int) $row->attempts . "\nOutcome: " . ( $row->outcome ? $row->outcome : 'pending' ) . "\nTarget control: " . ( $row->control_required ? ( $row->control_verified_at ? sanitize_key( (string) $row->control_method ) . ' at ' . $row->control_verified_at . ' UTC' : 'required, not shown (' . (int) $row->control_attempts . ' of 3 checks used)' ) : 'not required' ) . "\nError: " . ( $row->error_code ? sanitize_key( $row->error_code ) : '—' ) . "\nChecker revision: " . ( $row->checker_revision ? substr( $row->checker_revision, 0, 12 ) . '…' : '—' );
+		$exec = 'Status: ' . $row->status . "\nAttempts: " . (int) $row->attempts . "\nOutcome: " . ( $row->outcome ? $row->outcome : 'pending' ) . "\nTarget control: " . ( $row->control_required ? ( $row->control_verified_at ? sanitize_key( (string) $row->control_method ) . ' at ' . $row->control_verified_at . ' UTC' : 'required, not shown (' . (int) $row->control_attempts . ' of 3 checks used)' ) : 'not required' ) . "\nError: " . ( $row->error_code ? sanitize_key( $row->error_code ) : '—' ) . ( 'manual_review' === $row->control_method ? "\nAuthority review: " . ct_scan_control_evidence_line( $row ) : '' ) . "\nChecker revision: " . ( $row->checker_revision ? substr( $row->checker_revision, 0, 12 ) . '…' : '—' );
 		$mail = 'Confirmation email: ' . sanitize_key( $row->confirmation_email_status ) . "\nReport transport: " . sanitize_key( $row->report_notification_status ) . "\nDelivery confirmed: " . ( $row->report_delivered_at ? $row->report_delivered_at . ' UTC' : 'no' ) . "\nRevoked: " . ( $row->revoked_at ? $row->revoked_at . ' UTC' : 'no' );
 		echo '<tr><td><a href="' . esc_url( $request_url ) . '">Job #' . (int) $row->job_id . ' / request #' . (int) $row->request_id . '</a><br>Created ' . esc_html( $row->created_at ) . ' UTC</td>';
 		echo '<td><code>' . esc_html( $row->target_origin ) . '</code><br>Terms ' . esc_html( $row->terms_version ) . '<br>Accepted ' . esc_html( $row->terms_accepted_at ) . ' UTC<br>Expires ' . esc_html( $row->authorization_expires_at ) . ' UTC<br>Scope hash <code>' . esc_html( substr( $row->scope_hash, 0, 16 ) ) . '…</code></td>';

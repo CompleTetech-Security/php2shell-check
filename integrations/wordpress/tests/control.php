@@ -24,7 +24,9 @@ add_filter( 'pre_wp_mail', static function ( $pre, $atts ) use ( &$mail ) {
 
 /** A confirmed job waiting for target control. Returns its ids and the challenge token the customer saw. */
 function ct_test_control_job( $host ) {
-	global $mail, $request_ids;
+	global $mail, $request_ids, $wpdb;
+	// Scenarios are sequential: end any earlier job still holding a requested or in-progress check.
+	$wpdb->query( "UPDATE " . ct_scan_jobs_table() . " SET status = 'cancelled', error_code = 'test_cleanup', control_state = 'none' WHERE status = 'awaiting_control' AND control_state IN ('requested','checking')" );
 	list( $request_id, $fields ) = ct_test_request( $host );
 	$request_ids[] = $request_id;
 	$before = count( $mail );
@@ -33,8 +35,8 @@ function ct_test_control_job( $host ) {
 	ct_test_assert( 1 === (int) ct_scan_row( $event['job_id'] )->control_required, 'The job did not freeze control_required.' );
 	preg_match( '/token=([a-f0-9]{64})/', $mail[ $before ]['message'], $m );
 	list( $message, $status, $markup ) = ct_scan_confirm_job( $event['job_id'], $m[1] );
-	ct_test_assert( 200 === $status && 1 === preg_match( '/ct-scan-verify=([a-f0-9]{64})/', $markup, $t ), 'Confirmation did not present a challenge.' );
-	return array( 'request_id' => $request_id, 'fields' => $fields, 'job_id' => (int) $event['job_id'], 'token' => $t[1], 'markup' => $markup );
+	ct_test_assert( 200 === $status && 1 === preg_match( '/ct-scan-verify=([a-f0-9]{64})/', $markup, $t ) && 1 === preg_match( '/name="ctl" value="([a-f0-9]{64})"/', $markup, $p ), 'Confirmation did not present a challenge and a page capability.' );
+	return array( 'request_id' => $request_id, 'fields' => $fields, 'job_id' => (int) $event['job_id'], 'token' => $t[1], 'page' => $p[1], 'markup' => $markup );
 }
 
 function ct_test_control_claim() {
@@ -59,7 +61,7 @@ function ct_test_age_control( $job_id ) {
 /** One full check: request, claim, admit, result. Returns the result response. */
 function ct_test_run_check( $job, $method, $observed, $outcome = 'observed' ) {
 	global $wpdb;
-	$r = ct_scan_request_control_check( $job['job_id'], $job['token'], $method );
+	$r = ct_scan_request_control_check( $job['job_id'], $job['page'], $method );
 	ct_test_assert( 'scheduled' === $r, 'A check could not be scheduled: ' . ( is_wp_error( $r ) ? $r->get_error_code() : $r ) );
 	$task = ct_test_control_claim();
 	ct_test_assert( $task && (int) $task['id'] === $job['job_id'], 'The scheduled check was not claimed.' );
@@ -71,7 +73,10 @@ function ct_test_run_check( $job, $method, $observed, $outcome = 'observed' ) {
 // ---- Confirmation no longer queues: mailbox control is not target control -----------------------------
 $a = ct_test_control_job( 'control-a.example.net' );
 $row = ct_scan_row( $a['job_id'] );
-ct_test_assert( 'awaiting_control' === $row->status && 'pending' === $row->control_state && ! empty( $row->confirmed_at ) && hash( 'sha256', $a['token'] ) === $row->control_token_hash, 'Confirmation did not leave the job awaiting target control with a hashed challenge.' );
+ct_test_assert( 'awaiting_control' === $row->status && 'pending' === $row->control_state && ! empty( $row->confirmed_at ) && hash( 'sha256', $a['token'] ) === $row->control_token_hash && hash( 'sha256', $a['page'] ) === $row->control_page_hash, 'Confirmation did not leave the job awaiting target control with hashed secrets.' );
+// Two independent secrets: the published challenge value is not the page capability.
+ct_test_assert( $a['token'] !== $a['page'] && $a['token'] === ct_scan_control_challenge( $row, $a['page'] ) && false === strpos( wp_json_encode( $row ), $a['page'] ), 'The challenge and the page capability are not independent, or the capability is stored.' );
+ct_test_assert( false === strpos( $a['markup'], 'ct-scan-verify=' . $a['page'] ), 'The page capability is shown as the challenge.' );
 ct_test_assert( false === strpos( wp_json_encode( $row ), $a['token'] ), 'The raw challenge token is stored.' );
 ct_test_assert( false !== strpos( $a['markup'], '_ct-scan-challenge.control-a.example.net' ) && false !== strpos( $a['markup'], 'https://control-a.example.net/.well-known/ct-scan-challenge.txt' ), 'The instructions do not name the exact hostname and fixed paths.' );
 ct_test_assert( 'awaiting_control' === get_post_meta( $a['request_id'], '_ct_scan_status', true ), 'The request status did not record the wait.' );
@@ -92,11 +97,13 @@ ct_test_assert( 200 === $legacy_status && 'queued' === ct_scan_row( $legacy['job
 $wpdb->update( $jobs, array( 'status' => 'cancelled', 'error_code' => 'test_cleanup' ), array( 'job_id' => $legacy['job_id'] ) );
 
 // ---- Scheduling a check: customer-driven, bound to the secret, limited ------------------------------
-ct_test_assert( is_wp_error( ct_scan_request_control_check( $a['job_id'], str_repeat( 'a', 64 ), 'dns_txt' ) ), 'A wrong challenge token scheduled a check.' );
-ct_test_assert( 'control_method_invalid' === ct_scan_request_control_check( $a['job_id'], $a['token'], 'http' )->get_error_code(), 'An unsupported method was accepted.' );
+ct_test_assert( is_wp_error( ct_scan_request_control_check( $a['job_id'], str_repeat( 'a', 64 ), 'dns_txt' ) ), 'A wrong page capability scheduled a check.' );
+// Anyone can read the published challenge; it must not let them use up the customer's checks.
+ct_test_assert( 'control_link_invalid' === ct_scan_request_control_check( $a['job_id'], $a['token'], 'dns_txt' )->get_error_code() && 'pending' === ct_scan_row( $a['job_id'] )->control_state && 0 === (int) ct_scan_row( $a['job_id'] )->control_attempts, 'The published challenge value scheduled a check.' );
+ct_test_assert( 'control_method_invalid' === ct_scan_request_control_check( $a['job_id'], $a['page'], 'http' )->get_error_code(), 'An unsupported method was accepted.' );
 ct_test_assert( 'pending' === ct_scan_row( $a['job_id'] )->control_state, 'A rejected request changed the state.' );
-ct_test_assert( 'scheduled' === ct_scan_request_control_check( $a['job_id'], $a['token'], 'dns_txt' ), 'A valid check was not scheduled.' );
-ct_test_assert( 'control_check_in_progress' === ct_scan_request_control_check( $a['job_id'], $a['token'], 'https_file' )->get_error_code(), 'A second check was scheduled while one is outstanding.' );
+ct_test_assert( 'scheduled' === ct_scan_request_control_check( $a['job_id'], $a['page'], 'dns_txt' ), 'A valid check was not scheduled.' );
+ct_test_assert( 'control_check_in_progress' === ct_scan_request_control_check( $a['job_id'], $a['page'], 'https_file' )->get_error_code(), 'A second check was scheduled while one is outstanding.' );
 ct_test_assert( 0 === (int) ct_scan_row( $a['job_id'] )->control_attempts, 'Scheduling consumed an attempt (only an admission may).' );
 
 // ---- Claim and admission -----------------------------------------------------------------------------
@@ -148,7 +155,7 @@ foreach ( array( 'prefix ' . $token, $token . ' suffix', strtoupper( $token ), '
 $fail1 = ct_test_control_result( $task, 'not_found' );
 $row = ct_scan_row( $a['job_id'] );
 ct_test_assert( 200 === $fail1->get_status() && false === $fail1->get_data()['verified'] && 'awaiting_control' === $row->status && 'pending' === $row->control_state && 1 === (int) $row->control_attempts && empty( $row->control_lease_hash ), 'A failed check did not return the job to waiting with the attempt spent.' );
-ct_test_assert( 'control_too_soon' === ct_scan_request_control_check( $a['job_id'], $a['token'], 'dns_txt' )->get_error_code(), 'A check was scheduled inside the one-minute interval.' );
+ct_test_assert( 'control_too_soon' === ct_scan_request_control_check( $a['job_id'], $a['page'], 'dns_txt' )->get_error_code(), 'A check was scheduled inside the one-minute interval.' );
 ct_test_assert( null === ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() )->get_data()['job'], 'A failed check made the job claimable.' );
 ct_test_assert( 409 === ct_test_control_result( $task, 'observed', array( 'ct-scan-verify=' . $a['token'] ) )->get_status() || 410 === ct_test_control_result( $task, 'observed', array( 'ct-scan-verify=' . $a['token'] ) )->get_status(), 'A spent task accepted another result.' );
 
@@ -165,7 +172,7 @@ $started = ct_test_rest_call( 'ct_scan_start', '/ct-scan/v1/start', array( 'id' 
 ct_test_assert( 200 === $started->get_status(), 'A verified job could not start.' );
 ct_test_assert( 200 === ct_test_admit( array( 'job' => $claimed ) )->get_status(), 'A verified, running job was not admitted.' );
 // Replaying the control token after success does nothing.
-ct_test_assert( is_wp_error( ct_scan_request_control_check( $a['job_id'], $a['token'], 'dns_txt' ) ), 'A spent challenge scheduled another check.' );
+ct_test_assert( is_wp_error( ct_scan_request_control_check( $a['job_id'], $a['page'], 'dns_txt' ) ), 'A spent challenge scheduled another check.' );
 ct_test_end_job( $a['job_id'] );
 
 // ---- Three failures end in `blocked`, never in a scan ------------------------------------------------
@@ -180,19 +187,19 @@ for ( $i = 1; $i <= 3; $i++ ) {
 $row = ct_scan_row( $b['job_id'] );
 ct_test_assert( 'blocked' === $row->status && 'target_control_failed' === $row->error_code && 3 === (int) $row->control_attempts && null === $row->control_token_hash && ! empty( $row->finished_at ), 'Three failed checks did not block the job.' );
 ct_test_assert( 'blocked' === get_post_meta( $b['request_id'], '_ct_scan_status', true ), 'The request did not record the blocked state.' );
-ct_test_assert( is_wp_error( ct_scan_request_control_check( $b['job_id'], $b['token'], 'dns_txt' ) ), 'A blocked job accepted another check.' );
+ct_test_assert( is_wp_error( ct_scan_request_control_check( $b['job_id'], $b['page'], 'dns_txt' ) ), 'A blocked job accepted another check.' );
 ct_test_assert( null === ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() )->get_data()['job'], 'A blocked job was claimed for scanning.' );
 ct_test_assert( 410 === ct_test_admit( array( 'job' => array( 'id' => $b['job_id'], 'lease' => str_repeat( '2', 64 ), 'scope_hash' => $row->scope_hash ) ), 'http' )->get_status(), 'A blocked job was admitted for scanning.' );
 // Even with operator notes, a blocked job gets no detailed report.
 $wpdb->update( $jobs, array( 'manual_remainder_status' => 'complete', 'manual_remainder_notes' => 'Operator notes.' ), array( 'job_id' => $b['job_id'] ) );
+$mail_before_report = count( $mail );
 $report = ct_scan_admin_send_report( $b['job_id'] );
 ct_test_assert( is_wp_error( $report ) && 'report_target_unverified' === $report->get_error_code(), 'A detailed report path opened for a target whose control was never shown.' );
-$count = count( $mail );
-ct_test_assert( count( $mail ) === $count, 'Mail was sent.' );
+ct_test_assert( count( $mail ) === $mail_before_report, 'Mail was sent for a blocked job.' );
 
 // ---- Lapsed lease, customer stop, expiry --------------------------------------------------------------
 $c = ct_test_control_job( 'control-c.example.net' );
-ct_scan_request_control_check( $c['job_id'], $c['token'], 'dns_txt' );
+ct_scan_request_control_check( $c['job_id'], $c['page'], 'dns_txt' );
 $task_c = ct_test_control_claim();
 ct_test_assert( 200 === ct_test_control_admit( $task_c )->get_status(), 'Fixture admission failed.' );
 $wpdb->update( $jobs, array( 'control_lease_until' => gmdate( 'Y-m-d H:i:s', time() - 5 ) ), array( 'job_id' => $c['job_id'] ) );
@@ -201,7 +208,7 @@ $row = ct_scan_row( $c['job_id'] );
 ct_test_assert( 'awaiting_control' === $row->status && 'pending' === $row->control_state && 1 === (int) $row->control_attempts, 'A lapsed lease refunded the attempt or stranded the job.' );
 // Stop while a check is scheduled: nothing more is admitted or recorded.
 ct_test_age_control( $c['job_id'] );
-ct_scan_request_control_check( $c['job_id'], $c['token'], 'dns_txt' );
+ct_scan_request_control_check( $c['job_id'], $c['page'], 'dns_txt' );
 $task_c2 = ct_test_control_claim();
 $stop_token = bin2hex( random_bytes( 32 ) );
 $wpdb->update( $jobs, array( 'stop_token_hash' => hash( 'sha256', $stop_token ) ), array( 'job_id' => $c['job_id'] ) );
@@ -213,7 +220,7 @@ ct_test_assert( 410 === ct_test_control_admit( $task_c2 )->get_status() && 410 =
 ct_test_assert( 410 === ct_test_control_result( $task_c2, 'observed', array( 'ct-scan-verify=' . $c['token'] ) )->get_status(), 'A result was accepted after Stop.' );
 
 $d = ct_test_control_job( 'control-d.example.net' );
-ct_scan_request_control_check( $d['job_id'], $d['token'], 'https_file' );
+ct_scan_request_control_check( $d['job_id'], $d['page'], 'https_file' );
 $task_d = ct_test_control_claim();
 $wpdb->update( $jobs, array( 'authorization_expires_at' => gmdate( 'Y-m-d H:i:s', time() - 1 ) ), array( 'job_id' => $d['job_id'] ) );
 $exp = ct_test_control_admit( $task_d );
@@ -221,7 +228,7 @@ ct_test_assert( 410 === $exp->get_status() && 'job_expired' === $exp->get_data()
 
 // Fault: a thrown exception or a lost compare-and-set refuses.
 $e = ct_test_control_job( 'control-e.example.net' );
-ct_scan_request_control_check( $e['job_id'], $e['token'], 'dns_txt' );
+ct_scan_request_control_check( $e['job_id'], $e['page'], 'dns_txt' );
 $task_e = ct_test_control_claim();
 $racer = static function ( $sql ) use ( &$raced, $jobs, $e ) {
 	global $wpdb;
@@ -249,6 +256,60 @@ remove_filter( 'query', $thrower );
 ct_test_assert( 503 === $faulted->get_status() && 0 === (int) ct_scan_row( $e['job_id'] )->control_attempts, 'A database fault during control admission did not fail closed.' );
 ct_test_assert( ct_scan_lock_acquire(), 'The queue lock leaked after a faulted control admission.' );
 ct_scan_lock_release();
+
+// ---- Cases that defend the central invariants directly (not only through the happy path) ----------------------
+// A control-required job forced into `queued` without verified control is never claimed, and is cancelled.
+$g = ct_test_control_job( 'control-g.example.net' );
+$wpdb->update( $jobs, array( 'status' => 'queued', 'control_state' => 'none' ), array( 'job_id' => $g['job_id'] ) );
+ct_test_assert( null === ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() )->get_data()['job'] && 'cancelled' === ct_scan_row( $g['job_id'] )->status, 'A control-required job without verified control was claimable.' );
+// ...and a leased/running one is refused at start and admission.
+$h = ct_test_control_job( 'control-h.example.net' );
+$wpdb->update( $jobs, array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => hash( 'sha256', str_repeat( '3', 64 ) ), 'lease_until' => gmdate( 'Y-m-d H:i:s', time() + 200 ) ), array( 'job_id' => $h['job_id'] ) );
+$bad_admit = ct_test_admit( array( 'job' => array( 'id' => $h['job_id'], 'lease' => str_repeat( '3', 64 ), 'scope_hash' => ct_scan_row( $h['job_id'] )->scope_hash ) ) );
+ct_test_assert( 410 === $bad_admit->get_status() && 'authorization_revoked_or_expired' === $bad_admit->get_data()['reason'], 'A running, unverified, control-required job was admitted.' );
+// The fourth admission is refused even with a valid lease and interval.
+$i = ct_test_control_job( 'control-i.example.net' );
+ct_scan_request_control_check( $i['job_id'], $i['page'], 'dns_txt' );
+$task_i = ct_test_control_claim();
+$wpdb->update( $jobs, array( 'control_attempts' => 3, 'control_last_attempt_ms' => 1 ), array( 'job_id' => $i['job_id'] ) );
+$over = ct_test_control_admit( $task_i );
+ct_test_assert( 409 === $over->get_status() && 'budget_exhausted' === $over->get_data()['reason'] && 3 === (int) ct_scan_row( $i['job_id'] )->control_attempts, 'A fourth control admission was granted.' );
+// Every check spent and the last result lost: maintenance blocks the job instead of leaving it waiting.
+$wpdb->update( $jobs, array( 'control_lease_until' => gmdate( 'Y-m-d H:i:s', time() - 5 ) ), array( 'job_id' => $i['job_id'] ) );
+ct_scan_maintenance_locked();
+$ri = ct_scan_row( $i['job_id'] );
+ct_test_assert( 'blocked' === $ri->status && 'target_control_failed' === $ri->error_code && null === $ri->control_page_hash, 'An exhausted job whose last result was lost was left waiting.' );
+// An unconfirmed row is not admitted for a control check.
+$j = ct_test_control_job( 'control-j.example.net' );
+ct_scan_request_control_check( $j['job_id'], $j['page'], 'dns_txt' );
+$task_j = ct_test_control_claim();
+$wpdb->update( $jobs, array( 'confirmed_at' => null ), array( 'job_id' => $j['job_id'] ) );
+$unconfirmed = ct_test_control_admit( $task_j );
+ct_test_assert( 410 === $unconfirmed->get_status() && 'recipient_unconfirmed' === $unconfirmed->get_data()['reason'], 'An unconfirmed row was admitted for a control check.' );
+// A revoked job's page is dead.
+$k = ct_test_control_job( 'control-k.example.net' );
+wp_set_current_user( 1 );
+ct_scan_admin_revoke( $k['job_id'] );
+ct_test_assert( 'control_link_invalid' === ct_scan_request_control_check( $k['job_id'], $k['page'], 'dns_txt' )->get_error_code(), 'A revoked job still accepted a control request.' );
+// A claim whose recorded method is not one of the two is cancelled, not run.
+$l = ct_test_control_job( 'control-l.example.net' );
+$wpdb->update( $jobs, array( 'control_state' => 'requested', 'control_requested_method' => 'ftp' ), array( 'job_id' => $l['job_id'] ) );
+ct_test_assert( null === ct_test_control_claim() && 'cancelled' === ct_scan_row( $l['job_id'] )->status, 'A control check with an unknown method was handed to the worker.' );
+// One piece of target traffic at a time: a check in progress blocks scan claims and a scan blocks check claims.
+$m1 = ct_test_control_job( 'control-m1.example.net' );
+ct_scan_request_control_check( $m1['job_id'], $m1['page'], 'dns_txt' );
+$task_m = ct_test_control_claim();
+list( $q_id, $q_fields ) = ct_test_request( 'control-m2.example.net' );
+$request_ids[] = $q_id;
+$q_event = ct_scan_on_request_ready( $q_id, $q_fields );
+$wpdb->update( $jobs, array( 'control_required' => 0 ), array( 'job_id' => $q_event['job_id'] ) );
+ct_test_queue_job( $q_event['job_id'] );
+ct_test_assert( null === ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() )->get_data()['job'], 'A scan was claimed while a control check was in progress.' );
+$wpdb->update( $jobs, array( 'control_state' => 'pending', 'control_lease_hash' => null ), array( 'job_id' => $m1['job_id'] ) );
+ct_scan_request_control_check( $m1['job_id'], $m1['page'], 'dns_txt' );
+$scan_claim = ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() )->get_data()['job'];
+ct_test_assert( is_array( $scan_claim ) && (int) $scan_claim['id'] === (int) $q_event['job_id'], 'The queued scan was not claimed.' );
+ct_test_assert( null === ct_test_control_claim(), 'A control check was claimed while a scan was leased.' );
 
 // ---- Recorded manual authority review ------------------------------------------------------------------
 $f = ct_test_control_job( 'control-f.example.net' );
