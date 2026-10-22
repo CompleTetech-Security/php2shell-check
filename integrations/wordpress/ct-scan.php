@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CompleteTech Authorized PHP2Shell Scan Queue
  * Description: Confirmation-gated, one-target PHP2Shell screening queue for Promo Requests.
- * Version: 0.1.0
+ * Version: 0.2.0
  *
  * This MU plugin stores authorization and job state locally. It never starts a
  * scanner process. The external worker talks to the signed REST routes below.
@@ -65,6 +65,10 @@ function ct_scan_config() {
 		'global_daily_limit'       => 20,
 		'target_daily_limit'       => 1,
 		'job_retention_days'       => 365,
+		// The admission guard is advisory to a scanner that ignores it; only enforced network egress
+		// (allow the customer's HTTP/HTTPS, deny private/metadata ranges) makes it a boundary. The
+		// operator must state, deliberately, that this exists. See docs/WORDPRESS.md "Egress".
+		'egress_enforced'          => false,
 	);
 
 	$path = defined( 'CT_SCAN_PRIVATE_CONFIG' )
@@ -86,6 +90,7 @@ function ct_scan_config() {
 	$config['enabled'] = true === $config['enabled']
 		&& is_string( $config['worker_hmac_secret'] )
 		&& strlen( $config['worker_hmac_secret'] ) >= 32
+		&& true === $config['egress_enforced']
 		&& is_string( $config['expected_checker_revision'] )
 		&& 1 === preg_match( '/\A[a-f0-9]{40}\z/i', $config['expected_checker_revision'] )
 		&& is_string( $config['supported_terms_version'] )
@@ -113,6 +118,10 @@ function ct_scan_nonces_table() {
 function ct_scan_maybe_install_schema() {
 	$previous = get_option( 'ct_scan_schema_version' );
 	if ( $previous === CT_SCAN_SCHEMA_VERSION ) {
+		return;
+	}
+	// A failed upgrade must not re-run dbDelta on every public request: back off for five minutes.
+	if ( get_transient( 'ct_scan_schema_backoff' ) ) {
 		return;
 	}
 	global $wpdb;
@@ -182,9 +191,13 @@ function ct_scan_maybe_install_schema() {
 	foreach ( $required as $table => $columns ) {
 		$found = $wpdb->get_col( "SHOW COLUMNS FROM {$table}", 0 );
 		if ( ! is_array( $found ) || array_diff( $columns, $found ) ) {
+			// Loud once per back-off window, and bounded. The worker API stays refused (fail closed).
+			error_log( 'ct-scan: database upgrade to schema ' . CT_SCAN_SCHEMA_VERSION . ' is incomplete for ' . $table . '; the worker API stays refused. Retrying in 5 minutes. Restore from backup or repair the table.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			set_transient( 'ct_scan_schema_backoff', '1', 5 * MINUTE_IN_SECONDS );
 			return;
 		}
 	}
+	delete_transient( 'ct_scan_schema_backoff' );
 	if ( is_string( $previous ) && '' !== $previous && version_compare( $previous, '3', '<' ) ) {
 		// A job that started before request counting existed has no record of what it already
 		// sent: it gets no fresh budget, so its remaining admissions are refused.
@@ -277,6 +290,8 @@ function ct_scan_meta_string( $post_id, $key ) {
 
 /** Check the saved request and acceptance snapshot before any job is created. */
 function ct_scan_validate_saved_request( $request_id, $fields, $require_current_terms = true, $frozen_expiry = '' ) {
+	// Authorization is judged on what the database holds now, never on an object-cache copy.
+	clean_post_cache( (int) $request_id );
 	$config = ct_scan_config();
 	$post   = get_post( $request_id );
 	if ( ! $post || 'ct_promo_request' !== $post->post_type || 'private' !== $post->post_status ) {
@@ -1300,6 +1315,10 @@ function ct_scan_result( WP_REST_Request $request ) {
 			return ct_scan_rest_error( 410, 'authorization_revoked_or_expired' );
 		}
 		if ( 'completed' === $data['outcome'] ) {
+			// A completed result is only credible if the guard admitted at least one request for this job.
+			if ( (int) $row->http_admitted < 1 ) {
+				return ct_scan_rest_error( 409, 'no_admission' );
+			}
 			$encoded_result = ct_scan_validate_result( $data['result'], $row );
 			if ( is_wp_error( $encoded_result ) ) {
 				return ct_scan_rest_error( 422, $encoded_result->get_error_code() );

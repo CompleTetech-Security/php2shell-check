@@ -125,7 +125,7 @@ Enforcement in the supervisor and scanner:
   unexpected message or an oversized message ends the scan
   (`admission_protocol_violation`).
 - The supervisor kills the scanner when a request is not reported finished
-  within the ten-second bound plus one second of grace
+  within ten seconds of the grant, with no extra grace
   (`request_deadline_exceeded`).
 - While the scanner runs, the supervisor probes the job about every two seconds
   on a separate thread (so a slow store cannot delay the deadline or the kill),
@@ -169,6 +169,23 @@ records into public issues or logs.
 Before upgrading the pinned revision or rotating the key, stop accepting new
 work, drain/reconcile existing receipts and stop the controller. Do not change
 the expected revision while old receipts are awaiting acknowledgement.
+
+## Egress (activation requirement)
+
+The admission guard, the unprivileged UID and the resource limits are
+cooperative controls: a scanner that is compromised and ignores the protocol can
+open its own sockets, and the supervisor can only kill it after the fact. **The
+integration therefore refuses to enable itself** (`ct_scan_enabled()` is false,
+the whole worker API answers 503) unless the protected configuration contains
+`'egress_enforced' => true`. Set that only after enforcing, outside the
+container's control, that the worker may reach only: one DNS resolver you
+control, TCP 80 and 443 to public addresses, and nothing in private, link-local,
+CGNAT, documentation, multicast, cloud-metadata or non-global IPv6 ranges.
+`deployment/compose.yaml` does **not** do this. `deployment/egress-filter.nft.example`
+sketches the intended host policy; it is an unverified example, not a claim that
+the repository enforces anything. The destination check inside the worker lists
+those ranges itself (it does not depend on the Python version's `ipaddress`
+properties), but that is a second layer, not the boundary.
 
 ## Repository and site ownership
 
@@ -292,10 +309,16 @@ The default configuration is disabled, and no historical request sweep exists.
    then start with the same command prefix and `up -d`. The API origin is fixed
    to `https://complete.tech`; changing sites requires a reviewed code change.
    Check for subnet conflicts before using the default worker subnet.
-5. Apply the reviewed site patch/terms update, then set `enabled` true. The
-   runner must authenticate successfully before accepting live submissions.
-   A matching revision and key are required; mismatches fail closed.
+5. Enforce egress (see "Egress"), then set `egress_enforced` true. Apply the
+   reviewed site patch/terms update, then set `enabled` true. The runner must
+   authenticate successfully before accepting live submissions. A matching
+   revision and key and `egress_enforced` are required; otherwise the
+   integration stays disabled.
 
+Take a database backup first: the upgrade changes the jobs table in place. If it
+cannot complete, the failure is written to the PHP error log once, the worker
+API stays refused, and the upgrade is not retried for five minutes (so a broken
+table cannot make every public request re-run it).
 Schema 3 adds `profile_id`, `http_admitted` and `last_admit_ms` to the jobs
 table (existing rows default to `r2-header-v1` with empty counters); the
 upgrade runs on `init` and the worker API refuses requests until it completes.

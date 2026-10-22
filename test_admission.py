@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import ipaddress
 import json
 import os
 import socket
@@ -415,10 +416,11 @@ class PumpStateMachineTests(unittest.TestCase):
         gate = _ScriptGate(admit=[_grant(timeout=10.0)])
         harness = _PumpHarness(self, gate, monotonic=clock)
         self.assertEqual(harness.child_admit()[0], {"ok": True})
-        clock.now += 10.9
+        clock.now += 9.9
         self.assertIsNone(harness.pump.tick())
-        clock.now += 0.2
+        clock.now += 0.2  # 10.1 s after the grant: the disclosed ten-second bound, with no extra grace
         self.assertEqual(harness.pump.tick(), "request_deadline_exceeded")
+        self.assertEqual(admission.REQUEST_GRACE_SECONDS, 0.0)
 
     def test_probe_refusal_is_fatal_but_an_unreachable_guard_is_not_by_itself(self):
         self.assertLessEqual(admission.PROBE_INTERVAL_SECONDS, 2.0, "cancellation must be noticed within a couple of seconds")
@@ -509,6 +511,52 @@ class PumpStateMachineTests(unittest.TestCase):
         harness.child_sock.close()
         self.assertIsNone(harness.pump.service())
         self.assertTrue(harness.pump.closed)
+
+
+class NetworkDenylistTests(unittest.TestCase):
+    """The destination check lists special-purpose ranges itself; it must not depend on the
+    interpreter's ipaddress `is_*` properties, which differ between Python versions."""
+
+    @staticmethod
+    def _answer(text):
+        family = socket.AF_INET6 if ":" in text else socket.AF_INET
+        return (family, socket.SOCK_STREAM, 6, "", (text, 443))
+
+    def _rejected(self, text):
+        with self.assertRaises(ValueError):
+            network._public_addresses("example.test", 443, resolver=lambda *_a, **_k: [self._answer(text)])
+
+    def test_every_listed_range_is_refused_at_both_ends_and_in_the_middle(self):
+        for net in network.DENIED_V4 + network.DENIED_V6:
+            first, last = net[0], net[-1]
+            middle = net[net.num_addresses // 2] if net.num_addresses > 2 else first
+            for address in {first, last, middle}:
+                with self.subTest(network=str(net), address=str(address)):
+                    self._rejected(str(address))
+
+    def test_the_list_alone_refuses_them_even_if_every_builtin_property_said_public(self):
+        neutral = property(lambda self: False)
+        patches = []
+        for cls in (ipaddress.IPv4Address, ipaddress.IPv6Address):
+            for name in ("is_private", "is_reserved", "is_multicast", "is_unspecified", "is_loopback", "is_link_local"):
+                patches.append(mock.patch.object(cls, name, new=neutral))
+            patches.append(mock.patch.object(cls, "is_global", new=property(lambda self: True)))
+        patches.append(mock.patch.object(ipaddress.IPv6Address, "is_site_local", new=neutral))
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        for text in ("100.64.0.1", "192.0.2.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", "10.1.2.3", "169.254.169.254", "0.0.0.1", "255.255.255.255",
+                     "3fff::1", "3fff:fff:ffff:ffff::1", "2001:db8::1", "2002:808:808::", "64:ff9b::808:808", "100::1", "fc00::1", "fe80::1", "5f00::1"):
+            with self.subTest(address=text):
+                self._rejected(text)
+
+    def test_neighbours_just_outside_each_range_are_not_swept_up(self):
+        for text in ("100.63.255.255", "100.128.0.0", "198.17.255.255", "198.20.0.0", "192.0.3.0", "203.0.114.0", "3fff:1000::1", "2001:4860:4860::8888", "2606:4700:4700::1111"):
+            with self.subTest(address=text):
+                self.assertEqual(
+                    network._public_addresses("example.test", 443, resolver=lambda *_a, **_k: [self._answer(text)]),
+                    [(socket.AF_INET6 if ":" in text else socket.AF_INET, text)],
+                )
 
 
 class ChildAdmissionTests(unittest.TestCase):

@@ -268,6 +268,53 @@ $err = stream_get_contents( $dpipes[2] );
 proc_close( $disabled );
 ct_test_assert( "disabled\n" === $out, 'The disabled-integration check failed: ' . $out . $err );
 
+
+// Egress gate: without an explicit statement that network egress is enforced, the integration refuses to enable.
+function ct_test_gate( $env ) {
+	$proc = proc_open( array( PHP_BINARY, __DIR__ . '/config-gate.php' ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $pipes, null, array_merge( getenv(), array( 'CT_TEST_WP_ROOT' => getenv( 'CT_TEST_WP_ROOT' ) ?: '/var/www/html' ), $env ) );
+	$out = stream_get_contents( $pipes[1] );
+	stream_get_contents( $pipes[2] );
+	proc_close( $proc );
+	return trim( $out );
+}
+ct_test_assert( 'enabled' === ct_test_gate( array() ) && 'refused' === ct_test_gate( array( 'CT_TEST_EGRESS' => '0' ) ), 'The integration enabled itself without egress_enforced, or refused with it.' );
+
+// Authorization is judged on the database, not on an object-cache copy: a change that bypassed the
+// cache (a restore, a direct query, another process) ends a running job at once.
+$jobc = ct_test_running_job( 'admit-cache.example.net' );
+$request_ids[] = $jobc['request_id'];
+get_post_meta( $jobc['request_id'], '_ct_terms_sha256', true ); // prime the cache
+get_post( $jobc['request_id'] );
+$wpdb->update( $wpdb->postmeta, array( 'meta_value' => str_repeat( '8', 64 ) ), array( 'post_id' => $jobc['request_id'], 'meta_key' => '_ct_terms_sha256' ) );
+ct_test_assert( str_repeat( '8', 64 ) !== get_post_meta( $jobc['request_id'], '_ct_terms_sha256', true ), 'Fixture expected a stale object-cache value.' );
+$stale = ct_test_admit( $jobc );
+ct_test_assert( 410 === $stale->get_status() && 'authorization_revoked_or_expired' === $stale->get_data()['reason'], 'A change made behind the object cache did not end the authorization.' );
+
+// Schema upgrade failure is loud once and bounded: no dbDelta on every public request.
+$log = tempnam( sys_get_temp_dir(), 'ctlog' );
+$previous_log = ini_set( 'error_log', $log );
+$wpdb->query( 'ALTER TABLE ' . $jobs . ' DROP COLUMN last_admit_ms' );
+update_option( 'ct_scan_schema_version', '2', false );
+delete_transient( 'ct_scan_schema_backoff' );
+$runs = 0;
+$count = static function ( $queries ) use ( &$runs ) {
+	++$runs;
+	return array(); // dbDelta does nothing: the upgrade stays incomplete
+};
+add_filter( 'dbdelta_queries', $count );
+ct_scan_maybe_install_schema();
+ct_scan_maybe_install_schema();
+ct_scan_maybe_install_schema();
+remove_filter( 'dbdelta_queries', $count );
+$logged = (string) file_get_contents( $log );
+ct_test_assert( 2 === $runs, "dbDelta ran $runs times (two tables, once) for three requests after a failed upgrade." );
+ct_test_assert( 1 === substr_count( $logged, 'ct-scan: database upgrade' ) && false !== get_transient( 'ct_scan_schema_backoff' ), 'A failed upgrade was not logged exactly once with a back-off.' );
+ct_test_assert( 503 === ct_test_admit( $jobc )->get_status() && '2' === get_option( 'ct_scan_schema_version' ), 'The worker API was not refused during an incomplete upgrade.' );
+delete_transient( 'ct_scan_schema_backoff' );
+ct_scan_maybe_install_schema();
+ct_test_assert( get_option( 'ct_scan_schema_version' ) === CT_SCAN_SCHEMA_VERSION && false === get_transient( 'ct_scan_schema_backoff' ), 'The upgrade did not complete after the back-off.' );
+ini_set( 'error_log', (string) $previous_log );
+@unlink( $log );
 // Remove only records created by this test.
 foreach ( $request_ids as $id ) {
 	$wpdb->delete( $jobs, array( 'request_id' => $id ), array( '%d' ) );

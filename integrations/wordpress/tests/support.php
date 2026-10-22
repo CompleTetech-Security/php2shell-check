@@ -10,6 +10,7 @@ if ( PHP_SAPI !== 'cli' || getenv( 'WORDPRESS_DB_PASSWORD' ) !== 'fixture-only' 
 $private_config = tempnam( '/tmp', 'ct-scan-integration-' );
 file_put_contents( $private_config, '<?php return ' . var_export( array(
 	'enabled'                   => '0' !== getenv( 'CT_TEST_ENABLED' ),
+	'egress_enforced'           => '0' !== getenv( 'CT_TEST_EGRESS' ),
 	'supported_terms_version'   => '2026-10-21-r2',
 	'expected_checker_revision' => str_repeat( 'a', 40 ),
 	'expected_rules_as_of'      => '2026-10-21',
