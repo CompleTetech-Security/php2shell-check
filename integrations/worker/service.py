@@ -290,7 +290,7 @@ class WorkerService:
         timeout = min(30.0, remaining - CALLBACK_RESERVE_SECONDS)
         if timeout <= 0:
             return "control_stale"
-        gate = AdmissionGate(self.api, task, kind="control", stop_event=self.stop_event, clock=self.clock)
+        gate = AdmissionGate(self.api, task, kind="control", stop_event=self.stop_event, deadline=self.clock() + timeout, clock=self.clock)
         runner_task = "control_dns" if task.method == "dns_txt" else "control_https"
         try:
             control = self.runner.run(task.target, timeout=timeout, stop_event=self.stop_event, gate=gate, task=runner_task)

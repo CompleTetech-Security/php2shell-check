@@ -12,10 +12,10 @@ learns the expected token.
 
 from __future__ import annotations
 
-import os
 import random
 import socket
 import struct
+import time
 from urllib.request import Request
 
 from .admission import AdmissionRefused
@@ -162,9 +162,13 @@ def lookup_txt(host: str, resolver: tuple[str, int], guard, *, timeout: float = 
         guard.ensure_fresh()
         sock = socket.socket(family, socket.SOCK_DGRAM)
         try:
-            sock.settimeout(timeout)
             sock.sendto(packet, resolver)
+            deadline = time.monotonic() + timeout  # one overall budget; stray packets cannot extend it
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ControlError("dns_timeout")
+                sock.settimeout(remaining)
                 try:
                     data, source = sock.recvfrom(MAX_BYTES + 1)
                 except socket.timeout as exc:
