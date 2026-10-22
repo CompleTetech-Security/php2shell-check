@@ -90,7 +90,7 @@ function ct_scan_config() {
 		// Owner decisions (2026-10-22): findings 12 months; signed authorization evidence 6 years
 		// after request closure, except r2 and earlier acceptances, which keep 3 years from acceptance.
 		'evidence_retention_years' => 6,
-		'legacy_retention_years'   => array( '2026-10-21-r2' => 3 ),
+		'legacy_retention_years'   => 3,
 		// How long a deletion tombstone is kept: longer than the longest backup rotation (90 days).
 		'tombstone_retention_days' => 120,
 	);
@@ -216,6 +216,9 @@ function ct_scan_maybe_install_schema() {
 		hold_until datetime NULL,
 		hold_set_by bigint(20) unsigned NULL,
 		hold_set_at datetime NULL,
+		hold_released_by bigint(20) unsigned NULL,
+		hold_released_at datetime NULL,
+		identity char(32) NULL,
 		PRIMARY KEY  (job_id),
 		UNIQUE KEY request_id (request_id),
 		KEY status_created (status,created_at),
@@ -237,6 +240,7 @@ function ct_scan_maybe_install_schema() {
 		created_at datetime NOT NULL,
 		deleted_at datetime NOT NULL,
 		reason varchar(32) NOT NULL,
+		identity char(32) NULL,
 		PRIMARY KEY  (tombstone_id),
 		UNIQUE KEY identity (job_id,request_id,scope_hash,created_at),
 		KEY deleted_at (deleted_at)
@@ -249,9 +253,9 @@ function ct_scan_maybe_install_schema() {
 	) {$charset};";
 	dbDelta( $sql );
 	$required = array(
-		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at' ),
+		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at', 'identity' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
-		$tombstones => array( 'tombstone_id', 'job_id', 'request_id', 'scope_hash', 'created_at', 'deleted_at', 'reason' ),
+		$tombstones => array( 'tombstone_id', 'job_id', 'request_id', 'scope_hash', 'created_at', 'deleted_at', 'reason', 'identity' ),
 	);
 	foreach ( $required as $table => $columns ) {
 		$found = $wpdb->get_col( "SHOW COLUMNS FROM {$table}", 0 );
@@ -606,6 +610,7 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 		if ( $target_count >= min( 10, max( 1, absint( $config['target_daily_limit'] ) ) ) ) {
 			return ct_scan_safe_notice( $request_id, 'target_quota' );
 		}
+		$identity = bin2hex( random_bytes( 16 ) );
 		$inserted = $wpdb->insert(
 			$jobs,
 			array(
@@ -627,11 +632,14 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 				'profile_id'               => ct_scan_current_profile(),
 				'summary_sha256'           => $accepted['summary_sha256'],
 				'bound_required'           => $accepted['bound_required'] ? 1 : 0,
+				// Opaque identity mirrored on the private request: lets a deletion tombstone recognise
+				// the same record after a restore without matching on recyclable numeric ids.
+				'identity'                 => $identity,
 				// Frozen at creation: a later configuration change cannot relax an existing job.
 				// A profile broader than the r2 header screening can never run without target control.
 				'control_required'         => ( in_array( $accepted['terms_version'], (array) $config['target_control_versions'], true ) || 'r2-header-v1' !== ct_scan_current_profile() ) ? 1 : 0,
 			),
-			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d' )
+			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d' )
 		);
 		if ( 1 !== $inserted ) {
 			$existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$jobs} WHERE request_id = %d LIMIT 1", $request_id ) );
@@ -647,6 +655,7 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 		$job_id = (int) $wpdb->insert_id;
 		update_post_meta( $request_id, '_ct_scan_event_recorded', '1' );
 		update_post_meta( $request_id, '_ct_scan_job_id', $job_id );
+		update_post_meta( $request_id, '_ct_scan_identity', $identity );
 		update_post_meta( $request_id, '_ct_scan_authorization_expires_at', $accepted['authorization_expires'] );
 		ct_scan_mark_request_status( $request_id, 'awaiting_confirmation' );
 	} finally {
@@ -775,26 +784,62 @@ function ct_scan_maintenance_locked() {
 }
 
 /** Statuses from which a job never runs again; reaching one is the request's closure. */
+function ct_scan_terminal_statuses() {
+	return array( 'completed', 'failed', 'failed_unknown', 'cancelled', 'expired', 'blocked' );
+}
+
 function ct_scan_terminal_sql() {
-	return "'completed','failed','failed_unknown','cancelled','expired','blocked'";
+	return "'" . implode( "','", ct_scan_terminal_statuses() ) . "'";
 }
 
 /**
- * When the signed authorization evidence of a job may be deleted. r2 and earlier acceptances keep
- * their promised three years from acceptance; every other version keeps six years after the
- * request's closure (owner decision, 2026-10-22). Never less than three years, whatever the config.
+ * A stored UTC datetime we are willing to compute a deletion date from: the exact `Y-m-d H:i:s`
+ * shape, a real calendar date, and not earlier than 2020 (zero dates, which PHP silently parses
+ * into year -1, and other restore/migration debris are refused rather than guessed at).
+ */
+function ct_scan_valid_datetime( $value ) {
+	if ( ! is_string( $value ) || ! preg_match( '/\A(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\z/', $value, $m ) || (int) $m[1] < 2020 ) {
+		return false;
+	}
+	if ( ! checkdate( (int) $m[2], (int) $m[3], (int) $m[1] ) || (int) $m[4] > 23 || (int) $m[5] > 59 || (int) $m[6] > 59 ) {
+		return false;
+	}
+	return true;
+}
+
+/** Retention periods are never shorter than the three years every acceptance has been promised. */
+function ct_scan_clamp_years( $years ) {
+	return is_numeric( $years ) ? max( 3, (int) $years ) : 3;
+}
+
+/**
+ * r2 and earlier acceptances keep three years from acceptance; this recognises them by version
+ * (`YYYY-MM-DD-rN` up to `2026-10-21-r2`). A version that cannot be parsed is NOT treated as legacy:
+ * it gets the longer period, so a surprise string can never shorten retention.
+ */
+function ct_scan_is_legacy_version( $version ) {
+	if ( ! is_string( $version ) || ! preg_match( '/\A(\d{4}-\d{2}-\d{2})-r(\d{1,3})\z/', $version, $m ) ) {
+		return false;
+	}
+	return $m[1] < '2026-10-21' || ( '2026-10-21' === $m[1] && (int) $m[2] <= 2 );
+}
+
+/**
+ * When the signed authorization evidence of a job may be deleted: r2 and earlier acceptances three
+ * years from acceptance; every other version six years after the request's closure (owner decision,
+ * 2026-10-22). Returns false, and the job is then never deleted, if the base date is not trustworthy.
+ * Month/year arithmetic that overflows (Feb 29) lands later, never earlier.
  */
 function ct_scan_retain_until( $row ) {
 	$config = ct_scan_config();
-	$legacy = (array) $config['legacy_retention_years'];
-	if ( isset( $legacy[ $row->terms_version ] ) ) {
-		$years = max( 3, (int) $legacy[ $row->terms_version ] );
+	if ( ct_scan_is_legacy_version( $row->terms_version ) ) {
+		$years = ct_scan_clamp_years( $config['legacy_retention_years'] );
 		$base  = $row->terms_accepted_at;
 	} else {
-		$years = max( 3, (int) $config['evidence_retention_years'] );
+		$years = ct_scan_clamp_years( $config['evidence_retention_years'] );
 		$base  = $row->closed_at;
 	}
-	if ( ! is_string( $base ) || '' === $base ) {
+	if ( ! ct_scan_valid_datetime( $base ) ) {
 		return false;
 	}
 	try {
@@ -804,31 +849,66 @@ function ct_scan_retain_until( $row ) {
 	}
 }
 
+/** The grace period after a hold expires before its job becomes deletable (nothing vanishes the minute a hold lapses). */
+function ct_scan_hold_grace_days() {
+	return 3;
+}
+
 /**
- * Is this job under a preservation hold? An unexpired hold preserves; a hold with a purpose but no
- * expiry (not creatable through the admin action) also preserves, so a damaged hold never causes a
- * deletion. Only an expired or absent hold lets retention proceed.
+ * Is this job under a preservation hold? An unexpired hold preserves, and so does one that expired
+ * less than the grace period ago; a hold with a purpose but no expiry (not creatable through the admin
+ * action) also preserves, so a damaged hold never causes a deletion.
  */
 function ct_scan_job_on_hold( $row, $now ) {
-	return ! empty( $row->hold_reason ) && ( empty( $row->hold_until ) || $row->hold_until > $now );
+	if ( empty( $row->hold_reason ) ) {
+		return false;
+	}
+	if ( empty( $row->hold_until ) || ! ct_scan_valid_datetime( $row->hold_until ) ) {
+		return true;
+	}
+	$grace_end = ( new DateTimeImmutable( $row->hold_until, new DateTimeZone( 'UTC' ) ) )->modify( '+' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
+	return $grace_end > $now;
+}
+
+/**
+ * May this job's records be deleted now? Every date involved must be trustworthy, the stored date must
+ * not be earlier than the one derived from the row today or than three years after creation, and no hold
+ * may apply. Anything doubtful is kept.
+ */
+function ct_scan_deletion_allowed( $row, $now ) {
+	if ( ! in_array( $row->status, ct_scan_terminal_statuses(), true ) || ct_scan_job_on_hold( $row, $now ) ) {
+		return false;
+	}
+	foreach ( array( $row->created_at, $row->closed_at, $row->retain_until ) as $date ) {
+		if ( ! ct_scan_valid_datetime( $date ) ) {
+			return false;
+		}
+	}
+	$expected = ct_scan_retain_until( $row );
+	if ( false === $expected || $row->retain_until < $expected || $row->retain_until < $row->closed_at ) {
+		return false;
+	}
+	$floor = ( new DateTimeImmutable( $row->created_at, new DateTimeZone( 'UTC' ) ) )->modify( '+3 years' )->format( 'Y-m-d H:i:s' );
+	return $row->retain_until >= $floor && $row->retain_until <= $now;
 }
 
 /** Remember a deleted record by identifier only, so a restored backup cannot bring it back. */
 function ct_scan_record_tombstone( $row, $reason ) {
 	global $wpdb;
 	$result = $wpdb->query( $wpdb->prepare(
-		'INSERT IGNORE INTO ' . ct_scan_tombstones_table() . ' (job_id, request_id, scope_hash, created_at, deleted_at, reason) VALUES (%d, %d, %s, %s, %s, %s)',
+		'INSERT IGNORE INTO ' . ct_scan_tombstones_table() . ' (job_id, request_id, scope_hash, created_at, deleted_at, reason, identity) VALUES (%d, %d, %s, %s, %s, %s, %s)',
 		(int) $row->job_id,
 		(int) $row->request_id,
 		$row->scope_hash,
 		$row->created_at,
 		ct_scan_utc_now(),
-		substr( sanitize_key( $reason ), 0, 32 )
+		substr( sanitize_key( $reason ), 0, 32 ),
+		is_string( $row->identity ) ? $row->identity : ''
 	) );
 	return false !== $result;
 }
 
-/** Delete one job and its linked private request. Returns true only if both are gone and a tombstone exists. */
+/** Delete one job and its linked request, whatever status that post is in. True only if both are gone and a tombstone exists. */
 function ct_scan_delete_job_records( $row, $reason ) {
 	global $wpdb;
 	$table = ct_scan_jobs_table();
@@ -847,7 +927,9 @@ function ct_scan_delete_job_records( $row, $reason ) {
 			return false;
 		}
 	}
-	if ( $post && 'ct_promo_request' === $post->post_type && 'private' === $post->post_status && (int) $post->ID === (int) $row->request_id ) {
+	// The request carries the contact details and the full contract copy: delete it in any status
+	// (a trashed or re-published copy must not outlive the job that pointed to it).
+	if ( $post && 'ct_promo_request' === $post->post_type && (int) $post->ID === (int) $row->request_id ) {
 		if ( ! wp_delete_post( (int) $row->request_id, true ) ) {
 			return false;
 		}
@@ -857,69 +939,79 @@ function ct_scan_delete_job_records( $row, $reason ) {
 
 /**
  * Closure, findings retention (12 months), evidence retention (retain_until), narrow holds, and
- * tombstones. Held jobs keep everything; nothing is deleted before its promised period.
+ * tombstones. Held jobs keep everything; nothing is deleted before its promised period, and every
+ * step is bounded per run so the global queue lock is not held for long.
  */
 function ct_scan_retention_locked( $now ) {
 	global $wpdb;
 	$table    = ct_scan_jobs_table();
 	$terminal = ct_scan_terminal_sql();
+	// 0. A job that can run again is not closed: forget any closure stamped on it.
+	$wpdb->query( "UPDATE {$table} SET closed_at = NULL, retain_until = NULL WHERE status NOT IN ({$terminal}) AND (closed_at IS NOT NULL OR retain_until IS NOT NULL)" );
 	// 1. Closure is explicit: the first time a job is seen terminal it is stamped.
 	$wpdb->query( $wpdb->prepare( "UPDATE {$table} SET closed_at = COALESCE(finished_at, %s) WHERE closed_at IS NULL AND status IN ({$terminal})", $now ) );
-	// 2. The evidence deletion date is fixed once, at closure.
-	$unset = $wpdb->get_results( "SELECT job_id,terms_version,terms_accepted_at,closed_at FROM {$table} WHERE closed_at IS NOT NULL AND retain_until IS NULL" );
+	// 2. The evidence deletion date is fixed once, at closure. An untrustworthy base leaves it NULL (kept).
+	$unset = $wpdb->get_results( "SELECT job_id,terms_version,terms_accepted_at,closed_at FROM {$table} WHERE closed_at IS NOT NULL AND retain_until IS NULL LIMIT 200" );
 	foreach ( (array) $unset as $row ) {
 		$when = ct_scan_retain_until( $row );
 		if ( false !== $when ) {
 			$wpdb->update( $table, array( 'retain_until' => $when ), array( 'job_id' => (int) $row->job_id, 'retain_until' => null ), array( '%s' ), array( '%d', '%s' ) );
 		}
 	}
-	// 3. Findings: twelve months after closure, unless held.
-	$findings_cutoff = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-12 months' )->format( 'Y-m-d H:i:s' );
+	// 3. Findings: twelve months after closure (366 days, so a leap day cannot make it early), unless held.
+	$findings_cutoff = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-366 days' )->format( 'Y-m-d H:i:s' );
+	$grace_edge      = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
 	$wpdb->query( $wpdb->prepare(
-		"UPDATE {$table} SET result_json = NULL, manual_remainder_notes = NULL WHERE (result_json IS NOT NULL OR manual_remainder_notes IS NOT NULL) AND closed_at IS NOT NULL AND closed_at < %s AND NOT (hold_reason IS NOT NULL AND hold_until > %s)",
+		"UPDATE {$table} SET result_json = NULL, manual_remainder_notes = NULL WHERE (result_json IS NOT NULL OR manual_remainder_notes IS NOT NULL) AND closed_at IS NOT NULL AND closed_at >= '2020-01-01 00:00:00' AND closed_at < %s AND (hold_reason IS NULL OR hold_until <= %s)",
 		$findings_cutoff,
-		$now
+		$grace_edge
 	) );
-	// 4. Evidence: delete what has outlived its retain_until, except under a hold.
+	// 4. Evidence: delete what has outlived its retain_until, except under a hold. Bounded per run.
 	$due = $wpdb->get_results( $wpdb->prepare(
-		"SELECT * FROM {$table} WHERE retain_until IS NOT NULL AND retain_until <= %s AND closed_at IS NOT NULL AND status IN ({$terminal}) AND NOT (hold_reason IS NOT NULL AND hold_until > %s)",
+		"SELECT * FROM {$table} WHERE retain_until IS NOT NULL AND retain_until <= %s AND closed_at IS NOT NULL AND status IN ({$terminal}) AND (hold_reason IS NULL OR hold_until <= %s) ORDER BY retain_until ASC LIMIT 50",
 		$now,
-		$now
+		$grace_edge
 	) );
 	foreach ( (array) $due as $row ) {
-		if ( ct_scan_job_on_hold( $row, $now ) ) {
-			continue;
+		if ( ct_scan_deletion_allowed( $row, $now ) ) {
+			ct_scan_delete_job_records( $row, 'retention' );
 		}
-		ct_scan_delete_job_records( $row, 'retention' );
 	}
 	// 5. A restored backup must not resurrect deleted records: delete matches again.
 	ct_scan_apply_tombstones( $now );
 	$wpdb->query( $wpdb->prepare( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE deleted_at < %s', ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . max( 90, (int) ct_scan_config()['tombstone_retention_days'] ) . ' days' )->format( 'Y-m-d H:i:s' ) ) );
 }
 
-/** Delete again any job row (and linked private request) that matches a deletion tombstone. */
+/**
+ * Delete again any job row (and linked request) that a deletion tombstone recognises after a restore.
+ * A job row matches on its numeric identifiers AND creation time AND scope; a request post matches only
+ * on the opaque identity recorded at creation, and only when no job row currently uses that request or
+ * job id (recycled auto-increment ids must never reach a live record). Holds are honoured.
+ */
 function ct_scan_apply_tombstones( $now ) {
 	global $wpdb;
-	$table = ct_scan_jobs_table();
-	$ghosts = $wpdb->get_results( 'SELECT j.* FROM ' . $table . ' j INNER JOIN ' . ct_scan_tombstones_table() . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.scope_hash = j.scope_hash AND t.created_at = j.created_at' );
+	$table  = ct_scan_jobs_table();
+	$stones = ct_scan_tombstones_table();
+	$ghosts = $wpdb->get_results( 'SELECT j.* FROM ' . $table . ' j INNER JOIN ' . $stones . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.scope_hash = j.scope_hash AND t.created_at = j.created_at ORDER BY j.job_id ASC LIMIT 50' );
 	foreach ( (array) $ghosts as $row ) {
-		ct_scan_delete_job_records( $row, 'restored' );
+		if ( ! ct_scan_job_on_hold( $row, $now ) ) {
+			ct_scan_delete_job_records( $row, 'restored' );
+		}
 	}
-	// A restored request post whose job row was never restored: same identity through its saved job id.
-	$stones = $wpdb->get_results( 'SELECT job_id,request_id FROM ' . ct_scan_tombstones_table() . ' ORDER BY tombstone_id DESC LIMIT 500' );
-	foreach ( (array) $stones as $stone ) {
-		$post = get_post( (int) $stone->request_id );
-		if ( $post && 'ct_promo_request' === $post->post_type && 'private' === $post->post_status && (string) $stone->job_id === ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_job_id' ) ) {
+	// A restored request post whose job row was not restored (or was restored without matching).
+	$posts = $wpdb->posts;
+	$restored = $wpdb->get_results( 'SELECT t.job_id, t.request_id, t.identity FROM ' . $stones . ' t INNER JOIN ' . $posts . " p ON p.ID = t.request_id AND p.post_type = 'ct_promo_request' WHERE t.identity IS NOT NULL AND t.identity <> '' ORDER BY t.tombstone_id DESC LIMIT 50" );
+	foreach ( (array) $restored as $stone ) {
+		$live = $wpdb->get_var( $wpdb->prepare( "SELECT job_id FROM {$table} WHERE request_id = %d OR job_id = %d LIMIT 1", (int) $stone->request_id, (int) $stone->job_id ) );
+		if ( $live ) {
+			continue;
+		}
+		if ( hash_equals( (string) $stone->identity, ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_identity' ) ) && (string) $stone->job_id === ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_job_id' ) ) {
 			wp_delete_post( (int) $stone->request_id, true );
 		}
 	}
 }
 
-/**
- * Narrow preservation hold for one job: a stated purpose and a mandatory expiry (at most two years).
- * While it stands, nothing about that job is deleted or scrubbed. Administrators only; recorded with
- * who set it and when.
- */
 function ct_scan_admin_set_hold( $job_id, $reason, $days ) {
 	global $wpdb;
 	$user = wp_get_current_user();
@@ -952,14 +1044,19 @@ function ct_scan_admin_set_hold( $job_id, $reason, $days ) {
 
 function ct_scan_admin_release_hold( $job_id ) {
 	global $wpdb;
-	if ( ! current_user_can( 'manage_options' ) ) {
+	$user = wp_get_current_user();
+	if ( ! $user || ! $user->exists() || ! current_user_can( 'manage_options' ) ) {
 		return new WP_Error( 'hold_forbidden', 'Only an administrator can release a hold.' );
 	}
 	if ( ! ct_scan_lock_acquire( 3 ) ) {
 		return new WP_Error( 'queue_busy', 'The queue is temporarily busy.' );
 	}
 	try {
-		$updated = $wpdb->update( ct_scan_jobs_table(), array( 'hold_reason' => null, 'hold_until' => null ), array( 'job_id' => absint( $job_id ) ), array( '%s', '%s' ), array( '%d' ) );
+		$row = ct_scan_row( $job_id );
+		if ( ! $row || empty( $row->hold_reason ) ) {
+			return new WP_Error( 'hold_unavailable', 'This job has no hold to release.' );
+		}
+		$updated = $wpdb->update( ct_scan_jobs_table(), array( 'hold_reason' => null, 'hold_until' => null, 'hold_released_by' => (int) $user->ID, 'hold_released_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%s', '%d', '%s' ), array( '%d' ) );
 		if ( false === $updated ) {
 			return new WP_Error( 'hold_write_failed', 'The hold could not be released.' );
 		}
@@ -2265,7 +2362,7 @@ function ct_scan_register_rest_routes() {
 add_action( 'rest_api_init', 'ct_scan_register_rest_routes' );
 
 function ct_scan_terminal_status( $status ) {
-	return in_array( $status, array( 'completed', 'failed', 'failed_unknown', 'cancelled', 'expired', 'blocked' ), true );
+	return in_array( $status, ct_scan_terminal_statuses(), true );
 }
 
 function ct_scan_email_safe_text( $value, $max = 2000 ) {
@@ -2618,7 +2715,7 @@ function ct_scan_admin_page() {
 	foreach ( $rows as $row ) {
 		$request_url = admin_url( 'post.php?post=' . (int) $row->request_id . '&action=edit' );
 		$host = wp_parse_url( $row->target_origin, PHP_URL_HOST );
-		$exec = 'Status: ' . $row->status . "\nAttempts: " . (int) $row->attempts . "\nOutcome: " . ( $row->outcome ? $row->outcome : 'pending' ) . "\nTarget control: " . ( $row->control_required ? ( $row->control_verified_at ? sanitize_key( (string) $row->control_method ) . ' at ' . $row->control_verified_at . ' UTC' : 'required, not shown (' . (int) $row->control_attempts . ' of 3 checks used)' ) : 'not required' ) . "\nError: " . ( $row->error_code ? sanitize_key( $row->error_code ) : '—' ) . ( 'manual_review' === $row->control_method ? "\nAuthority review: " . ct_scan_control_evidence_line( $row ) : '' ) . "\nChecker revision: " . ( $row->checker_revision ? substr( $row->checker_revision, 0, 12 ) . '…' : '—' );
+		$exec = 'Status: ' . $row->status . "\nAttempts: " . (int) $row->attempts . "\nOutcome: " . ( $row->outcome ? $row->outcome : 'pending' ) . "\nTarget control: " . ( $row->control_required ? ( $row->control_verified_at ? sanitize_key( (string) $row->control_method ) . ' at ' . $row->control_verified_at . ' UTC' : 'required, not shown (' . (int) $row->control_attempts . ' of 3 checks used)' ) : 'not required' ) . "\nClosed: " . ( $row->closed_at ? $row->closed_at . ' UTC' : '—' ) . "\nEvidence deletion date: " . ( $row->retain_until ? $row->retain_until . ' UTC' : ( $row->closed_at ? 'unknown (kept)' : '—' ) ) . "\nError: " . ( $row->error_code ? sanitize_key( $row->error_code ) : '—' ) . ( 'manual_review' === $row->control_method ? "\nAuthority review: " . ct_scan_control_evidence_line( $row ) : '' ) . "\nChecker revision: " . ( $row->checker_revision ? substr( $row->checker_revision, 0, 12 ) . '…' : '—' );
 		$mail = 'Confirmation email: ' . sanitize_key( $row->confirmation_email_status ) . "\nReport transport: " . sanitize_key( $row->report_notification_status ) . "\nDelivery confirmed: " . ( $row->report_delivered_at ? $row->report_delivered_at . ' UTC' : 'no' ) . "\nRevoked: " . ( $row->revoked_at ? $row->revoked_at . ' UTC' : 'no' );
 		echo '<tr><td><a href="' . esc_url( $request_url ) . '">Job #' . (int) $row->job_id . ' / request #' . (int) $row->request_id . '</a><br>Created ' . esc_html( $row->created_at ) . ' UTC</td>';
 		echo '<td><code>' . esc_html( $row->target_origin ) . '</code><br>Terms ' . esc_html( $row->terms_version ) . '<br>Accepted ' . esc_html( $row->terms_accepted_at ) . ' UTC<br>Expires ' . esc_html( $row->authorization_expires_at ) . ' UTC<br>Scope hash <code>' . esc_html( substr( $row->scope_hash, 0, 16 ) ) . '…</code></td>';

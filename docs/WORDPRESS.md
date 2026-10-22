@@ -445,26 +445,40 @@ maintenance (which runs on every worker claim and on the admin queue page):
   (`completed`, `failed`, `failed_unknown`, `cancelled`, `expired`, `blocked`)
   it is stamped `closed_at`; an accepted request that was never confirmed or
   never showed target control closes when it expires. A job that can still run
-  is never closed or deleted, however old its acceptance.
+  is never closed or deleted, however old its dates say it is; if one is ever
+  reopened, its closure stamp is cleared.
 - **Findings** (`result_json`, manual remainder notes): cleared twelve months
-  after closure. The signed evidence stays.
-- **Signed authorization evidence** (the job row and its linked private request):
-  deleted at `retain_until`, fixed once at closure: **six years after closure**,
-  except that r2 and earlier acceptances keep their promised **three years from
-  acceptance** (config `legacy_retention_years`). Never less than three years,
-  whatever the configuration. The archive (issue 11) can read `retain_until` per
-  accepted version.
+  (366 days, so a leap day cannot make it early) after closure. The signed
+  evidence stays.
+- **Signed authorization evidence** (the job row and its linked private request,
+  in whatever post status it is in): deleted at `retain_until`, fixed once at
+  closure: **six years after closure**, except that r2 and earlier acceptances
+  (versions `YYYY-MM-DD-rN` up to `2026-10-21-r2`) keep their promised **three
+  years from acceptance**. Never less than three years, whatever the
+  configuration; a version that cannot be parsed gets the longer period.
+- **Doubtful data is kept.** Deletion requires every date involved to be a real
+  `Y-m-d H:i:s` date no earlier than 2020 (zero dates and other restore debris
+  are refused), the stored deletion date to be no earlier than the one derived
+  from the row today and no earlier than three years after the job's creation,
+  and the job to be in a terminal state. A job whose base date cannot be trusted
+  keeps `retain_until` empty and is shown as "unknown (kept)" in the admin queue.
+  Each run deletes at most 50 jobs, so the queue lock is held briefly.
 - **Narrow preservation hold** (admin queue): one job, a stated purpose of 20 to
   190 characters, a mandatory expiry of at most 730 days, recorded with who set
-  it and when. While it stands nothing about that job is cleared or deleted; an
-  expired or released hold lets retention proceed, and a damaged hold (purpose
+  it and when (and who released it). While it stands nothing about that job is
+  cleared or deleted, including by a tombstone; after it expires or is released,
+  the job stays preserved for a further three days. A damaged hold (purpose
   without an expiry) preserves rather than deletes.
 - **Tombstones.** Deleting a job writes an identifier-only tombstone (job id,
-  request id, scope hash, creation time, time and reason; no personal or
-  customer data) before the deletion. If a restored backup brings the rows back,
-  the next maintenance run deletes them again, and a restored private request is
-  deleted only if its saved job id is the tombstoned one. Tombstones are kept 120
-  days, longer than the 90-day backup rotation, then purged.
+  request id, scope hash, creation time, an opaque random identity, time and
+  reason; no personal or customer data) before the deletion. If a restored backup
+  brings the rows back, the next maintenance run deletes them again: a job row
+  matches on its ids, scope and creation time; a restored request post matches
+  only on its opaque identity and only when no job row currently uses that request
+  or job id (auto-increment ids can be recycled after a restore and must never
+  reach a live record). Jobs created before the identity existed are recognised by
+  their job row only. Tombstones are kept 120 days, longer than the 90-day backup
+  rotation, then purged.
 - Deletion scrubs the contact fields first, then deletes the private request and
   the job row; if any step fails the record stays (and is retried) rather than
   being half-deleted.

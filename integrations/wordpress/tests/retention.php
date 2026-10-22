@@ -7,6 +7,9 @@ require __DIR__ . '/support.php';
 global $wpdb;
 $jobs = ct_scan_jobs_table();
 ct_test_purge_fixtures();
+// Leftovers of an aborted earlier run of this script.
+$wpdb->query( "DELETE FROM {$jobs} WHERE job_id >= 888000000" );
+$wpdb->query( 'DELETE FROM ' . ct_scan_tombstones_table() );
 $request_ids = array();
 add_filter( 'pre_wp_mail', '__return_true' );
 
@@ -21,7 +24,7 @@ function ct_test_aged_job( $host, $status, $accepted, $closed, $version = '2026-
 	$request_ids[] = $request_id;
 	$event = ct_scan_on_request_ready( $request_id, $fields );
 	ct_test_assert( is_array( $event ), 'Retention fixture job was not created.' );
-	$update = array( 'status' => $status, 'terms_accepted_at' => ct_test_old( $accepted ), 'terms_version' => $version, 'confirmation_token_hash' => null );
+	$update = array( 'status' => $status, 'terms_accepted_at' => ct_test_old( $accepted ), 'created_at' => ct_test_old( $accepted ), 'terms_version' => $version, 'confirmation_token_hash' => null );
 	if ( null !== $closed ) {
 		$update['finished_at'] = ct_test_old( $closed );
 		$update['result_json'] = '{"fixture":true}';
@@ -84,8 +87,8 @@ ct_test_assert( null === $o->result_json && null === $o->manual_remainder_notes 
 // ---- Evidence deadlines --------------------------------------------------------------------------------------
 $edge_keep = ct_test_aged_job( 'ret-keep.example.net', 'failed', '-2 years -11 months', '-1 day' );
 $edge_del  = ct_test_aged_job( 'ret-del.example.net', 'failed', '-3 years -1 day', '-1 day' );
-$six_keep  = ct_test_aged_job( 'ret-six-keep.example.net', 'cancelled', '-7 years', '-5 years -11 months', '2027-06-01-r3' );
-$six_del   = ct_test_aged_job( 'ret-six-del.example.net', 'cancelled', '-7 years', '-6 years -1 day', '2027-06-01-r3' );
+$six_keep  = ct_test_aged_job( 'ret-six-keep.example.net', 'cancelled', '-6 years -2 days', '-5 years -11 months', '2027-06-01-r3' );
+$six_del   = ct_test_aged_job( 'ret-six-del.example.net', 'cancelled', '-6 years -2 days', '-6 years -1 day', '2027-06-01-r3' );
 ct_scan_maintenance_locked();
 ct_test_assert( ct_test_exists( $edge_keep ) && get_post( $edge_keep['request_id'] ), 'r2 evidence was deleted before three years.' );
 ct_test_assert( ! ct_test_exists( $edge_del ) && ! get_post( $edge_del['request_id'] ), 'r2 evidence was not deleted after three years.' );
@@ -103,6 +106,8 @@ $ghost = array( 'job_id' => $edge_del['job_id'], 'request_id' => $edge_del['requ
 $wpdb->insert( $jobs, $ghost );
 $restored_post = wp_insert_post( array( 'import_id' => $edge_del['request_id'], 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'restored' ) );
 update_post_meta( $edge_del['request_id'], '_ct_scan_job_id', $edge_del['job_id'] );
+update_post_meta( $edge_del['request_id'], '_ct_scan_identity', $stone->identity );
+ct_test_assert( 32 === strlen( (string) $stone->identity ), 'The tombstone did not keep the opaque identity.' );
 ct_test_assert( ct_test_exists( $edge_del ) && get_post( $edge_del['request_id'] ), 'Fixture failed to restore the deleted records.' );
 ct_scan_maintenance_locked();
 ct_test_assert( ! ct_test_exists( $edge_del ) && ! get_post( $edge_del['request_id'] ), 'A restored backup resurrected deleted records.' );
@@ -116,7 +121,22 @@ $other = wp_insert_post( array( 'import_id' => $six_del['request_id'], 'post_typ
 update_post_meta( $six_del['request_id'], '_ct_scan_job_id', 999999999 );
 ct_scan_maintenance_locked();
 ct_test_assert( get_post( $six_del['request_id'] ), 'A tombstone deleted a request that belongs to a different job.' );
-wp_delete_post( $six_del['request_id'], true );
+// Same id and job id but not the same identity (a recycled id after a restore): untouched.
+$six_stone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $six_del['job_id'] ) );
+update_post_meta( $six_del['request_id'], '_ct_scan_job_id', $six_del['job_id'] );
+update_post_meta( $six_del['request_id'], '_ct_scan_identity', str_repeat( 'f', 32 ) );
+ct_scan_maintenance_locked();
+ct_test_assert( get_post( $six_del['request_id'] ), 'A tombstone deleted a request with a different identity.' );
+// Same identity but a live job row now uses that request id: a recycled id must never reach a live record.
+update_post_meta( $six_del['request_id'], '_ct_scan_identity', $six_stone->identity );
+$wpdb->insert( $jobs, array( 'job_id' => 888000001, 'request_id' => $six_del['request_id'], 'target_origin' => 'https://recycled.example.net/', 'scope_hash' => str_repeat( 'c', 64 ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'live@example.com', 'contact_name' => 'Live', 'referrer' => 'direct', 'status' => 'awaiting_confirmation', 'created_at' => ct_test_old( '-1 hour' ) ) );
+ct_scan_maintenance_locked();
+ct_test_assert( get_post( $six_del['request_id'] ), 'A tombstone deleted the request of a live job that reuses its id.' );
+$wpdb->delete( $jobs, array( 'job_id' => 888000001 ) );
+// With no live row, a matching identity does delete a restored post, in any post status.
+wp_update_post( array( 'ID' => $six_del['request_id'], 'post_status' => 'trash' ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ! get_post( $six_del['request_id'] ), 'A restored request in the trash was not deleted.' );
 // Tombstones expire after the backup window, not before.
 $wpdb->update( ct_scan_tombstones_table(), array( 'deleted_at' => ct_test_old( '-100 days' ) ), array( 'job_id' => $edge_del['job_id'] ) );
 $wpdb->update( ct_scan_tombstones_table(), array( 'deleted_at' => ct_test_old( '-130 days' ) ), array( 'job_id' => $six_del['job_id'] ) );
@@ -128,6 +148,9 @@ ct_test_assert( null === $wpdb->get_var( $wpdb->prepare( 'SELECT job_id FROM ' .
 $held = ct_test_aged_job( 'ret-held.example.net', 'failed', '-3 years -1 day', '-13 months' );
 wp_set_current_user( 0 );
 ct_test_assert( 'hold_forbidden' === ct_scan_admin_set_hold( $held['job_id'], 'Preserving records for dispute number 123.', 30 )->get_error_code(), 'An anonymous caller placed a hold.' );
+$subscriber = wp_insert_user( array( 'user_login' => 'ct_ret_sub_' . wp_generate_password( 6, false ), 'user_pass' => wp_generate_password(), 'role' => 'subscriber' ) );
+wp_set_current_user( (int) $subscriber );
+ct_test_assert( 'hold_forbidden' === ct_scan_admin_set_hold( $held['job_id'], 'Preserving records for dispute number 123.', 30 )->get_error_code() && 'hold_forbidden' === ct_scan_admin_release_hold( $held['job_id'] )->get_error_code(), 'A logged-in non-administrator managed a hold.' );
 wp_set_current_user( 1 );
 foreach ( array( array( 'too short', 30 ), array( str_repeat( 'x', 191 ), 30 ), array( 'Preserving records for dispute number 123.', 0 ), array( 'Preserving records for dispute number 123.', 731 ), array( 'Preserving records for dispute number 123.', 'forever' ), array( 'Preserving records for dispute number 123.', -5 ) ) as $i => $bad ) {
 	ct_test_assert( 'hold_invalid' === ct_scan_admin_set_hold( $held['job_id'], $bad[0], $bad[1] )->get_error_code(), "Invalid hold case $i was accepted." );
@@ -138,15 +161,116 @@ ct_test_assert( 'Preserving records for dispute number 123.' === $h->hold_reason
 ct_scan_maintenance_locked();
 $h = ct_scan_row( $held['job_id'] );
 ct_test_assert( $h && null !== $h->result_json && null !== $h->manual_remainder_notes && get_post( $held['request_id'] ), 'A held job lost records.' );
-// Once the hold expires, retention proceeds: both the findings and the evidence are past their dates.
+// A hold that just expired still preserves for the grace period, so nothing vanishes the minute it lapses.
 $wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-1 minute' ) ), array( 'job_id' => $held['job_id'] ) );
 ct_scan_maintenance_locked();
-ct_test_assert( ! ct_test_exists( $held ) && ! get_post( $held['request_id'] ), 'An expired hold still pinned the record.' );
+ct_test_assert( ct_test_exists( $held ) && null !== ct_scan_row( $held['job_id'] )->result_json, 'A hold that expired a minute ago released its records at once.' );
+$wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-4 days' ) ), array( 'job_id' => $held['job_id'] ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ! ct_test_exists( $held ) && ! get_post( $held['request_id'] ), 'An expired hold still pinned the record after its grace period.' );
+// The tombstone path honours a hold too: a restored row under a hold is kept.
+$restore_held = ct_test_aged_job( 'ret-restore-held.example.net', 'failed', '-3 years -1 day', '-1 day' );
+ct_scan_maintenance_locked();
+ct_test_assert( ! ct_test_exists( $restore_held ), 'Fixture expected the job to be deleted first.' );
+$rstone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $restore_held['job_id'] ) );
+$wpdb->insert( $jobs, array( 'job_id' => $restore_held['job_id'], 'request_id' => $restore_held['request_id'], 'target_origin' => 'https://ret-restore-held.example.net/', 'scope_hash' => $rstone->scope_hash, 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'held@example.com', 'contact_name' => 'Held', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => $rstone->created_at, 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ct_test_exists( $restore_held ), 'A restored job under a hold was deleted by its tombstone.' );
+$wpdb->delete( $jobs, array( 'job_id' => $restore_held['job_id'] ) );
+
+// ---- Untrustworthy dates and doubtful rows are kept, never deleted --------------------------------------------
+$zero_r2 = ct_test_aged_job( 'ret-zero-r2.example.net', 'failed', '-3 years -1 day', '-1 hour' );
+$wpdb->update( $jobs, array( 'terms_accepted_at' => '0000-00-00 00:00:00', 'closed_at' => null, 'retain_until' => null ), array( 'job_id' => $zero_r2['job_id'] ) );
+$zero_new = ct_test_aged_job( 'ret-zero-new.example.net', 'cancelled', '-1 year', '-1 hour', '2027-06-01-r3' );
+$wpdb->update( $jobs, array( 'finished_at' => '0000-00-00 00:00:00', 'closed_at' => '0000-00-00 00:00:00', 'retain_until' => null ), array( 'job_id' => $zero_new['job_id'] ) );
+$garbled = ct_test_aged_job( 'ret-garbled.example.net', 'failed', '-3 years -1 day', '-1 hour' );
+$wpdb->update( $jobs, array( 'terms_accepted_at' => '1999-01-01 00:00:00', 'closed_at' => null, 'retain_until' => null ), array( 'job_id' => $garbled['job_id'] ) );
+ct_scan_maintenance_locked();
+ct_scan_maintenance_locked();
+foreach ( array( $zero_r2, $zero_new, $garbled ) as $case ) {
+	$r = ct_scan_row( $case['job_id'] );
+	ct_test_assert( $r && null === $r->retain_until && get_post( $case['request_id'] ), 'A job with an untrustworthy date was given a deletion date or deleted.' );
+}
+ct_test_assert( null !== ct_scan_row( $zero_new['job_id'] )->result_json, 'Findings were cleared on the strength of a zero date.' );
+// A stored date earlier than the one derived today, or earlier than three years after creation, is not honoured.
+$tampered = ct_test_aged_job( 'ret-tampered.example.net', 'failed', '-3 years -1 day', '-1 day' );
+ct_scan_maintenance_locked();
+ct_test_assert( ! ct_test_exists( $tampered ), 'Fixture expected a normal due job to be deleted.' );
+$early = ct_test_aged_job( 'ret-early.example.net', 'failed', '-2 years', '-1 day' );
+ct_scan_maintenance_locked();
+$wpdb->update( $jobs, array( 'retain_until' => ct_test_old( '-1 day' ) ), array( 'job_id' => $early['job_id'] ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ct_test_exists( $early ) && get_post( $early['request_id'] ), 'A retain_until earlier than three years after creation (or the derived date) deleted the evidence.' );
+// The derived-date check alone (the creation floor passes): accepted two years ago, created four years ago.
+$early2 = ct_test_aged_job( 'ret-early2.example.net', 'failed', '-2 years', '-1 day' );
+$wpdb->update( $jobs, array( 'created_at' => ct_test_old( '-4 years' ) ), array( 'job_id' => $early2['job_id'] ) );
+ct_scan_maintenance_locked();
+$wpdb->update( $jobs, array( 'retain_until' => ct_test_old( '-1 day' ) ), array( 'job_id' => $early2['job_id'] ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ct_test_exists( $early2 ), 'A retain_until earlier than the date derived from the row deleted the evidence.' );
+// The creation floor alone: a record created long after its acceptance date is not deleted on that date.
+$late_created = ct_test_aged_job( 'ret-late-created.example.net', 'failed', '-3 years -1 day', '-1 day' );
+$wpdb->update( $jobs, array( 'created_at' => ct_test_old( '-1 day' ) ), array( 'job_id' => $late_created['job_id'] ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ct_test_exists( $late_created ), 'A record created after its stated acceptance date was deleted on that date.' );
+$wpdb->update( $jobs, array( 'retain_until' => ct_test_old( '+1 year' ) ), array( 'job_id' => $early['job_id'] ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ct_test_exists( $early ) && ct_scan_row( $early['job_id'] )->retain_until > ct_test_old( '+1 day' ), 'A later stored deletion date was shortened.' );
+// A job that can still run is never deleted even if its dates say it is due.
+$running = ct_test_aged_job( 'ret-running.example.net', 'awaiting_confirmation', '-3 years -1 day', null );
+$wpdb->update( $jobs, array( 'closed_at' => ct_test_old( '-1 day' ), 'retain_until' => ct_test_old( '-1 hour' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'confirmation_expires_at' => ct_test_old( '+1 day' ) ), array( 'job_id' => $running['job_id'] ) );
+ct_scan_maintenance_locked();
+$rr = ct_scan_row( $running['job_id'] );
+ct_test_assert( $rr && get_post( $running['request_id'] ) && null === $rr->closed_at && null === $rr->retain_until, 'A job that can still run was deleted, or kept a closure stamp, because its dates said so.' );
+// Reopening clears the closure stamp so the old date cannot delete it later.
+$reopen = ct_test_aged_job( 'ret-reopen.example.net', 'failed', '-1 day', '-1 hour' );
+ct_scan_maintenance_locked();
+ct_test_assert( null !== ct_scan_row( $reopen['job_id'] )->retain_until, 'Fixture expected a closed job.' );
+$wpdb->update( $jobs, array( 'status' => 'awaiting_confirmation' ), array( 'job_id' => $reopen['job_id'] ) );
+ct_scan_maintenance_locked();
+$ro = ct_scan_row( $reopen['job_id'] );
+ct_test_assert( null === $ro->closed_at && null === $ro->retain_until, 'Reopening a job left its old closure and deletion date.' );
+// A terminal job with no finished_at is closed now, not left open.
+$nofinish = ct_test_aged_job( 'ret-nofinish.example.net', 'cancelled', '-1 day', null );
+ct_scan_maintenance_locked();
+ct_test_assert( ! empty( ct_scan_row( $nofinish['job_id'] )->closed_at ), 'A terminal job without finished_at was never closed.' );
+
+// ---- Version rules and period floors ----------------------------------------------------------------------------
+foreach ( array( '2026-01-01-r1' => true, '2026-10-21-r1' => true, '2026-10-21-r2' => true, '2026-10-21-r3' => false, '2026-10-22-r1' => false, '2027-06-01-r3' => false, 'weird' => false, '' => false, '2026-10-21-r2 ' => false, '2020-01-01-r9999' => false ) as $version => $legacy ) {
+	ct_test_assert( $legacy === ct_scan_is_legacy_version( $version ), "Version '$version' was classified wrongly." );
+}
+ct_test_assert( 3 === ct_scan_clamp_years( 1 ) && 3 === ct_scan_clamp_years( 0 ) && 3 === ct_scan_clamp_years( 'x' ) && 3 === ct_scan_clamp_years( -6 ) && 3 === ct_scan_clamp_years( null ) && 6 === ct_scan_clamp_years( 6 ) && 10 === ct_scan_clamp_years( '10' ), 'The three-year floor does not hold.' );
+$old_version = ct_test_aged_job( 'ret-old-version.example.net', 'failed', '-2 years', '-1 day', '2026-01-01-r1' );
+$weird_version = ct_test_aged_job( 'ret-weird-version.example.net', 'failed', '-2 years', '-1 day', 'weird' );
+ct_scan_maintenance_locked();
+$ov = ct_scan_row( $old_version['job_id'] );
+$wv = ct_scan_row( $weird_version['job_id'] );
+ct_test_assert( $ov->retain_until === ( new DateTimeImmutable( $ov->terms_accepted_at, new DateTimeZone( 'UTC' ) ) )->modify( '+3 years' )->format( 'Y-m-d H:i:s' ), 'A pre-r2 acceptance is not kept three years from acceptance.' );
+ct_test_assert( $wv->retain_until === ( new DateTimeImmutable( $wv->closed_at, new DateTimeZone( 'UTC' ) ) )->modify( '+6 years' )->format( 'Y-m-d H:i:s' ), 'An unrecognised version did not get the longer period.' );
+
+// ---- Deleting in any post status; bounded work per run ----------------------------------------------------------
+$trashed = ct_test_aged_job( 'ret-trashed.example.net', 'failed', '-3 years -1 day', '-1 day' );
+wp_update_post( array( 'ID' => $trashed['request_id'], 'post_status' => 'trash' ) );
+ct_scan_maintenance_locked();
+ct_test_assert( ! ct_test_exists( $trashed ) && ! get_post( $trashed['request_id'] ), 'A trashed request (with the contact details and contract) outlived its deleted job.' );
+$batch = array();
+for ( $i = 0; $i < 53; $i++ ) {
+	$batch[] = ct_test_aged_job( "ret-batch-$i.example.net", 'failed', '-3 years -1 day', '-1 day' );
+}
+ct_scan_maintenance_locked();
+$remaining = count( array_filter( $batch, 'ct_test_exists' ) );
+ct_test_assert( $remaining >= 3 && $remaining < 53, "A single run did not bound its deletions ($remaining of 53 remain)." );
+ct_scan_maintenance_locked();
+ct_scan_maintenance_locked();
+ct_test_assert( 0 === count( array_filter( $batch, 'ct_test_exists' ) ), 'The remaining due jobs were not deleted on later runs.' );
+
 // Release works; a damaged hold (purpose without expiry) preserves rather than deletes.
 $rel = ct_test_aged_job( 'ret-release.example.net', 'failed', '-3 years -1 day', '-1 day' );
 ct_scan_admin_set_hold( $rel['job_id'], 'Preserving records for dispute number 456.', 10 );
 ct_test_assert( true === ct_scan_admin_release_hold( $rel['job_id'] ), 'Release failed.' );
-ct_test_assert( null === ct_scan_row( $rel['job_id'] )->hold_reason && null === ct_scan_row( $rel['job_id'] )->hold_until, 'Release left the hold in place.' );
+$released = ct_scan_row( $rel['job_id'] );
+ct_test_assert( null === $released->hold_reason && null === $released->hold_until && 1 === (int) $released->hold_released_by && ! empty( $released->hold_released_at ), 'Release left the hold in place or did not record who released it.' );
+ct_test_assert( 'hold_unavailable' === ct_scan_admin_release_hold( $rel['job_id'] )->get_error_code() && 'hold_unavailable' === ct_scan_admin_release_hold( 999999999 )->get_error_code() && 'hold_unavailable' === ct_scan_admin_release_hold( 0 )->get_error_code(), 'Releasing a hold that does not exist reported success.' );
 $damaged = ct_test_aged_job( 'ret-damaged.example.net', 'failed', '-3 years -1 day', '-1 day' );
 $wpdb->update( $jobs, array( 'hold_reason' => 'Purpose without an expiry (damaged).', 'hold_until' => null ), array( 'job_id' => $damaged['job_id'] ) );
 ct_scan_maintenance_locked();
