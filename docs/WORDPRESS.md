@@ -30,6 +30,13 @@ flowchart LR
 - Confirmation tokens are hashed at rest, short lived, and consumed by an
   explicit POST. GET requests, including email-security prefetches, cannot
   confirm. Mailbox control is not independent proof of domain ownership.
+- The confirmation email also carries a separate Stop link, also hashed at
+  rest. GET only shows a Stop form; a nonce-protected POST cancels the job
+  (`customer_stopped`) under the queue lock. Claims and starts then refuse it
+  and late results are rejected. A check the worker already started may finish
+  its current requests: there is not yet a per-request admission guard. Stopping
+  a finished job changes nothing and does not block its report. Schema 2 adds
+  `stop_token_hash`; the upgrade runs automatically on `init`.
 - Jobs have atomic claims. A claim that was never started can be recovered;
   a started job with an uncertain outcome is not automatically scanned again.
   A lost result acknowledgement retries the stored receipt, not the scan.
