@@ -10,7 +10,8 @@ if ( PHP_SAPI !== 'cli' || getenv( 'WORDPRESS_DB_PASSWORD' ) !== 'fixture-only' 
 $private_config = tempnam( '/tmp', 'ct-scan-integration-' );
 file_put_contents( $private_config, '<?php return ' . var_export( array(
 	'enabled'                   => '0' !== getenv( 'CT_TEST_ENABLED' ),
-	'supported_terms_version'   => '2026-10-21-r2',
+	'egress_enforced'           => '0' !== getenv( 'CT_TEST_EGRESS' ),
+	'supported_terms_version'   => getenv( 'CT_TEST_VERSION' ) ?: '2026-10-21-r2',
 	'expected_checker_revision' => str_repeat( 'a', 40 ),
 	'expected_rules_as_of'      => '2026-10-21',
 	'worker_hmac_secret'        => str_repeat( 'fixture-key-', 4 ),
@@ -18,9 +19,11 @@ file_put_contents( $private_config, '<?php return ' . var_export( array(
 	'confirmation_ttl_hours'    => 24,
 	'global_daily_limit'        => 1000,
 	'target_daily_limit'        => 100,
-	'bound_terms_versions'      => getenv( 'CT_TEST_BOUND' ) ? array( '2026-10-21-r2' ) : array(),
+	// CT_TEST_EVIDENCE_YEARS: a raw value (words, NULL, TRUE, ARRAY, numbers) for evidence_retention_years.
+	'evidence_retention_years'  => false === getenv( 'CT_TEST_EVIDENCE_YEARS' ) ? 6 : ( array( 'NULL' => null, 'TRUE' => true, 'FALSE' => false, 'ARRAY' => array( 9 ) )[ getenv( 'CT_TEST_EVIDENCE_YEARS' ) ] ?? getenv( 'CT_TEST_EVIDENCE_YEARS' ) ),
+	// CT_TEST_POLICY: legacy (default; the grandfathered r2 flow), strict, or none (no decision declared).
+	'terms_policy'              => 'none' === getenv( 'CT_TEST_POLICY' ) ? array() : array( ( getenv( 'CT_TEST_VERSION' ) ?: '2026-10-21-r2' ) => 'strict' === getenv( 'CT_TEST_POLICY' ) ? 'strict' : 'legacy' ),
 	'send_accepted_copy'        => '1' === getenv( 'CT_TEST_COPY' ),
-	'target_control_versions'   => '1' === getenv( 'CT_TEST_CONTROL' ) ? array( '2026-10-21-r2' ) : array(),
 ), true ) . ';' );
 define( 'CT_SCAN_PRIVATE_CONFIG', $private_config );
 register_shutdown_function( static function () use ( $private_config ) { @unlink( $private_config ); } );
@@ -93,7 +96,16 @@ function ct_test_result( $target ) {
 
 function ct_test_queue_job( $job_id ) {
 	global $wpdb;
-	$wpdb->update( ct_scan_jobs_table(), array( 'status' => 'queued', 'confirmation_token_hash' => null, 'confirmation_expires_at' => null, 'confirmed_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $job_id ) );
+	$update = array( 'status' => 'queued', 'confirmation_token_hash' => null, 'confirmation_expires_at' => null, 'confirmed_at' => ct_scan_utc_now() );
+	$row    = ct_scan_row( $job_id );
+	if ( $row && ! empty( $row->control_required ) ) {
+		// A job that must show control of its target is released only by that proof; fixtures that are not
+		// about the control gate stand in for it.
+		$update['control_verified_at'] = ct_scan_utc_now();
+		$update['control_valid_until'] = $row->authorization_expires_at;
+		$update['control_method']      = 'manual_review';
+	}
+	$wpdb->update( ct_scan_jobs_table(), $update, array( 'job_id' => (int) $job_id ) );
 }
 
 
@@ -137,16 +149,16 @@ function ct_test_purge_fixtures() {
 	}
 }
 
-/** The Target Summary text a bound acceptance would carry for a fixture request. */
+/** The Target Summary text a bound acceptance would carry for a fixture request; $overrides replace single lines. */
 function ct_test_summary( $fields, $overrides = array() ) {
-	$lines = array_merge( array(
-		'Website (scan scope)' => $fields['target'],
-		'Client contact'       => $fields['name'],
-		'Client email'         => $fields['email'],
-		'Profile'              => ct_scan_current_profile(),
-	), $overrides );
+	$canonical = ct_scan_target_summary( $fields['target'], $fields['name'], $fields['email'], ct_scan_current_profile() );
+	$lines = array();
+	foreach ( explode( "\n", rtrim( $canonical, "\n" ) ) as $line ) {
+		list( $label, $value ) = explode( ': ', $line, 2 );
+		$lines[ $label ] = $value;
+	}
 	$text = '';
-	foreach ( $lines as $label => $value ) {
+	foreach ( array_merge( $lines, $overrides ) as $label => $value ) {
 		$text .= $label . ': ' . $value . "\n";
 	}
 	return $text;
@@ -192,4 +204,10 @@ function ct_test_running_job_for_bound( $host ) {
 function ct_test_end_job( $job_id ) {
 	global $wpdb;
 	$wpdb->update( ct_scan_jobs_table(), array( 'status' => 'failed', 'outcome' => 'failed', 'finished_at' => ct_scan_utc_now(), 'lease_hash' => null, 'lease_until' => null ), array( 'job_id' => (int) $job_id ) );
+}
+
+/** One maintenance pass as production does it: state transitions under the queue lock, then retention outside it. */
+function ct_test_maintain() {
+	ct_scan_maintenance_locked();
+	ct_scan_retention_run( true );
 }

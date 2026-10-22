@@ -131,6 +131,51 @@ class RequestOrigin:
         return scheme, port, host, target
 
 
+# Explicit special-purpose ranges, listed rather than inferred: Python's ipaddress `is_global`
+# differs between versions (3.10 through 3.14 disagree on several of these), and a destination
+# check must not depend on the interpreter. Anything in these ranges is never a customer's site.
+DENIED_V4 = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "0.0.0.0/8",  # "this" network
+        "10.0.0.0/8",
+        "100.64.0.0/10",  # carrier-grade NAT
+        "127.0.0.0/8",
+        "169.254.0.0/16",  # link-local, cloud metadata
+        "172.16.0.0/12",
+        "192.0.0.0/24",  # IETF protocol assignments
+        "192.0.2.0/24",  # documentation
+        "192.88.99.0/24",  # deprecated 6to4 relay anycast
+        "192.168.0.0/16",
+        "198.18.0.0/15",  # benchmarking
+        "198.51.100.0/24",  # documentation
+        "203.0.113.0/24",  # documentation
+        "224.0.0.0/4",  # multicast
+        "240.0.0.0/4",  # reserved, includes the broadcast address
+    )
+)
+DENIED_V6 = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "::/128",
+        "::1/128",
+        "::ffff:0:0/96",  # IPv4-mapped
+        "64:ff9b::/96",  # NAT64
+        "64:ff9b:1::/48",  # local-use NAT64
+        "100::/64",  # discard-only
+        "2001::/23",  # IETF protocol assignments, includes Teredo
+        "2001:db8::/32",  # documentation
+        "2002::/16",  # 6to4
+        "3fff::/20",  # documentation (RFC 9637)
+        "5f00::/16",  # SRv6 SIDs
+        "fc00::/7",  # unique local
+        "fe80::/10",  # link-local
+        "fec0::/10",  # deprecated site-local
+        "ff00::/8",  # multicast
+    )
+)
+
+
 def _public_addresses(host: str, port: int, resolver=socket.getaddrinfo):
     """Resolve afresh and reject the entire answer set if any address is non-public."""
     try:
@@ -154,16 +199,6 @@ def _public_addresses(host: str, port: int, resolver=socket.getaddrinfo):
             address = ipaddress.ip_address(text)
         except (IndexError, ValueError) as exc:
             raise ValueError("invalid_dns_answer") from exc
-        denied_v4 = (
-            ipaddress.ip_network("192.0.0.0/24"),
-            ipaddress.ip_network("192.88.99.0/24"),
-        )
-        denied_v6 = (
-            ipaddress.ip_network("64:ff9b::/96"),
-            ipaddress.ip_network("64:ff9b:1::/48"),
-            ipaddress.ip_network("2001::/23"),
-            ipaddress.ip_network("2002::/16"),
-        )
         unsafe = (
             not address.is_global
             or address.is_multicast
@@ -174,11 +209,11 @@ def _public_addresses(host: str, port: int, resolver=socket.getaddrinfo):
             or address.is_private
         )
         if isinstance(address, ipaddress.IPv4Address):
-            unsafe = unsafe or any(address in network for network in denied_v4)
+            unsafe = unsafe or any(address in network for network in DENIED_V4)
         if isinstance(address, ipaddress.IPv6Address):
             unsafe = unsafe or address.ipv4_mapped is not None or address.is_site_local
             unsafe = unsafe or address not in ipaddress.ip_network("2000::/3")
-            unsafe = unsafe or any(address in network for network in denied_v6)
+            unsafe = unsafe or any(address in network for network in DENIED_V6)
         if unsafe:
             raise ValueError("non_public_address")
         key = (family, address.compressed)

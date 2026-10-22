@@ -82,6 +82,10 @@ $run = array(
 	'id' => $claimed['id'], 'lease' => $claimed['lease'], 'scope_hash' => $claimed['scope_hash'], 'outcome' => 'completed',
 	'result' => ct_test_result( $fields['target'] ), 'error' => '', 'checker_revision' => str_repeat( 'a', 40 ),
 );
+// A completed result is not credible unless the guard admitted at least one request for the job.
+$unadmitted = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', $run );
+ct_test_assert( 409 === $unadmitted->get_status() && 'no_admission' === $unadmitted->get_data()['error'] && 'running' === ct_scan_row( $claimed['id'] )->status, 'A completed result was accepted for a job that never had a request admitted.' );
+ct_test_assert( 200 === ct_test_rest_call( 'ct_scan_admit', '/ct-scan/v1/admit', array( 'id' => $claimed['id'], 'lease' => $claimed['lease'], 'scope_hash' => $claimed['scope_hash'], 'kind' => 'http' ) )->get_status(), 'Fixture admission was refused.' );
 $result = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', $run );
 ct_test_assert( 200 === $result->get_status() && true === $result->get_data()['ok'], 'Valid checker receipt was not acknowledged.' );
 $retry = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', $run );
@@ -203,7 +207,7 @@ $request_ids[] = $retention_id;
 $retention_event = ct_scan_on_request_ready( $retention_id, $retention_fields );
 $old_finished = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '-13 months' )->format( 'Y-m-d H:i:s' );
 $wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => $old_finished, 'terms_accepted_at' => $old_finished, 'result_json' => '{}', 'manual_remainder_notes' => 'private notes' ), array( 'job_id' => (int) $retention_event['job_id'] ) );
-ct_scan_maintenance_locked();
+ct_test_maintain();
 $retained = ct_scan_row( $retention_event['job_id'] );
 ct_test_assert( $retained && null === $retained->result_json && null === $retained->manual_remainder_notes && get_post( $retention_id ), '12-month cleanup must clear result/manual data but retain the request evidence.' );
 $three_years = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '-3 years -1 day' )->format( 'Y-m-d H:i:s' );
@@ -212,10 +216,10 @@ $hold_delete = static function ( $check, $post ) use ( $retention_id ) {
 	return (int) $retention_id === (int) $post->ID ? false : $check;
 };
 add_filter( 'pre_delete_post', $hold_delete, 10, 2 );
-ct_scan_maintenance_locked();
+ct_test_maintain();
 remove_filter( 'pre_delete_post', $hold_delete, 10 );
 ct_test_assert( ct_scan_row( $retention_event['job_id'] ) && get_post( $retention_id ) && '' === ct_scan_row( $retention_event['job_id'] )->contact_email && '' === ct_scan_row( $retention_event['job_id'] )->contact_name, 'Failed three-year post deletion must retain the job link while scrubbing contact fields.' );
-ct_scan_maintenance_locked();
+ct_test_maintain();
 ct_test_assert( ! ct_scan_row( $retention_event['job_id'] ) && ! get_post( $retention_id ), 'Three-year cleanup must remove the exact linked private request and job.' );
 
 // Remove only records created by this test.

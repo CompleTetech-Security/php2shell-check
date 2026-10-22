@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CompleteTech Authorized PHP2Shell Scan Queue
  * Description: Confirmation-gated, one-target PHP2Shell screening queue for Promo Requests.
- * Version: 0.1.0
+ * Version: 0.2.0
  *
  * This MU plugin stores authorization and job state locally. It never starts a
  * scanner process. The external worker talks to the signed REST routes below.
@@ -80,13 +80,17 @@ function ct_scan_config() {
 		'global_daily_limit'       => 20,
 		'target_daily_limit'       => 1,
 		'job_retention_days'       => 365,
-		// Terms versions whose acceptance MUST carry a bound snapshot and Target Summary.
-		'bound_terms_versions'     => array(),
 		// Email the verified contact their accepted copy after confirmation (off by default).
 		'send_accepted_copy'       => false,
-		// Terms versions whose jobs must prove control of the exact target (DNS TXT, HTTPS file,
-		// or a recorded manual authority review) before any scan can be claimed.
-		'target_control_versions'  => array(),
+		// An explicit decision for every terms version the integration serves: array( '<version>' => 'strict' | 'legacy' ).
+		// `strict` (also what an unlisted version gets) requires bound evidence and proof of control of the
+		// exact target. `legacy` grandfathers an r2-or-earlier acceptance flow and is honoured ONLY for those versions.
+		// The integration refuses to enable unless supported_terms_version has an entry here.
+		'terms_policy'             => array(),
+		// The admission guard is advisory to a scanner that ignores it; only enforced network egress
+		// (allow the customer's HTTP/HTTPS, deny private/metadata ranges) makes it a boundary. The
+		// operator must state, deliberately, that this exists. See docs/WORDPRESS.md "Egress".
+		'egress_enforced'          => false,
 		// Owner decisions (2026-10-22): findings 12 months; signed authorization evidence 6 years
 		// after request closure, except r2 and earlier acceptances, which keep 3 years from acceptance.
 		'evidence_retention_years' => 6,
@@ -114,12 +118,67 @@ function ct_scan_config() {
 	$config['enabled'] = true === $config['enabled']
 		&& is_string( $config['worker_hmac_secret'] )
 		&& strlen( $config['worker_hmac_secret'] ) >= 32
+		&& true === $config['egress_enforced']
+		&& ct_scan_policy_declared( $config )
 		&& is_string( $config['expected_checker_revision'] )
 		&& 1 === preg_match( '/\A[a-f0-9]{40}\z/i', $config['expected_checker_revision'] )
 		&& is_string( $config['supported_terms_version'] )
 		&& '' !== $config['supported_terms_version'];
 
 	return $config;
+}
+
+/**
+ * r2 and earlier acceptances (versions `YYYY-MM-DD-rN` up to `2026-10-21-r2`) are the only ones that may be
+ * grandfathered. A version that cannot be parsed is NOT legacy.
+ */
+function ct_scan_is_legacy_version( $version ) {
+	if ( ! is_string( $version ) || ! preg_match( '/\A(\d{4}-\d{2}-\d{2})-r(\d{1,3})\z/', $version, $m ) ) {
+		return false;
+	}
+	return $m[1] < '2026-10-21' || ( '2026-10-21' === $m[1] && (int) $m[2] <= 2 );
+}
+
+/**
+ * The requirement a terms version carries. STRICT is the default for every version: bound evidence (and,
+ * where the control gate exists, proof of control of the exact target). `legacy` is honoured only when the
+ * operator listed that exact version AND it is an r2-or-earlier version, so a new version can never inherit
+ * the grandfathered flow by omission or by configuration.
+ */
+function ct_scan_terms_policy( $version ) {
+	$config = ct_scan_config();
+	$policy = is_array( $config['terms_policy'] ) && is_string( $version ) && isset( $config['terms_policy'][ $version ] ) ? $config['terms_policy'][ $version ] : '';
+	return ( 'legacy' === $policy && ct_scan_is_legacy_version( $version ) ) ? 'legacy' : 'strict';
+}
+
+/** The integration serves one terms version; its policy must be an explicit, valid decision. */
+function ct_scan_policy_declared( $config ) {
+	$version = $config['supported_terms_version'];
+	if ( ! is_string( $version ) || '' === $version || ! is_array( $config['terms_policy'] ) || ! isset( $config['terms_policy'][ $version ] ) ) {
+		return false;
+	}
+	$policy = $config['terms_policy'][ $version ];
+	return 'strict' === $policy || ( 'legacy' === $policy && ct_scan_is_legacy_version( $version ) );
+}
+
+/**
+ * The canonical Target Summary a signer is shown and signs: the exact website, the client, the profile,
+ * the limits of that profile and the authorization period. Deterministic from the request fields and the
+ * profile's code-defined limits, so the form, the recorder and this plugin render byte-identical text.
+ * Returns '' for an unknown profile.
+ */
+function ct_scan_target_summary( $target, $name, $email, $profile = null ) {
+	$profile = null === $profile ? ct_scan_current_profile() : $profile;
+	$limits  = ct_scan_profile_limits( $profile );
+	if ( ! $limits || ! is_string( $target ) || ! is_string( $name ) || ! is_string( $email ) ) {
+		return '';
+	}
+	return 'Website (scan scope): ' . $target . "\n"
+		. 'Client contact: ' . $name . "\n"
+		. 'Client email: ' . $email . "\n"
+		. 'Profile: ' . $profile . "\n"
+		. 'Limits: this website only (HTTP 80 / HTTPS 443); at most ' . (int) $limits['http_requests'] . ' requests, one at a time, at most one per second, ' . (int) ( $limits['timeout_ms'] / 1000 ) . " seconds each\n"
+		. "Authorization: expires 60 days after acceptance (never after the published window end), or when the request closes\n";
 }
 
 function ct_scan_enabled() {
@@ -146,6 +205,10 @@ function ct_scan_nonces_table() {
 function ct_scan_maybe_install_schema() {
 	$previous = get_option( 'ct_scan_schema_version' );
 	if ( $previous === CT_SCAN_SCHEMA_VERSION ) {
+		return;
+	}
+	// A failed upgrade must not re-run dbDelta on every public request: back off for five minutes.
+	if ( get_transient( 'ct_scan_schema_backoff' ) ) {
 		return;
 	}
 	global $wpdb;
@@ -237,13 +300,13 @@ function ct_scan_maybe_install_schema() {
 		tombstone_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
 		job_id bigint(20) unsigned NOT NULL,
 		request_id bigint(20) unsigned NOT NULL,
-		scope_hash char(64) NOT NULL,
+		scope_mac char(64) NOT NULL,
 		created_at datetime NOT NULL,
 		deleted_at datetime NOT NULL,
 		reason varchar(32) NOT NULL,
 		identity char(32) NULL,
 		PRIMARY KEY  (tombstone_id),
-		UNIQUE KEY identity (job_id,request_id,scope_hash,created_at),
+		UNIQUE KEY identity (job_id,request_id,scope_mac,created_at),
 		KEY deleted_at (deleted_at)
 	) {$charset};" );
 	$sql = "CREATE TABLE {$nonces} (
@@ -256,14 +319,18 @@ function ct_scan_maybe_install_schema() {
 	$required = array(
 		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at', 'identity', 'retention_checked_at' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
-		$tombstones => array( 'tombstone_id', 'job_id', 'request_id', 'scope_hash', 'created_at', 'deleted_at', 'reason', 'identity' ),
+		$tombstones => array( 'tombstone_id', 'job_id', 'request_id', 'scope_mac', 'created_at', 'deleted_at', 'reason', 'identity' ),
 	);
 	foreach ( $required as $table => $columns ) {
 		$found = $wpdb->get_col( "SHOW COLUMNS FROM {$table}", 0 );
 		if ( ! is_array( $found ) || array_diff( $columns, $found ) ) {
+			// Loud once per back-off window, and bounded. The worker API stays refused (fail closed).
+			error_log( 'ct-scan: database upgrade to schema ' . CT_SCAN_SCHEMA_VERSION . ' is incomplete for ' . $table . '; the worker API stays refused. Retrying in 5 minutes. Restore from backup or repair the table.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			set_transient( 'ct_scan_schema_backoff', '1', 5 * MINUTE_IN_SECONDS );
 			return;
 		}
 	}
+	delete_transient( 'ct_scan_schema_backoff' );
 	if ( is_string( $previous ) && '' !== $previous && version_compare( $previous, '3', '<' ) ) {
 		// A job that started before request counting existed has no record of what it already
 		// sent: it gets no fresh budget, so its remaining admissions are refused.
@@ -367,8 +434,8 @@ function ct_scan_meta_string( $post_id, $key ) {
  *   _ct_summary_shown_digest the digest the form carried for the summary
  *
  * Any partial or mismatched set refuses the job (and cancels a queued or running one via
- * ct_scan_authorization_is_live). Versions listed in config `bound_terms_versions` must be bound.
- * An unbound legacy acceptance is accepted only for versions that are not listed.
+ * ct_scan_authorization_is_live). Every version must be bound (the `strict` policy, which is the default)
+ * unless the operator grandfathered an r2-or-earlier version as `legacy` in config `terms_policy`.
  */
 function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $required, $profile ) {
 	$marker  = ct_scan_meta_string( $request_id, '_ct_terms_binding' );
@@ -402,13 +469,11 @@ function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $req
 			}
 		}
 	}
-	// The Target Summary must be exactly the canonical text of the authorized request: nothing
-	// before, between or after the four lines, so no decoy or appended instruction can ride along.
-	$expected = 'Website (scan scope): ' . $identity['target'] . "\n"
-		. 'Client contact: ' . $identity['name'] . "\n"
-		. 'Client email: ' . $identity['email'] . "\n"
-		. 'Profile: ' . $profile . "\n";
-	if ( ! hash_equals( $expected, $summary ) ) {
+	// The Target Summary must be exactly the canonical text of the authorized request (website, client,
+	// profile, limits, authorization period): nothing before, between or after, so no decoy or appended
+	// instruction can ride along, and the limits the signer saw are the limits the job runs under.
+	$expected = ct_scan_target_summary( $identity['target'], $identity['name'], $identity['email'], $profile );
+	if ( '' === $expected || ! hash_equals( $expected, $summary ) ) {
 		return new WP_Error( 'ct_scan_binding_mismatch', 'The retained Target Summary is not the canonical summary of the authorized request.' );
 	}
 	return array( 'bound' => true, 'summary_sha256' => $summary_hash, 'required' => (bool) $required );
@@ -416,6 +481,8 @@ function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $req
 
 /** Check the saved request and acceptance snapshot before any job is created. */
 function ct_scan_validate_saved_request( $request_id, $fields, $require_current_terms = true, $frozen_expiry = '', $frozen = null ) {
+	// Authorization is judged on what the database holds now, never on an object-cache copy.
+	clean_post_cache( (int) $request_id );
 	$config = ct_scan_config();
 	$post   = get_post( $request_id );
 	if ( ! $post || 'ct_promo_request' !== $post->post_type || 'private' !== $post->post_status ) {
@@ -483,7 +550,7 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 	}
 	// A job's evidence requirement and profile are frozen when it is created, so a later
 	// configuration change can neither relax nor tighten an authorization already given.
-	$bound_required = is_array( $frozen ) ? (bool) $frozen['bound_required'] : in_array( $terms_version, (array) $config['bound_terms_versions'], true );
+	$bound_required = is_array( $frozen ) ? (bool) $frozen['bound_required'] : 'strict' === ct_scan_terms_policy( $terms_version );
 	$profile        = is_array( $frozen ) ? (string) $frozen['profile'] : ct_scan_current_profile();
 	$bound = ct_scan_check_bound_evidence( $request_id, $terms_hash, array( 'target' => $target, 'email' => $email, 'name' => $name ), $bound_required, $profile );
 	if ( is_wp_error( $bound ) ) {
@@ -639,9 +706,10 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 				// Opaque identity mirrored on the private request: lets a deletion tombstone recognise
 				// the same record after a restore without matching on recyclable numeric ids.
 				'identity'                 => $identity,
-				// Frozen at creation: a later configuration change cannot relax an existing job.
+				// Frozen at creation: a later configuration change cannot relax an existing job. Every version is strict
+				// (requires control of the exact target) unless an r2-or-earlier version was explicitly grandfathered.
 				// A profile broader than the r2 header screening can never run without target control.
-				'control_required'         => ( in_array( $accepted['terms_version'], (array) $config['target_control_versions'], true ) || 'r2-header-v1' !== ct_scan_current_profile() ) ? 1 : 0,
+				'control_required'         => ( 'strict' === ct_scan_terms_policy( $accepted['terms_version'] ) || 'r2-header-v1' !== ct_scan_current_profile() ) ? 1 : 0,
 			),
 			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d' )
 		);
@@ -787,7 +855,6 @@ function ct_scan_maintenance_locked() {
 	$nonce_table = ct_scan_nonces_table();
 	$wpdb->query( $wpdb->prepare( "DELETE FROM {$nonce_table} WHERE expires_at < %s", gmdate( 'Y-m-d H:i:s', time() - 600 ) ) );
 
-	ct_scan_retention_locked( $now );
 }
 
 /** Statuses from which a job never runs again; reaching one is the request's closure. */
@@ -814,22 +881,19 @@ function ct_scan_valid_datetime( $value ) {
 	return true;
 }
 
-/** Retention periods are never shorter than the three years every acceptance has been promised. */
-function ct_scan_clamp_years( $years ) {
-	return is_numeric( $years ) ? max( 3, (int) $years ) : 3;
+/**
+ * A retention period in whole years, never below its floor: 3 for r2-and-earlier acceptances, 6 for
+ * everything else. A value that is not a plain positive number (a word, null, a boolean, an array, 0,
+ * negative) means "the floor", never "shorter", and fractions round down but never below the floor.
+ */
+function ct_scan_clamp_years( $years, $floor = 3 ) {
+	$floor = max( 3, (int) $floor );
+	if ( ( ! is_int( $years ) && ! is_float( $years ) && ! ( is_string( $years ) && is_numeric( $years ) ) ) || ! is_finite( (float) $years ) ) {
+		return $floor;
+	}
+	return max( $floor, (int) $years );
 }
 
-/**
- * r2 and earlier acceptances keep three years from acceptance; this recognises them by version
- * (`YYYY-MM-DD-rN` up to `2026-10-21-r2`). A version that cannot be parsed is NOT treated as legacy:
- * it gets the longer period, so a surprise string can never shorten retention.
- */
-function ct_scan_is_legacy_version( $version ) {
-	if ( ! is_string( $version ) || ! preg_match( '/\A(\d{4}-\d{2}-\d{2})-r(\d{1,3})\z/', $version, $m ) ) {
-		return false;
-	}
-	return $m[1] < '2026-10-21' || ( '2026-10-21' === $m[1] && (int) $m[2] <= 2 );
-}
 
 /**
  * When the signed authorization evidence of a job may be deleted: r2 and earlier acceptances three
@@ -840,10 +904,10 @@ function ct_scan_is_legacy_version( $version ) {
 function ct_scan_retain_until( $row ) {
 	$config = ct_scan_config();
 	if ( ct_scan_is_legacy_version( $row->terms_version ) ) {
-		$years = ct_scan_clamp_years( $config['legacy_retention_years'] );
+		$years = ct_scan_clamp_years( $config['legacy_retention_years'], 3 );
 		$base  = $row->terms_accepted_at;
 	} else {
-		$years = ct_scan_clamp_years( $config['evidence_retention_years'] );
+		$years = ct_scan_clamp_years( $config['evidence_retention_years'], 6 );
 		$base  = $row->closed_at;
 	}
 	if ( ! ct_scan_valid_datetime( $base ) ) {
@@ -891,6 +955,10 @@ function ct_scan_deletion_allowed( $row, $now ) {
 			return false;
 		}
 	}
+	// A record cannot have closed before it was created; if it appears to, a date is wrong.
+	if ( $row->closed_at < $row->created_at ) {
+		return false;
+	}
 	$expected = ct_scan_retain_until( $row );
 	if ( false === $expected || $row->retain_until < $expected ) {
 		return false;
@@ -901,14 +969,22 @@ function ct_scan_deletion_allowed( $row, $now ) {
 	return $row->retain_until >= $floor && $row->retain_until <= $now;
 }
 
+/**
+ * A tombstone must not let anyone who reads it (a backup, a database export) test whether a given website
+ * was ever a customer: the scope is stored as a keyed MAC, not as the plain hash of the hostname.
+ */
+function ct_scan_tombstone_mac( $scope_hash ) {
+	return hash_hmac( 'sha256', (string) $scope_hash, wp_salt( 'secure_auth' ) . '|ct-scan-tombstone-v1' );
+}
+
 /** Remember a deleted record by identifier only, so a restored backup cannot bring it back. */
 function ct_scan_record_tombstone( $row, $reason ) {
 	global $wpdb;
 	$result = $wpdb->query( $wpdb->prepare(
-		'INSERT IGNORE INTO ' . ct_scan_tombstones_table() . ' (job_id, request_id, scope_hash, created_at, deleted_at, reason, identity) VALUES (%d, %d, %s, %s, %s, %s, %s)',
+		'INSERT IGNORE INTO ' . ct_scan_tombstones_table() . ' (job_id, request_id, scope_mac, created_at, deleted_at, reason, identity) VALUES (%d, %d, %s, %s, %s, %s, %s)',
 		(int) $row->job_id,
 		(int) $row->request_id,
-		$row->scope_hash,
+		ct_scan_tombstone_mac( $row->scope_hash ),
 		$row->created_at,
 		ct_scan_utc_now(),
 		substr( sanitize_key( $reason ), 0, 32 ),
@@ -947,14 +1023,82 @@ function ct_scan_delete_job_records( $row, $reason ) {
 }
 
 /**
- * Closure, findings retention (12 months), evidence retention (retain_until), narrow holds, and
- * tombstones. Held jobs keep everything; nothing is deleted before its promised period, and every
- * step is bounded per run so the global queue lock is not held for long.
+ * Retention is NOT done under the queue lock. Only one retention run at a time (its own advisory lock);
+ * the non-destructive steps are single statements; every deletion takes the queue lock for that one job
+ * only (no waiting: a busy queue means "try again next run"), re-reads the row under it and re-checks
+ * every condition, so Stop, claims and admissions are never delayed for more than one job's deletion
+ * and a hold placed a moment ago is honoured.
  */
-function ct_scan_retention_locked( $now ) {
+function ct_scan_retention_lock_name() {
+	global $wpdb;
+	return 'ctscanret_' . substr( hash( 'sha256', DB_NAME . '|' . $wpdb->prefix ), 0, 22 );
+}
+
+function ct_scan_retention_lock_acquire() {
+	global $wpdb;
+	return '1' === (string) $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', ct_scan_retention_lock_name() ) );
+}
+
+function ct_scan_retention_lock_release() {
+	global $wpdb;
+	$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', ct_scan_retention_lock_name() ) );
+}
+
+/** Run retention now (`$force`) or at most about once a minute. Returns true if a run happened. */
+function ct_scan_retention_run( $force = false ) {
+	if ( ! $force && get_transient( 'ct_scan_retention_last' ) ) {
+		return false;
+	}
+	if ( ! ct_scan_retention_lock_acquire() ) {
+		return false;
+	}
+	try {
+		set_transient( 'ct_scan_retention_last', '1', 55 );
+		ct_scan_retention_steps( ct_scan_utc_now() );
+	} finally {
+		ct_scan_retention_lock_release();
+	}
+	return true;
+}
+
+/**
+ * Deletion is refused when the server clock looks wrong: if any job carries a (plausible) timestamp later
+ * than "now", now cannot be trusted to decide that a retention period has passed.
+ */
+function ct_scan_clock_is_sane( $now ) {
+	global $wpdb;
+	$table  = ct_scan_jobs_table();
+	$limit  = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '+5 minutes' )->format( 'Y-m-d H:i:s' );
+	foreach ( array( 'created_at', 'finished_at', 'closed_at', 'terms_accepted_at' ) as $column ) {
+		$newest = $wpdb->get_var( "SELECT MAX({$column}) FROM {$table} WHERE {$column} < '2200-01-01 00:00:00'" );
+		if ( is_string( $newest ) && $newest > $limit ) {
+			return false;
+		}
+	}
+	return $now >= '2020-01-01 00:00:00' && $now < '2200-01-01 00:00:00';
+}
+
+/** Delete one job if, under the queue lock and from a fresh read, it is still due. Returns 'deleted'|'kept'|'failed'|'busy'. */
+function ct_scan_delete_if_due( $job_id, $now ) {
+	if ( ! ct_scan_lock_acquire() ) {
+		return 'busy';
+	}
+	try {
+		$row = ct_scan_row( $job_id );
+		if ( ! $row || ! ct_scan_deletion_allowed( $row, $now ) ) {
+			return 'kept';
+		}
+		return ct_scan_delete_job_records( $row, 'retention' ) ? 'deleted' : 'failed';
+	} finally {
+		ct_scan_lock_release();
+	}
+}
+
+function ct_scan_retention_steps( $now ) {
 	global $wpdb;
 	$table    = ct_scan_jobs_table();
 	$terminal = ct_scan_terminal_sql();
+	$budget   = microtime( true ) + 3.0;
 	// 0. A job that can run again is not closed: forget any closure stamped on it.
 	$wpdb->query( "UPDATE {$table} SET closed_at = NULL, retain_until = NULL WHERE status NOT IN ({$terminal}) AND (closed_at IS NOT NULL OR retain_until IS NOT NULL)" );
 	// 1. Closure is explicit: the first time a job is seen terminal it is stamped.
@@ -985,6 +1129,11 @@ function ct_scan_retention_locked( $now ) {
 			$wpdb->update( $table, array( 'retention_checked_at' => $now ), array( 'job_id' => (int) $row->job_id ), array( '%s' ), array( '%d' ) );
 		}
 	}
+	// Everything below deletes. Refuse all of it if the clock cannot be trusted.
+	if ( ! ct_scan_clock_is_sane( $now ) ) {
+		error_log( 'ct-scan: retention deletions skipped: the server clock is earlier than a stored job timestamp.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		return;
+	}
 	// 3. Findings: twelve months after closure (366 days, so a leap day cannot make it early), unless held.
 	$findings_cutoff = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-366 days' )->format( 'Y-m-d H:i:s' );
 	$grace_edge      = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
@@ -995,23 +1144,23 @@ function ct_scan_retention_locked( $now ) {
 	) );
 	// 4. Evidence: delete what has outlived its retain_until, except under a hold. Bounded per run.
 	$due = $wpdb->get_results( $wpdb->prepare(
-		"SELECT * FROM {$table} WHERE retain_until IS NOT NULL AND retain_until <= %s AND closed_at IS NOT NULL AND status IN ({$terminal}) AND (hold_reason IS NULL OR (hold_until >= '2020-01-01 00:00:00' AND hold_until <= %s)) AND (retention_checked_at IS NULL OR retention_checked_at < %s) ORDER BY retain_until ASC LIMIT 50",
+		"SELECT job_id FROM {$table} WHERE retain_until IS NOT NULL AND retain_until <= %s AND closed_at IS NOT NULL AND status IN ({$terminal}) AND (hold_reason IS NULL OR (hold_until >= '2020-01-01 00:00:00' AND hold_until <= %s)) AND (retention_checked_at IS NULL OR retention_checked_at < %s) ORDER BY retain_until ASC LIMIT 50",
 		$now,
 		$grace_edge,
 		$recheck
 	) );
 	foreach ( (array) $due as $row ) {
-		if ( ct_scan_deletion_allowed( $row, $now ) ) {
-			if ( ! ct_scan_delete_job_records( $row, 'retention' ) ) {
-				$wpdb->update( $table, array( 'retention_checked_at' => $now ), array( 'job_id' => (int) $row->job_id ), array( '%s' ), array( '%d' ) );
-			}
-		} else {
-			// Doubtful: keep it, and look at it again tomorrow rather than on every run.
+		$outcome = ct_scan_delete_if_due( (int) $row->job_id, $now );
+		if ( 'busy' === $outcome || microtime( true ) > $budget ) {
+			break; // the queue is in use (or the run is long enough): continue next time
+		}
+		if ( 'deleted' !== $outcome ) {
+			// Doubtful or failed: keep it, and look at it again tomorrow rather than on every run.
 			$wpdb->update( $table, array( 'retention_checked_at' => $now ), array( 'job_id' => (int) $row->job_id ), array( '%s' ), array( '%d' ) );
 		}
 	}
 	// 5. A restored backup must not resurrect deleted records: delete matches again.
-	ct_scan_apply_tombstones( $now );
+	ct_scan_apply_tombstones( $now, $budget );
 	$wpdb->query( $wpdb->prepare( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE deleted_at < %s', ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . max( 90, (int) ct_scan_config()['tombstone_retention_days'] ) . ' days' )->format( 'Y-m-d H:i:s' ) ) );
 }
 
@@ -1021,22 +1170,35 @@ function ct_scan_retention_locked( $now ) {
  * on the opaque identity recorded at creation, and only when no job row currently uses that request or
  * job id (recycled auto-increment ids must never reach a live record). Holds are honoured.
  */
-function ct_scan_apply_tombstones( $now ) {
+function ct_scan_apply_tombstones( $now, $budget = null ) {
 	global $wpdb;
 	$table  = ct_scan_jobs_table();
 	$stones = ct_scan_tombstones_table();
-	$ghosts = $wpdb->get_results( 'SELECT j.* FROM ' . $table . ' j INNER JOIN ' . $stones . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.scope_hash = j.scope_hash AND t.created_at = j.created_at ORDER BY j.job_id ASC LIMIT 50' );
-	foreach ( (array) $ghosts as $row ) {
-		if ( ! ct_scan_job_on_hold( $row, $now ) ) {
-			ct_scan_delete_job_records( $row, 'restored' );
+	$budget = null === $budget ? microtime( true ) + 3.0 : $budget;
+	// Candidates by numeric ids and creation time; the keyed scope MAC is compared in PHP, under the lock.
+	$ghosts = $wpdb->get_results( 'SELECT j.job_id, t.scope_mac FROM ' . $table . ' j INNER JOIN ' . $stones . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.created_at = j.created_at ORDER BY j.job_id ASC LIMIT 50' );
+	foreach ( (array) $ghosts as $ghost ) {
+		if ( microtime( true ) > $budget ) {
+			return;
+		}
+		if ( ! ct_scan_lock_acquire() ) {
+			return;
+		}
+		try {
+			$row = ct_scan_row( (int) $ghost->job_id );
+			if ( $row && hash_equals( (string) $ghost->scope_mac, ct_scan_tombstone_mac( $row->scope_hash ) ) && ! ct_scan_job_on_hold( $row, $now ) ) {
+				ct_scan_delete_job_records( $row, 'restored' );
+			}
+		} finally {
+			ct_scan_lock_release();
 		}
 	}
 	// A restored request post whose job row was not restored: matched in SQL on the opaque identity
 	// (never on recyclable numeric ids alone), and only where no job row currently uses that request or
-	// job id, so a live record can never be reached.
+	// job id, so a live record can never be reached. Re-checked under the lock before each deletion.
 	$postmeta = $wpdb->postmeta;
 	$restored = $wpdb->get_results(
-		'SELECT t.job_id, t.request_id FROM ' . $stones . ' t'
+		'SELECT t.job_id, t.request_id, t.identity FROM ' . $stones . ' t'
 		. ' INNER JOIN ' . $wpdb->posts . " p ON p.ID = t.request_id AND p.post_type = 'ct_promo_request'"
 		. ' INNER JOIN ' . $postmeta . " m ON m.post_id = t.request_id AND m.meta_key = '_ct_scan_identity' AND m.meta_value = t.identity"
 		. " WHERE t.identity IS NOT NULL AND t.identity <> ''"
@@ -1044,8 +1206,17 @@ function ct_scan_apply_tombstones( $now ) {
 		. ' ORDER BY t.tombstone_id DESC LIMIT 50'
 	);
 	foreach ( (array) $restored as $stone ) {
-		if ( (string) $stone->job_id === ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_job_id' ) ) {
-			wp_delete_post( (int) $stone->request_id, true );
+		if ( microtime( true ) > $budget || ! ct_scan_lock_acquire() ) {
+			return;
+		}
+		try {
+			$live = $wpdb->get_var( $wpdb->prepare( "SELECT job_id FROM {$table} WHERE request_id = %d OR job_id = %d LIMIT 1", (int) $stone->request_id, (int) $stone->job_id ) );
+			clean_post_cache( (int) $stone->request_id );
+			if ( ! $live && hash_equals( (string) $stone->identity, ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_identity' ) ) && (string) $stone->job_id === ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_job_id' ) ) {
+				wp_delete_post( (int) $stone->request_id, true );
+			}
+		} finally {
+			ct_scan_lock_release();
 		}
 	}
 }
@@ -1113,6 +1284,8 @@ function ct_scan_maintain() {
 	} finally {
 		ct_scan_lock_release();
 	}
+	// Retention runs after the queue lock is released (see ct_scan_retention_run()).
+	ct_scan_retention_run();
 	return true;
 }
 
@@ -1680,6 +1853,19 @@ function ct_scan_is_list( $value ) {
 }
 
 function ct_scan_claim( WP_REST_Request $request ) {
+	$response = ct_scan_claim_locked( $request );
+	// The worker polls this route every few seconds; retention piggybacks on it, outside the queue lock.
+	if ( $response instanceof WP_REST_Response && 200 === $response->get_status() ) {
+		try {
+			ct_scan_retention_run();
+		} catch ( Throwable $error ) {
+			unset( $error ); // retention must never affect a claim
+		}
+	}
+	return $response;
+}
+
+function ct_scan_claim_locked( WP_REST_Request $request ) {
 	$body = ct_scan_rest_authenticate( $request, '/ct-scan/v1/claim' );
 	if ( is_wp_error( $body ) ) {
 		return ct_scan_rest_error( (int) $body->get_error_data()['status'], $body->get_error_code() );
@@ -2082,6 +2268,10 @@ function ct_scan_result( WP_REST_Request $request ) {
 			return ct_scan_rest_error( 410, 'authorization_revoked_or_expired' );
 		}
 		if ( 'completed' === $data['outcome'] ) {
+			// A completed result is only credible if the guard admitted at least one request for this job.
+			if ( (int) $row->http_admitted < 1 ) {
+				return ct_scan_rest_error( 409, 'no_admission' );
+			}
 			$encoded_result = ct_scan_validate_result( $data['result'], $row );
 			if ( is_wp_error( $encoded_result ) ) {
 				return ct_scan_rest_error( 422, $encoded_result->get_error_code() );
