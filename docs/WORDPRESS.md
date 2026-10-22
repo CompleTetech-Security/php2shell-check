@@ -125,7 +125,7 @@ Enforcement in the supervisor and scanner:
   unexpected message or an oversized message ends the scan
   (`admission_protocol_violation`).
 - The supervisor kills the scanner when a request is not reported finished
-  within the ten-second bound plus one second of grace
+  within ten seconds of the grant, with no extra grace
   (`request_deadline_exceeded`).
 - While the scanner runs, the supervisor probes the job about every two seconds
   on a separate thread (so a slow store cannot delay the deadline or the kill),
@@ -173,9 +173,12 @@ the expected revision while old receipts are awaiting acknowledgement.
 ## Exact-target control
 
 Mailbox confirmation shows control of an email address, not of the website, and
-a referral code shows neither. Config `target_control_versions` (default empty)
-lists terms versions whose jobs must show control of the exact hostname before
-any scan can be claimed. Each job freezes that requirement when it is created.
+a referral code shows neither. **Every job must show control of the exact
+hostname before any scan can be claimed, unless its terms version was explicitly
+grandfathered**: the `strict` policy (the default for every version; see "Strict
+by default" above) requires it, and only an r2-or-earlier version listed as
+`legacy` in `terms_policy` is exempt. Each job freezes that requirement when it
+is created.
 For such a job, confirmation no longer queues it: it waits as
 `awaiting_control`, and the confirmation page shows a one-time challenge token
 (only its hash is stored) with two ways to publish it. The published challenge
@@ -220,11 +223,10 @@ truncated or malformed answer is an error, with no TCP or resolver fallback) and
 come from the container's first configured resolver; they grant no exemption from
 the connection-safety rules, which still apply to the HTTPS check. Control checks
 and the scan share the single worker loop; no check can start while a scan runs.
-The gate is opt-in per terms version. An operator who enables the worker API
-for a terms version that is not listed in `target_control_versions` gets no
-control requirement for new jobs of that version (a job created earlier keeps
-the requirement it was created with); a profile broader than the r2 header
-screening always requires it. Decide this before activating a new terms version.
+The gate is on by default and cannot be dropped by omission: the integration
+refuses to enable unless the served terms version has an explicit `terms_policy`
+entry, a new version is strict whatever the configuration says, and a profile
+broader than the r2 header screening always requires control.
 One piece of target traffic runs at a time worker-wide: a scan claim is refused
 while a check is in progress and the reverse, enforced in WordPress. If every
 check is spent but the last result was lost, maintenance blocks the job.
@@ -248,19 +250,33 @@ carried. The site recorder writes these post meta keys:
 | `_ct_summary_text` | the Target Summary as displayed, `Label: value` lines (at most 8 KiB) |
 | `_ct_summary_sha256`, `_ct_summary_shown_digest` | its digest, and the digest the form carried |
 
-The Summary must be exactly the canonical four lines of the authorized request
-(LF terminated, in this order, nothing before, between or after):
-`Website (scan scope): <target>`, `Client contact: <name>`,
-`Client email: <email>`, `Profile: <the job's profile>`. Any missing,
-oversized, mismatched, stale, non-canonical or partial piece refuses the job
-(`ct_scan_binding_mismatch` / `ct_scan_binding_required`), and the job row
-stores the summary digest, so a later edit of the retained evidence makes the
-authorization no longer live and cancels a queued or running job. Config
-`bound_terms_versions` (default empty) lists terms versions whose acceptance
-**must** be bound; each job freezes that requirement and its profile when it is
-created, so a later configuration change neither cancels a running
-authorization nor relaxes one. Unbound pieces without the marker are always
-refused. Nothing in the plugin fetches mutable page HTML.
+The Summary must be exactly the canonical text from `ct_scan_target_summary()`
+(LF terminated, in this order, nothing before, between or after): the website,
+`Client contact`, `Client email`, `Profile`, a `Limits` line (this website only,
+HTTP 80 / HTTPS 443, at most N requests, one at a time, at most one per second,
+10 seconds each, from the profile's code-defined limits) and an `Authorization`
+line (60 days after acceptance, never after the published window end, or when
+the request closes). The form, the site recorder and this plugin render
+byte-identical text from that one function, so the limits the signer saw are the
+limits the job runs under. Any missing, oversized, mismatched, stale,
+non-canonical or partial piece refuses the job (`ct_scan_binding_mismatch` /
+`ct_scan_binding_required`), and the job row stores the summary digest, so a
+later edit of the retained evidence makes the authorization no longer live and
+cancels a queued or running job. A change of the profile's limits changes the
+text and therefore requires a new acceptance.
+
+**Strict by default.** Every terms version requires bound evidence (and, with the
+target-control gate, proof of control of the exact target) unless the operator
+explicitly grandfathers it: config `terms_policy` is
+`array( '<version>' => 'strict' | 'legacy' )`. `legacy` is honoured only for an
+r2-or-earlier version (`YYYY-MM-DD-rN` up to `2026-10-21-r2`); a newer or
+unparseable version listed as `legacy` is still strict. **The integration refuses
+to enable (the whole worker API answers 503) unless `supported_terms_version` has
+an entry in `terms_policy`**, so bumping the served version cannot silently drop
+the requirement; each job freezes its requirement and profile when it is created,
+so a later configuration change neither cancels a running authorization nor
+relaxes one. Unbound pieces without the marker are always refused. Nothing in the
+plugin fetches mutable page HTML.
 
 With config `send_accepted_copy` true (default false), a successful mailbox
 confirmation sends the verified contact their copy: the Target Summary, the
@@ -273,6 +289,22 @@ never to a referrer. An uncertain or failed hand-off is recorded as `unknown`
 and never resent automatically; `accepted` means transport acceptance, not
 receipt. A failure cannot cancel, delay or repeat a scan. The wording of that
 message has not been reviewed by the owner.
+## Egress (activation requirement)
+
+The admission guard, the unprivileged UID and the resource limits are
+cooperative controls: a scanner that is compromised and ignores the protocol can
+open its own sockets, and the supervisor can only kill it after the fact. **The
+integration therefore refuses to enable itself** (`ct_scan_enabled()` is false,
+the whole worker API answers 503) unless the protected configuration contains
+`'egress_enforced' => true`. Set that only after enforcing, outside the
+container's control, that the worker may reach only: one DNS resolver you
+control, TCP 80 and 443 to public addresses, and nothing in private, link-local,
+CGNAT, documentation, multicast, cloud-metadata or non-global IPv6 ranges.
+`deployment/compose.yaml` does **not** do this. `deployment/egress-filter.nft.example`
+sketches the intended host policy; it is an unverified example, not a claim that
+the repository enforces anything. The destination check inside the worker lists
+those ranges itself (it does not depend on the Python version's `ipaddress`
+properties), but that is a second layer, not the boundary.
 
 ## Repository and site ownership
 
@@ -396,10 +428,16 @@ The default configuration is disabled, and no historical request sweep exists.
    then start with the same command prefix and `up -d`. The API origin is fixed
    to `https://complete.tech`; changing sites requires a reviewed code change.
    Check for subnet conflicts before using the default worker subnet.
-5. Apply the reviewed site patch/terms update, then set `enabled` true. The
-   runner must authenticate successfully before accepting live submissions.
-   A matching revision and key are required; mismatches fail closed.
+5. Enforce egress (see "Egress"), then set `egress_enforced` true. Apply the
+   reviewed site patch/terms update, then set `enabled` true. The runner must
+   authenticate successfully before accepting live submissions. A matching
+   revision and key and `egress_enforced` are required; otherwise the
+   integration stays disabled.
 
+Take a database backup first: the upgrade changes the jobs table in place. If it
+cannot complete, the failure is written to the PHP error log once, the worker
+API stays refused, and the upgrade is not retried for five minutes (so a broken
+table cannot make every public request re-run it).
 Schema 3 adds `profile_id`, `http_admitted` and `last_admit_ms` to the jobs
 table (existing rows default to `r2-header-v1` with empty counters); schema 4
 adds `summary_sha256`, `accepted_copy_status` and `accepted_copy_at`. Upgrades

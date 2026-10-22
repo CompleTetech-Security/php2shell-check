@@ -10,13 +10,14 @@ if ('setup' === $mode) {
     file_put_contents($private . '/.htaccess', "Require all denied\n");
     file_put_contents($private . '/config.php', '<?php return ' . var_export(array(
         'enabled' => true,
+        'egress_enforced' => true, // disposable fixture: no network beyond the test network
+        // `setup control` runs the strict policy: bound evidence and proof of control of the exact target.
+        'terms_policy' => array('2026-10-21-r2' => ($argv[2] ?? '') === 'control' ? 'strict' : 'legacy'),
         'worker_hmac_secret' => str_repeat('fixture-', 8),
         'expected_checker_revision' => str_repeat('a', 40),
         'authorization_end_at' => gmdate('Y-m-d\TH:i:s\Z', time() + 86400 * 30),
         'global_daily_limit' => 1000,
         'target_daily_limit' => 10,
-        // `setup control`: the terms version requires proof of control of the exact target.
-        'target_control_versions' => ($argv[2] ?? '') === 'control' ? array('2026-10-21-r2') : array(),
     ), true) . ';');
     chmod($private . '/config.php', 0600);
     foreach (array($private, $private . '/config.php', $private . '/.htaccess') as $path) {
@@ -35,8 +36,19 @@ if ('setup' === $mode) {
     $id = wp_insert_post(array('post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'HTTP fixture', 'post_content' => $contract));
     foreach (array('target', 'email', 'name') as $key) { update_post_meta($id, '_ct_scan_' . $key, $fields[$key]); }
     update_post_meta($id, '_ct_ref', 'direct');
-    foreach (array('saved' => '1', 'version' => '2026-10-21-r2', 'url' => 'http://wordpress/terms/', 'sha256' => hash('sha256', $contract), 'accepted_at' => gmdate('Y-m-d\TH:i:s\Z'), 'contract' => $contract, 'ip' => '192.0.2.1', 'remote_addr' => '192.0.2.1', 'user_agent' => 'Local HTTP fixture') as $key => $value) {
+    $strict = ($argv[2] ?? '') === 'control';
+    $snapshot = "<p>Fixture terms, exact bytes.</p>\n";
+    foreach (array('saved' => '1', 'version' => '2026-10-21-r2', 'url' => 'http://wordpress/terms/', 'sha256' => hash('sha256', $strict ? $snapshot : $contract), 'accepted_at' => gmdate('Y-m-d\TH:i:s\Z'), 'contract' => $contract, 'ip' => '192.0.2.1', 'remote_addr' => '192.0.2.1', 'user_agent' => 'Local HTTP fixture') as $key => $value) {
         update_post_meta($id, '_ct_terms_' . $key, wp_slash($value));
+    }
+    if ($strict) {
+        // Strict policy: the acceptance is bound to the exact terms and Target Summary the signer was shown.
+        $summary = ct_scan_target_summary($fields['target'], $fields['name'], $fields['email']);
+        foreach (array('binding' => '1', 'snapshot' => $snapshot) as $key => $value) { update_post_meta($id, '_ct_terms_' . $key, wp_slash($value)); }
+        update_post_meta($id, '_ct_terms_shown_digest', hash('sha256', $snapshot));
+        update_post_meta($id, '_ct_summary_text', wp_slash($summary));
+        update_post_meta($id, '_ct_summary_sha256', hash('sha256', $summary));
+        update_post_meta($id, '_ct_summary_shown_digest', hash('sha256', $summary));
     }
     $token = '';
     add_filter('pre_wp_mail', static function ($return, $mail) use (&$token) {

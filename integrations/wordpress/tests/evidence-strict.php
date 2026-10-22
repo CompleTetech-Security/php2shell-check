@@ -1,6 +1,6 @@
 <?php
 /**
- * Run with CT_TEST_BOUND=1 and CT_TEST_COPY=1 (see evidence.php): the terms version requires bound
+ * Run with CT_TEST_POLICY=strict and CT_TEST_COPY=1 (see evidence.php): the terms version requires bound
  * evidence, and the verified contact receives an accepted copy.
  */
 require __DIR__ . '/support.php';

@@ -82,6 +82,10 @@ $run = array(
 	'id' => $claimed['id'], 'lease' => $claimed['lease'], 'scope_hash' => $claimed['scope_hash'], 'outcome' => 'completed',
 	'result' => ct_test_result( $fields['target'] ), 'error' => '', 'checker_revision' => str_repeat( 'a', 40 ),
 );
+// A completed result is not credible unless the guard admitted at least one request for the job.
+$unadmitted = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', $run );
+ct_test_assert( 409 === $unadmitted->get_status() && 'no_admission' === $unadmitted->get_data()['error'] && 'running' === ct_scan_row( $claimed['id'] )->status, 'A completed result was accepted for a job that never had a request admitted.' );
+ct_test_assert( 200 === ct_test_rest_call( 'ct_scan_admit', '/ct-scan/v1/admit', array( 'id' => $claimed['id'], 'lease' => $claimed['lease'], 'scope_hash' => $claimed['scope_hash'], 'kind' => 'http' ) )->get_status(), 'Fixture admission was refused.' );
 $result = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', $run );
 ct_test_assert( 200 === $result->get_status() && true === $result->get_data()['ok'], 'Valid checker receipt was not acknowledged.' );
 $retry = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', $run );

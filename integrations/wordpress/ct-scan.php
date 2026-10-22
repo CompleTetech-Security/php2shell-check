@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CompleteTech Authorized PHP2Shell Scan Queue
  * Description: Confirmation-gated, one-target PHP2Shell screening queue for Promo Requests.
- * Version: 0.1.0
+ * Version: 0.2.0
  *
  * This MU plugin stores authorization and job state locally. It never starts a
  * scanner process. The external worker talks to the signed REST routes below.
@@ -80,13 +80,17 @@ function ct_scan_config() {
 		'global_daily_limit'       => 20,
 		'target_daily_limit'       => 1,
 		'job_retention_days'       => 365,
-		// Terms versions whose acceptance MUST carry a bound snapshot and Target Summary.
-		'bound_terms_versions'     => array(),
 		// Email the verified contact their accepted copy after confirmation (off by default).
 		'send_accepted_copy'       => false,
-		// Terms versions whose jobs must prove control of the exact target (DNS TXT, HTTPS file,
-		// or a recorded manual authority review) before any scan can be claimed.
-		'target_control_versions'  => array(),
+		// An explicit decision for every terms version the integration serves: array( '<version>' => 'strict' | 'legacy' ).
+		// `strict` (also what an unlisted version gets) requires bound evidence and proof of control of the
+		// exact target. `legacy` grandfathers an r2-or-earlier acceptance flow and is honoured ONLY for those versions.
+		// The integration refuses to enable unless supported_terms_version has an entry here.
+		'terms_policy'             => array(),
+		// The admission guard is advisory to a scanner that ignores it; only enforced network egress
+		// (allow the customer's HTTP/HTTPS, deny private/metadata ranges) makes it a boundary. The
+		// operator must state, deliberately, that this exists. See docs/WORDPRESS.md "Egress".
+		'egress_enforced'          => false,
 	);
 
 	$path = defined( 'CT_SCAN_PRIVATE_CONFIG' )
@@ -108,12 +112,67 @@ function ct_scan_config() {
 	$config['enabled'] = true === $config['enabled']
 		&& is_string( $config['worker_hmac_secret'] )
 		&& strlen( $config['worker_hmac_secret'] ) >= 32
+		&& true === $config['egress_enforced']
+		&& ct_scan_policy_declared( $config )
 		&& is_string( $config['expected_checker_revision'] )
 		&& 1 === preg_match( '/\A[a-f0-9]{40}\z/i', $config['expected_checker_revision'] )
 		&& is_string( $config['supported_terms_version'] )
 		&& '' !== $config['supported_terms_version'];
 
 	return $config;
+}
+
+/**
+ * r2 and earlier acceptances (versions `YYYY-MM-DD-rN` up to `2026-10-21-r2`) are the only ones that may be
+ * grandfathered. A version that cannot be parsed is NOT legacy.
+ */
+function ct_scan_is_legacy_version( $version ) {
+	if ( ! is_string( $version ) || ! preg_match( '/\A(\d{4}-\d{2}-\d{2})-r(\d{1,3})\z/', $version, $m ) ) {
+		return false;
+	}
+	return $m[1] < '2026-10-21' || ( '2026-10-21' === $m[1] && (int) $m[2] <= 2 );
+}
+
+/**
+ * The requirement a terms version carries. STRICT is the default for every version: bound evidence (and,
+ * where the control gate exists, proof of control of the exact target). `legacy` is honoured only when the
+ * operator listed that exact version AND it is an r2-or-earlier version, so a new version can never inherit
+ * the grandfathered flow by omission or by configuration.
+ */
+function ct_scan_terms_policy( $version ) {
+	$config = ct_scan_config();
+	$policy = is_array( $config['terms_policy'] ) && is_string( $version ) && isset( $config['terms_policy'][ $version ] ) ? $config['terms_policy'][ $version ] : '';
+	return ( 'legacy' === $policy && ct_scan_is_legacy_version( $version ) ) ? 'legacy' : 'strict';
+}
+
+/** The integration serves one terms version; its policy must be an explicit, valid decision. */
+function ct_scan_policy_declared( $config ) {
+	$version = $config['supported_terms_version'];
+	if ( ! is_string( $version ) || '' === $version || ! is_array( $config['terms_policy'] ) || ! isset( $config['terms_policy'][ $version ] ) ) {
+		return false;
+	}
+	$policy = $config['terms_policy'][ $version ];
+	return 'strict' === $policy || ( 'legacy' === $policy && ct_scan_is_legacy_version( $version ) );
+}
+
+/**
+ * The canonical Target Summary a signer is shown and signs: the exact website, the client, the profile,
+ * the limits of that profile and the authorization period. Deterministic from the request fields and the
+ * profile's code-defined limits, so the form, the recorder and this plugin render byte-identical text.
+ * Returns '' for an unknown profile.
+ */
+function ct_scan_target_summary( $target, $name, $email, $profile = null ) {
+	$profile = null === $profile ? ct_scan_current_profile() : $profile;
+	$limits  = ct_scan_profile_limits( $profile );
+	if ( ! $limits || ! is_string( $target ) || ! is_string( $name ) || ! is_string( $email ) ) {
+		return '';
+	}
+	return 'Website (scan scope): ' . $target . "\n"
+		. 'Client contact: ' . $name . "\n"
+		. 'Client email: ' . $email . "\n"
+		. 'Profile: ' . $profile . "\n"
+		. 'Limits: this website only (HTTP 80 / HTTPS 443); at most ' . (int) $limits['http_requests'] . ' requests, one at a time, at most one per second, ' . (int) ( $limits['timeout_ms'] / 1000 ) . " seconds each\n"
+		. "Authorization: expires 60 days after acceptance (never after the published window end), or when the request closes\n";
 }
 
 function ct_scan_enabled() {
@@ -135,6 +194,10 @@ function ct_scan_nonces_table() {
 function ct_scan_maybe_install_schema() {
 	$previous = get_option( 'ct_scan_schema_version' );
 	if ( $previous === CT_SCAN_SCHEMA_VERSION ) {
+		return;
+	}
+	// A failed upgrade must not re-run dbDelta on every public request: back off for five minutes.
+	if ( get_transient( 'ct_scan_schema_backoff' ) ) {
 		return;
 	}
 	global $wpdb;
@@ -222,9 +285,13 @@ function ct_scan_maybe_install_schema() {
 	foreach ( $required as $table => $columns ) {
 		$found = $wpdb->get_col( "SHOW COLUMNS FROM {$table}", 0 );
 		if ( ! is_array( $found ) || array_diff( $columns, $found ) ) {
+			// Loud once per back-off window, and bounded. The worker API stays refused (fail closed).
+			error_log( 'ct-scan: database upgrade to schema ' . CT_SCAN_SCHEMA_VERSION . ' is incomplete for ' . $table . '; the worker API stays refused. Retrying in 5 minutes. Restore from backup or repair the table.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			set_transient( 'ct_scan_schema_backoff', '1', 5 * MINUTE_IN_SECONDS );
 			return;
 		}
 	}
+	delete_transient( 'ct_scan_schema_backoff' );
 	if ( is_string( $previous ) && '' !== $previous && version_compare( $previous, '3', '<' ) ) {
 		// A job that started before request counting existed has no record of what it already
 		// sent: it gets no fresh budget, so its remaining admissions are refused.
@@ -328,8 +395,8 @@ function ct_scan_meta_string( $post_id, $key ) {
  *   _ct_summary_shown_digest the digest the form carried for the summary
  *
  * Any partial or mismatched set refuses the job (and cancels a queued or running one via
- * ct_scan_authorization_is_live). Versions listed in config `bound_terms_versions` must be bound.
- * An unbound legacy acceptance is accepted only for versions that are not listed.
+ * ct_scan_authorization_is_live). Every version must be bound (the `strict` policy, which is the default)
+ * unless the operator grandfathered an r2-or-earlier version as `legacy` in config `terms_policy`.
  */
 function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $required, $profile ) {
 	$marker  = ct_scan_meta_string( $request_id, '_ct_terms_binding' );
@@ -363,13 +430,11 @@ function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $req
 			}
 		}
 	}
-	// The Target Summary must be exactly the canonical text of the authorized request: nothing
-	// before, between or after the four lines, so no decoy or appended instruction can ride along.
-	$expected = 'Website (scan scope): ' . $identity['target'] . "\n"
-		. 'Client contact: ' . $identity['name'] . "\n"
-		. 'Client email: ' . $identity['email'] . "\n"
-		. 'Profile: ' . $profile . "\n";
-	if ( ! hash_equals( $expected, $summary ) ) {
+	// The Target Summary must be exactly the canonical text of the authorized request (website, client,
+	// profile, limits, authorization period): nothing before, between or after, so no decoy or appended
+	// instruction can ride along, and the limits the signer saw are the limits the job runs under.
+	$expected = ct_scan_target_summary( $identity['target'], $identity['name'], $identity['email'], $profile );
+	if ( '' === $expected || ! hash_equals( $expected, $summary ) ) {
 		return new WP_Error( 'ct_scan_binding_mismatch', 'The retained Target Summary is not the canonical summary of the authorized request.' );
 	}
 	return array( 'bound' => true, 'summary_sha256' => $summary_hash, 'required' => (bool) $required );
@@ -377,6 +442,8 @@ function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $req
 
 /** Check the saved request and acceptance snapshot before any job is created. */
 function ct_scan_validate_saved_request( $request_id, $fields, $require_current_terms = true, $frozen_expiry = '', $frozen = null ) {
+	// Authorization is judged on what the database holds now, never on an object-cache copy.
+	clean_post_cache( (int) $request_id );
 	$config = ct_scan_config();
 	$post   = get_post( $request_id );
 	if ( ! $post || 'ct_promo_request' !== $post->post_type || 'private' !== $post->post_status ) {
@@ -444,7 +511,7 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 	}
 	// A job's evidence requirement and profile are frozen when it is created, so a later
 	// configuration change can neither relax nor tighten an authorization already given.
-	$bound_required = is_array( $frozen ) ? (bool) $frozen['bound_required'] : in_array( $terms_version, (array) $config['bound_terms_versions'], true );
+	$bound_required = is_array( $frozen ) ? (bool) $frozen['bound_required'] : 'strict' === ct_scan_terms_policy( $terms_version );
 	$profile        = is_array( $frozen ) ? (string) $frozen['profile'] : ct_scan_current_profile();
 	$bound = ct_scan_check_bound_evidence( $request_id, $terms_hash, array( 'target' => $target, 'email' => $email, 'name' => $name ), $bound_required, $profile );
 	if ( is_wp_error( $bound ) ) {
@@ -593,9 +660,10 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 				'profile_id'               => ct_scan_current_profile(),
 				'summary_sha256'           => $accepted['summary_sha256'],
 				'bound_required'           => $accepted['bound_required'] ? 1 : 0,
-				// Frozen at creation: a later configuration change cannot relax an existing job.
+				// Frozen at creation: a later configuration change cannot relax an existing job. Every version is strict
+				// (requires control of the exact target) unless an r2-or-earlier version was explicitly grandfathered.
 				// A profile broader than the r2 header screening can never run without target control.
-				'control_required'         => ( in_array( $accepted['terms_version'], (array) $config['target_control_versions'], true ) || 'r2-header-v1' !== ct_scan_current_profile() ) ? 1 : 0,
+				'control_required'         => ( 'strict' === ct_scan_terms_policy( $accepted['terms_version'] ) || 'r2-header-v1' !== ct_scan_current_profile() ) ? 1 : 0,
 			),
 			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d' )
 		);
@@ -1749,6 +1817,10 @@ function ct_scan_result( WP_REST_Request $request ) {
 			return ct_scan_rest_error( 410, 'authorization_revoked_or_expired' );
 		}
 		if ( 'completed' === $data['outcome'] ) {
+			// A completed result is only credible if the guard admitted at least one request for this job.
+			if ( (int) $row->http_admitted < 1 ) {
+				return ct_scan_rest_error( 409, 'no_admission' );
+			}
 			$encoded_result = ct_scan_validate_result( $data['result'], $row );
 			if ( is_wp_error( $encoded_result ) ) {
 				return ct_scan_rest_error( 422, $encoded_result->get_error_code() );

@@ -4,8 +4,8 @@
  * outcome, and the report/admission gates. Disposable fixture only. Re-runs itself with the terms
  * version listed as requiring target control.
  */
-if ( '1' !== getenv( 'CT_TEST_CONTROL' ) ) {
-	$env  = array_merge( getenv(), array( 'CT_TEST_CONTROL' => '1' ) );
+if ( 'strict' !== getenv( 'CT_TEST_POLICY' ) ) {
+	$env  = array_merge( getenv(), array( 'CT_TEST_POLICY' => 'strict' ) );
 	$proc = proc_open( array( PHP_BINARY, __FILE__ ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $pipes, null, $env );
 	echo stream_get_contents( $pipes[1] ), stream_get_contents( $pipes[2] );
 	exit( proc_close( $proc ) );
@@ -29,6 +29,7 @@ function ct_test_control_job( $host ) {
 	$wpdb->query( "UPDATE " . ct_scan_jobs_table() . " SET status = 'cancelled', error_code = 'test_cleanup', control_state = 'none' WHERE status = 'awaiting_control' AND control_state IN ('requested','checking')" );
 	list( $request_id, $fields ) = ct_test_request( $host );
 	$request_ids[] = $request_id;
+	ct_test_bind( $request_id, $fields ); // strict policy: bound evidence and control are both required
 	$before = count( $mail );
 	$event  = ct_scan_on_request_ready( $request_id, $fields );
 	ct_test_assert( is_array( $event ), 'Control fixture job was not created.' );
@@ -88,6 +89,7 @@ ct_test_assert( 410 === ct_test_rest_call( 'ct_scan_start', '/ct-scan/v1/start',
 // A legacy job (control not required) is unchanged: confirmation queues it.
 list( $legacy_id, $legacy_fields ) = ct_test_request( 'control-legacy.example.net' );
 $request_ids[] = $legacy_id;
+ct_test_bind( $legacy_id, $legacy_fields );
 $before = count( $mail );
 $legacy = ct_scan_on_request_ready( $legacy_id, $legacy_fields );
 $wpdb->update( $jobs, array( 'control_required' => 0 ), array( 'job_id' => $legacy['job_id'] ) );
@@ -301,6 +303,7 @@ ct_scan_request_control_check( $m1['job_id'], $m1['page'], 'dns_txt' );
 $task_m = ct_test_control_claim();
 list( $q_id, $q_fields ) = ct_test_request( 'control-m2.example.net' );
 $request_ids[] = $q_id;
+ct_test_bind( $q_id, $q_fields );
 $q_event = ct_scan_on_request_ready( $q_id, $q_fields );
 $wpdb->update( $jobs, array( 'control_required' => 0 ), array( 'job_id' => $q_event['job_id'] ) );
 ct_test_queue_job( $q_event['job_id'] );
