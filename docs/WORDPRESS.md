@@ -460,8 +460,17 @@ The default configuration is disabled, and no historical request sweep exists.
 5. Enforce egress (see "Egress"), then set `egress_enforced` true. Apply the
    reviewed site patch/terms update, then set `enabled` true. The runner must
    authenticate successfully before accepting live submissions. A matching
-   revision and key and `egress_enforced` are required; otherwise the
-   integration stays disabled.
+   revision and key, `egress_enforced`, and an explicit `terms_policy` entry
+   (`strict` or `legacy`, see "Bound acceptance evidence") for the served
+   `supported_terms_version` are required; otherwise the integration stays
+   disabled.
+
+**Upgrading an existing deployment:** add the `terms_policy` entry for the
+served terms version before (or together with) installing this plugin
+version. Without it the integration is disabled: the whole worker API answers
+503, new acceptances are not queued, and in-flight (queued, leased or running)
+jobs stall (they are not claimed, admitted or finished) until the entry is
+added or their authorization expires.
 
 Take a database backup first: the upgrade changes the jobs table in place. If it
 cannot complete, the failure is written to the PHP error log once, the worker

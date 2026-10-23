@@ -2344,7 +2344,8 @@ function ct_scan_admin_send_report( $job_id ) {
 		if ( ! is_email( $row->contact_email )
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_scan_email' ) !== $row->contact_email
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_version' ) !== $row->terms_version
-			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) !== $row->terms_hash ) {
+			// The job stores the recorded terms hash lowercased (as the accepted-copy path compares it).
+			|| strtolower( ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) ) !== $row->terms_hash ) {
 			return new WP_Error( 'report_contact_changed', 'The original authorized report contact could not be verified.' );
 		}
 		$body = ct_scan_build_report_body( $row );

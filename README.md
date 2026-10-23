@@ -108,7 +108,9 @@ shared development instructions; [CLAUDE.md](CLAUDE.md) points Claude to them.
 - [WordPress free-scan integration](docs/WORDPRESS.md): signed requests, confirmation,
   private job queue, restricted worker, deployment and recovery. **Activation
   requires enforced network egress** (`egress_enforced`); the repository's
-  Compose file does not provide it.
+  Compose file does not provide it. It also requires an explicit `terms_policy`
+  entry for the served terms version; without one the integration stays
+  disabled (503) and in-flight jobs stall.
 - [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)
 
 ```sh
