@@ -571,7 +571,11 @@ queue page):
   makes at most 50 deletion attempts in total, shared by the evidence step and
   the tombstone clean-up. A job judged doubtful is looked at again at most daily
   (`retention_checked_at`), so doubtful rows cannot hide due ones, and the queue
-  lock is held briefly.
+  lock is held briefly. A job that has no opaque identity yet (created before it
+  existed and not yet reached by the backfill, which handles 100 jobs per run) is
+  kept until it has one. A single implausible far-future timestamp on any job
+  (later than now, before 2200) halts every deletion until it is corrected; this
+  is logged once, not on every run.
 - **Narrow preservation hold** (admin queue): one job, a stated purpose of 20 to
   190 characters, a mandatory expiry of at most 730 days, recorded with who set
   it and when (and who released it). While it stands nothing about that job is
@@ -579,7 +583,13 @@ queue page):
   the job stays preserved for a further three days. Releasing ends the hold at
   that moment (an already expired hold keeps its own end). The stated purpose is
   kept, and who released it and when are recorded. A damaged hold (purpose
-  without an expiry) preserves rather than deletes.
+  without an expiry) preserves rather than deletes. A hold that still protects
+  the job (unexpired or in its grace period) and has not been released is never
+  replaced: a second "place hold" (a stale tab, another administrator, a direct
+  POST) is refused and changes nothing, so it can neither shorten the hold nor
+  erase its purpose and setter. To change a hold, release it first (the job stays
+  protected through the grace period), then place the new one; a new hold never
+  ends earlier than the released one.
 - **Retention runs outside the queue lock.** Only one retention run at a time
   (its own advisory lock, throttled to about once a minute on worker polls that
   hand out no job, so a lease is never delayed by it, and run again on the admin
@@ -600,13 +610,21 @@ queue page):
   reach a live record). A restored job row that holds a lease (a leased or
   running scan, or a control check in progress) is deleted again only after
   that bounded lease ends, so the one-at-a-time gate is never freed while its
-  traffic may be in flight. Jobs created before the identity existed are given one
+  traffic may be in flight. Restored rows that cannot be acted on (held, leased,
+  or whose deletion failed in the last day) are skipped in the query and the
+  candidates are paged, so they cannot hide later restored rows. Jobs created before the identity existed are given one
   (adopting what their request already carries) by the next maintenance run. Tombstones are kept 120 days, longer than the 90-day backup
-  rotation, then purged.
+  rotation, then purged. The scope MAC is keyed with `wp_salt( 'secure_auth' )`:
+  rotating that salt (or `SECURE_AUTH_KEY`/`SECURE_AUTH_SALT`) stops existing
+  tombstones from recognising restored job rows (restored request posts are still
+  matched by their opaque identity). Normal retention still deletes restored rows
+  when their own deletion date is due.
 - Deletion scrubs the contact fields first, then deletes the private request and
   the job row; if any step fails the record stays (and is retried) rather than
-  being half-deleted. A due job whose linked request carries another record's
-  identity is not touched at all.
+  being half-deleted. When its linked request exists, a due job is deleted only
+  if that request carries exactly the job's opaque identity; if the request has
+  another identity, or none, neither the request nor the job is touched (it is
+  re-examined daily and needs an administrator to repair the identity).
 
 Not covered here: backup rotation itself, the contract archive's historical Git
 objects and clones (issue 11), unsigned caller leads (there is no lead record in

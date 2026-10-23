@@ -1002,6 +1002,11 @@ function ct_scan_deletion_decision( $row, $now ) {
 	if ( ! in_array( $row->status, ct_scan_terminal_statuses(), true ) || ct_scan_job_on_hold( $row, $now ) ) {
 		return array( 'keep', null );
 	}
+	// A job without its opaque identity (not yet reached by the identity backfill) is kept until it has one:
+	// deleting it would leave a tombstone that cannot recognise its restored request.
+	if ( ! isset( $row->identity ) || ! is_string( $row->identity ) || '' === $row->identity ) {
+		return array( 'keep', null );
+	}
 	foreach ( array( $row->created_at, $row->closed_at, $row->retain_until ) as $date ) {
 		if ( ! ct_scan_valid_datetime( $date ) ) {
 			return array( 'keep', null );
@@ -1055,8 +1060,8 @@ function ct_scan_record_tombstone( $row, $reason ) {
  * and a tombstone exists.
  *
  * The request post is deleted only when it provably belongs to this job (post ids can be recycled after a
- * restore). For a retention deletion, a post that carries a different opaque identity than the job keeps
- * everything (nothing is deleted; retried later). For a restored job row recognised by its tombstone
+ * restore). For a retention deletion, a post that does not carry exactly the job's (non-empty) opaque
+ * identity keeps everything (nothing is deleted; retried later). For a restored job row recognised by its tombstone
  * ($tombstone_identity given), the post is deleted only if it carries exactly that identity; otherwise the
  * post is another record and is left alone while the restored row itself is deleted again.
  */
@@ -1070,7 +1075,9 @@ function ct_scan_delete_job_records( $row, $reason, $tombstone_identity = null )
 		$post_identity = ct_scan_meta_string( (int) $post->ID, '_ct_scan_identity' );
 		if ( null !== $tombstone_identity ) {
 			$ours = is_string( $tombstone_identity ) && '' !== $tombstone_identity && hash_equals( $tombstone_identity, $post_identity );
-		} elseif ( '' !== $post_identity && is_string( $row->identity ) && '' !== $row->identity && ! hash_equals( $row->identity, $post_identity ) ) {
+		} elseif ( ! is_string( $row->identity ) || '' === $row->identity || ! hash_equals( $row->identity, $post_identity ) ) {
+			// Only an exact, non-empty identity match proves the post is this job's (an empty or different
+			// identity may be a recycled id): keep everything and retry later.
 			return false;
 		}
 	}
@@ -1233,12 +1240,12 @@ function ct_scan_retention_steps( $now ) {
 	$recheck = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-1 day' )->format( 'Y-m-d H:i:s' );
 	// 1b. Jobs that predate the opaque identity get one (and so does their request) so a restored request
 	// can be recognised after deletion.
-	$anonymous = $wpdb->get_results( "SELECT job_id,request_id FROM {$table} WHERE identity IS NULL ORDER BY job_id ASC LIMIT 100" );
+	$anonymous = $wpdb->get_results( "SELECT job_id,request_id,identity FROM {$table} WHERE identity IS NULL OR identity = '' ORDER BY job_id ASC LIMIT 100" );
 	foreach ( (array) $anonymous as $row ) {
 		// Adopt an identity the request already carries; otherwise mint one for both.
 		$carried  = ct_scan_meta_string( (int) $row->request_id, '_ct_scan_identity' );
 		$identity = 1 === preg_match( '/\A[a-f0-9]{32}\z/', $carried ) ? $carried : bin2hex( random_bytes( 16 ) );
-		if ( 1 === $wpdb->update( $table, array( 'identity' => $identity ), array( 'job_id' => (int) $row->job_id, 'identity' => null ), array( '%s' ), array( '%d', '%s' ) ) && $identity !== $carried ) {
+		if ( 1 === $wpdb->update( $table, array( 'identity' => $identity ), array( 'job_id' => (int) $row->job_id, 'identity' => $row->identity ), array( '%s' ), array( '%d', '%s' ) ) && $identity !== $carried ) {
 			$post = get_post( (int) $row->request_id );
 			if ( $post && 'ct_promo_request' === $post->post_type ) {
 				update_post_meta( (int) $row->request_id, '_ct_scan_identity', $identity );
@@ -1274,7 +1281,7 @@ function ct_scan_retention_steps( $now ) {
 	// rules require), except under a hold. One budget of deletion attempts for the whole run (steps 4 and 5).
 	$deletions_left = ct_scan_retention_batch_limit();
 	$due = $wpdb->get_results( $wpdb->prepare(
-		"SELECT job_id FROM {$table} WHERE retain_until IS NOT NULL AND retain_until <= %s AND closed_at IS NOT NULL AND status IN ({$terminal}) AND (hold_reason IS NULL OR (hold_until >= '2020-01-01 00:00:00' AND hold_until <= %s)) AND (retention_checked_at IS NULL OR retention_checked_at < %s) ORDER BY retain_until ASC LIMIT 50",
+		"SELECT job_id FROM {$table} WHERE retain_until IS NOT NULL AND retain_until <= %s AND closed_at IS NOT NULL AND status IN ({$terminal}) AND identity IS NOT NULL AND identity <> '' AND (hold_reason IS NULL OR (hold_until >= '2020-01-01 00:00:00' AND hold_until <= %s)) AND (retention_checked_at IS NULL OR retention_checked_at < %s) ORDER BY retain_until ASC LIMIT 50",
 		$now,
 		$grace_edge,
 		$recheck
@@ -1317,26 +1324,55 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 		$deletions_left = ct_scan_retention_batch_limit();
 	}
 	// Candidates by numeric ids and creation time; the keyed scope MAC is compared in PHP, under the lock.
-	$ghosts = $wpdb->get_results( 'SELECT j.job_id, t.scope_mac, t.identity FROM ' . $table . ' j INNER JOIN ' . $stones . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.created_at = j.created_at ORDER BY j.job_id ASC LIMIT 50' );
-	foreach ( (array) $ghosts as $ghost ) {
-		if ( $deletions_left < 1 || microtime( true ) > $deadline ) {
-			return;
+	// Rows that cannot be acted on now are excluded in SQL (held or in grace, holding a lease, or whose
+	// deletion failed within the last day), and the candidates are paged by key, so rows that are skipped
+	// can never starve later restored rows.
+	$grace_edge = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
+	$recheck    = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-1 day' )->format( 'Y-m-d H:i:s' );
+	$after_job  = 0;
+	$after_stone = 0;
+	for ( $page = 0; $page < 20; $page++ ) {
+		$ghosts = $wpdb->get_results( $wpdb->prepare(
+			'SELECT j.job_id, t.tombstone_id, t.scope_mac, t.identity FROM ' . $table . ' j INNER JOIN ' . $stones . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.created_at = j.created_at'
+			. ' WHERE (j.job_id > %d OR (j.job_id = %d AND t.tombstone_id > %d))'
+			. " AND (j.hold_reason IS NULL OR (j.hold_until >= '2020-01-01 00:00:00' AND j.hold_until <= %s))"
+			. " AND j.status NOT IN ('leased','running') AND NOT (j.status = 'awaiting_control' AND COALESCE(j.control_state, '') = 'checking')"
+			. ' AND (j.retention_checked_at IS NULL OR j.retention_checked_at < %s)'
+			. ' ORDER BY j.job_id ASC, t.tombstone_id ASC LIMIT 50',
+			$after_job,
+			$after_job,
+			$after_stone,
+			$grace_edge,
+			$recheck
+		) );
+		if ( empty( $ghosts ) ) {
+			break;
 		}
-		if ( ! ct_scan_lock_acquire() ) {
-			return;
-		}
-		try {
-			$row = ct_scan_row( (int) $ghost->job_id );
-			// A restored row that holds a live lease (a scan, or a control check in progress) is left until the
-			// lease ends (bounded; maintenance reclaims it): deleting it would free the one-at-a-time gate while
-			// target traffic for it may still be in flight.
-			if ( $row && hash_equals( (string) $ghost->scope_mac, ct_scan_tombstone_mac( $row->scope_hash ) ) && ! ct_scan_job_on_hold( $row, $now ) && ! ct_scan_job_holds_lease( $row ) ) {
-				--$deletions_left;
-				// A failure leaves the row (and is retried next run); it never stops the other candidates.
-				ct_scan_delete_job_records( $row, 'restored', (string) $ghost->identity );
+		foreach ( (array) $ghosts as $ghost ) {
+			$after_job   = (int) $ghost->job_id;
+			$after_stone = (int) $ghost->tombstone_id;
+			if ( $deletions_left < 1 || microtime( true ) > $deadline ) {
+				return;
 			}
-		} finally {
-			ct_scan_lock_release();
+			if ( ! ct_scan_lock_acquire() ) {
+				return;
+			}
+			try {
+				$row = ct_scan_row( (int) $ghost->job_id );
+				// A restored row that holds a live lease (a scan, or a control check in progress) is left until the
+				// lease ends (bounded; maintenance reclaims it): deleting it would free the one-at-a-time gate while
+				// target traffic for it may still be in flight. Re-checked here under the lock.
+				if ( $row && hash_equals( (string) $ghost->scope_mac, ct_scan_tombstone_mac( $row->scope_hash ) ) && ! ct_scan_job_on_hold( $row, $now ) && ! ct_scan_job_holds_lease( $row ) ) {
+					--$deletions_left;
+					// A failure leaves the row (retried after a day, so it cannot take the budget of every run);
+					// it never stops the other candidates.
+					if ( ! ct_scan_delete_job_records( $row, 'restored', (string) $ghost->identity ) ) {
+						$wpdb->update( $table, array( 'retention_checked_at' => $now ), array( 'job_id' => (int) $row->job_id ), array( '%s' ), array( '%d' ) );
+					}
+				}
+			} finally {
+				ct_scan_lock_release();
+			}
 		}
 	}
 	// A restored request post whose job row was not restored: matched in SQL on the opaque identity
@@ -1372,6 +1408,14 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 	}
 }
 
+/**
+ * Place a preservation hold. A hold that still protects the job (unexpired, or inside its grace period) and
+ * has not been released is never replaced: a second "place hold" (a stale tab, two administrators, a direct
+ * POST) is refused with 'hold_active', so it can neither move the expiry earlier nor erase the stated purpose
+ * and who set it. To change a standing hold, release it first (the job stays protected through the grace
+ * period), then place the new one. A released hold in its grace period may be replaced, but never by a hold
+ * that ends earlier. The write is a compare-and-set on the hold values read under the queue lock.
+ */
 function ct_scan_admin_set_hold( $job_id, $reason, $days ) {
 	global $wpdb;
 	$user = wp_get_current_user();
@@ -1391,10 +1435,23 @@ function ct_scan_admin_set_hold( $job_id, $reason, $days ) {
 		if ( ! $row ) {
 			return new WP_Error( 'hold_unavailable', 'This job no longer exists.' );
 		}
-		$until   = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '+' . $days . ' days' )->format( 'Y-m-d H:i:s' );
-		$updated = $wpdb->update( ct_scan_jobs_table(), array( 'hold_reason' => $reason, 'hold_until' => $until, 'hold_set_by' => (int) $user->ID, 'hold_set_at' => ct_scan_utc_now(), 'hold_released_by' => null, 'hold_released_at' => null ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%s', '%d', '%s', '%d', '%s' ), array( '%d' ) );
+		$now   = ct_scan_utc_now();
+		$until = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '+' . $days . ' days' )->format( 'Y-m-d H:i:s' );
+		if ( ct_scan_job_on_hold( $row, $now ) && ( empty( $row->hold_released_at ) || ! ct_scan_valid_datetime( $row->hold_until ) || $row->hold_until > $until ) ) {
+			return new WP_Error( 'hold_active', 'This job already has a preservation hold; it was not changed. Release it first to place a different one.' );
+		}
+		$updated = $wpdb->update(
+			ct_scan_jobs_table(),
+			array( 'hold_reason' => $reason, 'hold_until' => $until, 'hold_set_by' => (int) $user->ID, 'hold_set_at' => $now, 'hold_released_by' => null, 'hold_released_at' => null ),
+			array( 'job_id' => (int) $row->job_id, 'hold_reason' => $row->hold_reason, 'hold_until' => $row->hold_until, 'hold_released_at' => $row->hold_released_at ),
+			array( '%s', '%s', '%d', '%s', '%d', '%s' ),
+			array( '%d', '%s', '%s', '%s' )
+		);
 		if ( false === $updated ) {
 			return new WP_Error( 'hold_write_failed', 'The hold could not be recorded.' );
+		}
+		if ( 1 !== $updated ) {
+			return new WP_Error( 'hold_changed', 'The hold changed while this request was handled; reload the queue and try again.' );
 		}
 	} finally {
 		ct_scan_lock_release();
@@ -3109,7 +3166,12 @@ function ct_scan_admin_page() {
 	echo '<div class="wrap"><h1>PHP2Shell screening queue</h1>';
 	echo '<p>Worker API: <strong>' . ( ct_scan_enabled() ? 'enabled' : 'disabled' ) . '</strong>. This page never displays the worker secret. The screening covers public passive evidence only; broader checks remain manual.</p>';
 	if ( isset( $_GET['ct_scan_notice'] ) && is_string( $_GET['ct_scan_notice'] ) ) {
-		echo '<div class="notice notice-info"><p>' . esc_html( sanitize_key( wp_unslash( $_GET['ct_scan_notice'] ) ) ) . '</p></div>';
+		$notice   = sanitize_key( wp_unslash( $_GET['ct_scan_notice'] ) );
+		$messages = array(
+			'hold_active'  => 'Not changed: this job already has a preservation hold. A second hold cannot replace or shorten it; release the existing hold first (the records stay protected through the grace period), then place the new one.',
+			'hold_changed' => 'Not changed: the hold was modified at the same time. Reload the queue and try again.',
+		);
+		echo '<div class="notice notice-info"><p>' . esc_html( $messages[ $notice ] ?? $notice ) . '</p></div>';
 	}
 	if ( empty( $rows ) ) {
 		echo '<p>No screening jobs are stored.</p></div>';

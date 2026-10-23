@@ -407,6 +407,90 @@ ct_scan_admin_set_hold( $reheld['job_id'], 'Second preservation purpose for this
 $rh = ct_scan_row( $reheld['job_id'] );
 ct_test_assert( null === $rh->hold_released_by && null === $rh->hold_released_at && 'Second preservation purpose for this job.' === $rh->hold_reason, 'A new hold kept the audit of an earlier release.' );
 
+// ---- Fourth review: a second hold never shortens or replaces a standing one; identities; tombstone paging ---------
+wp_set_current_user( 1 );
+$long_hold = ct_test_aged_job( 'ret-long-hold.example.net', 'failed', '-3 years -1 day', '-1 day' );
+ct_test_make_due( $long_hold );
+ct_test_assert( true === ct_scan_admin_set_hold( $long_hold['job_id'], 'Litigation hold for dispute number 2468.', 730 ), 'A 730-day hold was refused.' );
+$lh = ct_scan_row( $long_hold['job_id'] );
+$second_admin = wp_insert_user( array( 'user_login' => 'ct_ret_admin_' . wp_generate_password( 6, false ), 'user_pass' => wp_generate_password(), 'role' => 'administrator' ) );
+wp_set_current_user( (int) $second_admin );
+foreach ( array( 1, 729, 730 ) as $days ) {
+	$second = ct_scan_admin_set_hold( $long_hold['job_id'], 'A different, later purpose for this job.', $days );
+	$now_lh = ct_scan_row( $long_hold['job_id'] );
+	ct_test_assert( is_wp_error( $second ) && 'hold_active' === $second->get_error_code() && $lh->hold_until === $now_lh->hold_until && $lh->hold_reason === $now_lh->hold_reason && (int) $lh->hold_set_by === (int) $now_lh->hold_set_by && $lh->hold_set_at === $now_lh->hold_set_at, "A second hold ($days days) replaced or shortened a standing hold, or lost its purpose or setter." );
+}
+ct_test_maintain();
+ct_test_assert( ct_test_exists( $long_hold ) && get_post( $long_hold['request_id'] ), 'A due job lost its records after a refused second hold.' );
+// Inside the grace period of an expired (unreleased) hold, a new hold is refused too: the original purpose and setter stay.
+$wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-1 day' ) ), array( 'job_id' => $long_hold['job_id'] ) );
+$lh = ct_scan_row( $long_hold['job_id'] );
+$grace_try = ct_scan_admin_set_hold( $long_hold['job_id'], 'A different, later purpose for this job.', 30 );
+ct_test_assert( is_wp_error( $grace_try ) && 'hold_active' === $grace_try->get_error_code() && $lh->hold_until === ct_scan_row( $long_hold['job_id'] )->hold_until && $lh->hold_reason === ct_scan_row( $long_hold['job_id'] )->hold_reason, 'A hold in its grace period was replaced without being released.' );
+ct_test_maintain();
+ct_test_assert( ct_test_exists( $long_hold ), 'A job in its hold grace period was deleted.' );
+// Released (still in grace): a new hold may be placed, and it never ends earlier than the released one.
+ct_test_assert( true === ct_scan_admin_release_hold( $long_hold['job_id'] ) && $lh->hold_until === ct_scan_row( $long_hold['job_id'] )->hold_until, 'Releasing an expired hold changed its end.' );
+ct_test_assert( true === ct_scan_admin_set_hold( $long_hold['job_id'], 'A different, later purpose for this job.', 30 ), 'A new hold after a release was refused.' );
+$lh2 = ct_scan_row( $long_hold['job_id'] );
+ct_test_assert( 'A different, later purpose for this job.' === $lh2->hold_reason && (int) $second_admin === (int) $lh2->hold_set_by && $lh2->hold_until > ct_test_old( '+29 days' ) && null === $lh2->hold_released_at, 'A new hold after a release was not recorded with its own purpose and setter.' );
+// A damaged state (released, yet an expiry still in the future) is never shortened.
+$wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '+300 days' ), 'hold_released_at' => ct_test_old( '-1 hour' ), 'hold_released_by' => 1 ), array( 'job_id' => $long_hold['job_id'] ) );
+$lh3 = ct_scan_row( $long_hold['job_id'] );
+$short = ct_scan_admin_set_hold( $long_hold['job_id'], 'A shorter purpose that must not win.', 5 );
+ct_test_assert( is_wp_error( $short ) && $lh3->hold_until === ct_scan_row( $long_hold['job_id'] )->hold_until && $lh3->hold_reason === ct_scan_row( $long_hold['job_id'] )->hold_reason, 'A hold whose expiry is still in the future was shortened.' );
+wp_set_current_user( 1 );
+$wpdb->delete( $jobs, array( 'job_id' => $long_hold['job_id'] ) );
+
+// A due job without its opaque identity is kept until the backfill gives it one (never a tombstone without identity).
+$no_identity = (object) array( 'status' => 'failed', 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2024-02-20 12:00:00', 'created_at' => '2024-02-20 12:00:30', 'closed_at' => '2024-02-29 12:00:00', 'retain_until' => '2027-02-20 12:00:00', 'identity' => null );
+ct_test_assert( array( 'keep', null ) === ct_scan_deletion_decision( $no_identity, '2028-01-01 00:00:00' ), 'A job without an identity was judged deletable.' );
+$no_identity->identity = '';
+ct_test_assert( array( 'keep', null ) === ct_scan_deletion_decision( $no_identity, '2028-01-01 00:00:00' ), 'A job with an empty identity was judged deletable.' );
+unset( $no_identity->identity );
+ct_test_assert( array( 'keep', null ) === ct_scan_deletion_decision( $no_identity, '2028-01-01 00:00:00' ), 'A row read without its identity was judged deletable.' );
+$no_identity->identity = str_repeat( 'a', 32 );
+ct_test_assert( 'delete' === ct_scan_deletion_decision( $no_identity, '2028-01-01 00:00:00' )[0], 'Fixture expected the same job with an identity to be deletable.' );
+$empty_identity = ct_test_aged_job( 'ret-empty-identity.example.net', 'failed', '-3 years -1 day', '-1 day' );
+ct_test_make_due( $empty_identity );
+$wpdb->update( $jobs, array( 'identity' => '' ), array( 'job_id' => $empty_identity['job_id'] ) );
+delete_post_meta( $empty_identity['request_id'], '_ct_scan_identity' );
+ct_test_maintain();
+$ei_stone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $empty_identity['job_id'] ) );
+ct_test_assert( ! $ei_stone || 1 === preg_match( '/\A[a-f0-9]{32}\z/', (string) $ei_stone->identity ), 'A job was deleted with an empty identity in its tombstone.' );
+ct_test_assert( null === $wpdb->get_var( 'SELECT job_id FROM ' . ct_scan_tombstones_table() . " WHERE reason = 'retention' AND (identity IS NULL OR identity = '')" ), 'A retention tombstone without an identity exists.' );
+$wpdb->delete( $jobs, array( 'job_id' => $empty_identity['job_id'] ) );
+
+// A due job whose linked post has no identity (empty or missing) while the job has one is kept whole.
+foreach ( array( 'missing' => null, 'empty' => '' ) as $kind => $value ) {
+	$blank = ct_test_aged_job( "ret-blank-post-{$kind}.example.net", 'failed', '-3 years -1 day', '-1 day' );
+	ct_test_make_due( $blank );
+	if ( null === $value ) {
+		delete_post_meta( $blank['request_id'], '_ct_scan_identity' );
+	} else {
+		update_post_meta( $blank['request_id'], '_ct_scan_identity', $value );
+	}
+	ct_test_maintain();
+	$br = ct_scan_row( $blank['job_id'] );
+	ct_test_assert( $br && get_post( $blank['request_id'] ) && 'fixture@example.com' === $br->contact_email && null === $wpdb->get_var( $wpdb->prepare( 'SELECT job_id FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $blank['job_id'] ) ), "A job was (partly) deleted although its linked post's identity is {$kind}." );
+	$wpdb->delete( $jobs, array( 'job_id' => $blank['job_id'] ) );
+}
+
+// Restored rows that cannot be acted on (held, leased) never starve a later restored row in the tombstone loop.
+$restored_base = array( 'target_origin' => 'https://ret-starve.example.net/', 'scope_hash' => hash( 'sha256', 'https://ret-starve.example.net/' ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => ct_test_old( '-1 hour' ) );
+for ( $i = 0; $i < 56; $i++ ) {
+	$extra = 9 === $i % 10 ? array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => str_repeat( 'b', 64 ), 'lease_until' => ct_test_old( '+1 hour' ) ) : array( 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) );
+	$wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 888000100 + $i, 'request_id' => 889000100 + $i ), $extra ) );
+	$wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => 888000100 + $i, 'request_id' => 889000100 + $i, 'scope_mac' => ct_scan_tombstone_mac( $restored_base['scope_hash'] ), 'created_at' => $restored_base['created_at'], 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => bin2hex( random_bytes( 16 ) ) ) );
+}
+$wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 888000200, 'request_id' => 889000200 ) ) );
+$wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => 888000200, 'request_id' => 889000200, 'scope_mac' => ct_scan_tombstone_mac( $restored_base['scope_hash'] ), 'created_at' => $restored_base['created_at'], 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => bin2hex( random_bytes( 16 ) ) ) );
+ct_scan_retention_run( true );
+$starve_left = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$jobs} WHERE job_id BETWEEN 888000100 AND 888000155" );
+ct_test_assert( ! ct_scan_row( 888000200 ) && 56 === $starve_left, "Held or leased restored rows starved a later restored row, or were deleted ($starve_left of 56 kept)." );
+$wpdb->query( "DELETE FROM {$jobs} WHERE job_id BETWEEN 888000100 AND 888000200" );
+$wpdb->query( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE job_id BETWEEN 888000100 AND 888000200' );
+
 
 // ---- Second round: floors, clock, ordering, locks -----------------------------------------------------------------
 // Evidence retention for non-legacy versions can never be configured below six years; legacy never below three.
@@ -560,8 +644,8 @@ ct_test_maintain();
 ct_test_assert( ct_test_exists( $raise_future ) && ct_test_exists( $raise_legacy ) && $rf->retain_until === ct_scan_row( $raise_future['job_id'] )->retain_until && $rl->retain_until === ct_scan_row( $raise_legacy['job_id'] )->retain_until, 'An extended deletion date was shortened when the configuration went back.' );
 
 // Leap days: a period that starts on 29 February ends on 1 March, never on 28 February.
-$leap_r2  = (object) array( 'status' => 'failed', 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2024-02-29 12:00:00', 'created_at' => '2024-02-29 12:00:30', 'closed_at' => '2024-03-02 00:00:00', 'retain_until' => '2027-03-01 12:00:00' );
-$leap_new = (object) array( 'status' => 'failed', 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2027-06-01-r3', 'terms_accepted_at' => '2024-02-20 12:00:00', 'created_at' => '2024-02-20 12:00:30', 'closed_at' => '2024-02-29 12:00:00', 'retain_until' => '2030-03-01 12:00:00' );
+$leap_r2  = (object) array( 'status' => 'failed', 'identity' => str_repeat( 'a', 32 ), 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2024-02-29 12:00:00', 'created_at' => '2024-02-29 12:00:30', 'closed_at' => '2024-03-02 00:00:00', 'retain_until' => '2027-03-01 12:00:00' );
+$leap_new = (object) array( 'status' => 'failed', 'identity' => str_repeat( 'a', 32 ), 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2027-06-01-r3', 'terms_accepted_at' => '2024-02-20 12:00:00', 'created_at' => '2024-02-20 12:00:30', 'closed_at' => '2024-02-29 12:00:00', 'retain_until' => '2030-03-01 12:00:00' );
 ct_test_assert( '2027-03-01 12:00:00' === ct_scan_retain_until( $leap_r2 ) && '2027-03-01 12:00:00' === ct_scan_required_retain_until( $leap_r2 ) && '2030-03-01 12:00:00' === ct_scan_retain_until( $leap_new ), 'A period starting on 29 February does not end on 1 March.' );
 ct_test_assert( ! ct_scan_deletion_allowed( $leap_r2, '2027-02-28 23:59:59' ) && ct_scan_deletion_allowed( $leap_r2, '2027-03-01 12:00:00' ) && ! ct_scan_deletion_allowed( $leap_new, '2030-02-28 23:59:59' ) && ct_scan_deletion_allowed( $leap_new, '2030-03-01 12:00:00' ), 'A leap-day period allowed deletion early (or never).' );
 $leap_r2->retain_until = '2027-02-28 12:00:00';
