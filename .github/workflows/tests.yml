@@ -49,6 +49,8 @@ jobs:
         run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/integration.php
       - name: Test per-request admission, cancellation race and fail-closed behavior
         run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/admission.php
+      - name: Test bound acceptance evidence and the accepted copy
+        run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/evidence.php
       - name: Test Python to WordPress over HTTP with synthetic scan responses
         run: |
           fixture=$(docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/deployment/test-http-fixture.php setup)

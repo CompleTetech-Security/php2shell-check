@@ -175,6 +175,67 @@ Before upgrading the pinned revision or rotating the key, stop accepting new
 work, drain/reconcile existing receipts and stop the controller. Do not change
 the expected revision while old receipts are awaiting acknowledgement.
 
+## Bound acceptance evidence and the accepted copy
+
+A request is queued only if its saved acceptance reads back completely. A
+**bound** acceptance additionally retains the exact terms bytes the signer was
+shown and the exact Target Summary, each next to the digest the signer's form
+carried. The site recorder writes these post meta keys:
+
+| Key | Meaning |
+|---|---|
+| `_ct_terms_binding` | `1` marks the acceptance as bound |
+| `_ct_terms_snapshot` | the terms bytes as displayed (at most 512 KiB) |
+| `_ct_terms_sha256` | SHA-256 of those bytes |
+| `_ct_terms_shown_digest` | the digest the rendered form carried; must equal the hash |
+| `_ct_summary_text` | the Target Summary as displayed, `Label: value` lines (at most 8 KiB) |
+| `_ct_summary_sha256`, `_ct_summary_shown_digest` | its digest, and the digest the form carried |
+
+The Summary must be exactly the canonical text from `ct_scan_target_summary()`
+(LF terminated, in this order, nothing before, between or after): the website,
+`Client contact`, `Client email`, `Profile`, a `Limits` line (this website only,
+HTTP 80 / HTTPS 443, at most N requests, one at a time, at most one per second,
+10 seconds each, from the profile's code-defined limits) and an `Authorization`
+line (60 days after acceptance, never after the published window end, or when
+the request closes). The form, the site recorder and this plugin render
+byte-identical text from that one function, so the limits the signer saw are the
+limits the job runs under. Any missing, oversized, mismatched, stale,
+non-canonical or partial piece refuses the job (`ct_scan_binding_mismatch` /
+`ct_scan_binding_required`). Every recorded digest is compared, even when the
+terms and the Summary are byte-identical. An evidence key (the marker, the
+snapshot, the Summary or any of their digests) that holds more than one meta row
+is ambiguous and refuses the job (`ct_scan_evidence_duplicate`). The job row stores the summary digest, so a
+later edit of the retained evidence makes the authorization no longer live and
+cancels a queued or running job. A change of the profile's limits changes the
+text and therefore requires a new acceptance.
+
+**Strict by default.** Every terms version requires bound evidence (and, with the
+target-control gate, proof of control of the exact target) unless the operator
+explicitly grandfathers it: config `terms_policy` is
+`array( '<version>' => 'strict' | 'legacy' )`. `legacy` is honoured only for an
+r2-or-earlier version (`YYYY-MM-DD-rN` up to `2026-10-21-r2`); a newer or
+unparseable version listed as `legacy` is still strict. **The integration refuses
+to enable (the whole worker API answers 503) unless `supported_terms_version` has
+an entry in `terms_policy`**, so bumping the served version cannot silently drop
+the requirement; each job freezes its requirement and profile when it is created,
+so a later configuration change neither cancels a running authorization nor
+relaxes one. Unbound pieces without the marker are always refused. Nothing in the
+plugin fetches mutable page HTML.
+
+With config `send_accepted_copy` true (default false), a successful mailbox
+confirmation sends the verified contact their copy: the Target Summary, the
+hashes, the filled-in copy and, for a bound acceptance, the exact terms bytes
+as an attachment (written to a private temporary directory and attached only if
+it reproduces the recorded hash). The recipient must still be the confirmed,
+authorized address, and the job must still be live (queued, leased or running,
+not revoked, and its retained evidence unchanged), re-checked under the queue
+lock immediately before the send is claimed. It is sent at most once (the status is claimed by
+compare-and-set before mail is handed off), only to the verified address, and
+never to a referrer. An uncertain or failed hand-off is recorded as `unknown`
+and never resent automatically; `accepted` means transport acceptance, not
+receipt. A failure cannot cancel, delay or repeat a scan. The wording of that
+message has not been reviewed by the owner.
+
 ## Egress (activation requirement)
 
 The admission guard, the unprivileged UID and the resource limits are
@@ -325,8 +386,10 @@ cannot complete, the failure is written to the PHP error log once, the worker
 API stays refused, and the upgrade is not retried for five minutes (so a broken
 table cannot make every public request re-run it).
 Schema 3 adds `profile_id`, `http_admitted` and `last_admit_ms` to the jobs
-table (existing rows default to `r2-header-v1` with empty counters); the
-upgrade runs on `init` and the worker API refuses requests until it completes.
+table (existing rows default to `r2-header-v1` with empty counters); schema 4
+adds `summary_sha256`, `bound_required` (the job's frozen evidence requirement;
+existing rows default to `0`), `accepted_copy_status` and `accepted_copy_at`. Upgrades
+run on `init` and the worker API refuses requests until they complete.
 
 The healthcheck requires a successful authenticated exchange in the last ten
 minutes. Use `docker compose -p ct-php2shell -f deployment/compose.yaml ps` and

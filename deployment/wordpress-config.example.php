@@ -9,6 +9,11 @@ return array(
     // cannot change (see deployment/egress-filter.nft.example). While false the integration refuses to enable.
     'egress_enforced' => false,
     'supported_terms_version' => '2026-10-21-r2',
+    // REQUIRED explicit decision for the version above, or the integration refuses to enable:
+    //   'strict' : bound evidence (and target control) required - what every new version must use;
+    //   'legacy' : grandfathers the existing r2-or-earlier flow; honoured ONLY for r2-or-earlier versions.
+    // Bumping supported_terms_version without adding its entry disables the integration.
+    'terms_policy' => array('2026-10-21-r2' => 'legacy'),
     'expected_checker_revision' => 'REPLACE_WITH_REVIEWED_40_CHARACTER_COMMIT_SHA',
     'expected_rules_as_of' => '2026-10-21',
     'worker_hmac_secret' => is_readable(__DIR__ . '/worker.key')

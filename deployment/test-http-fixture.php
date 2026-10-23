@@ -11,6 +11,7 @@ if ('setup' === $mode) {
     file_put_contents($private . '/config.php', '<?php return ' . var_export(array(
         'enabled' => true,
         'egress_enforced' => true, // disposable fixture: no network beyond the test network
+        'terms_policy' => array('2026-10-21-r2' => 'legacy'),
         'worker_hmac_secret' => str_repeat('fixture-', 8),
         'expected_checker_revision' => str_repeat('a', 40),
         'authorization_end_at' => gmdate('Y-m-d\TH:i:s\Z', time() + 86400 * 30),

@@ -15,10 +15,6 @@ function ct_test_job_fields( $job_id ) {
 	return ct_scan_row( $job_id );
 }
 
-function ct_test_end_job( $job_id ) {
-	global $wpdb;
-	$wpdb->update( ct_scan_jobs_table(), array( 'status' => 'failed', 'outcome' => 'failed', 'finished_at' => ct_scan_utc_now(), 'lease_hash' => null, 'lease_until' => null ), array( 'job_id' => (int) $job_id ) );
-}
 
 function ct_test_stop_token( $job_id ) {
 	// The raw token exists only in the customer's email; a test token is installed by hash.
@@ -275,7 +271,7 @@ function ct_test_gate( $env ) {
 	$out = stream_get_contents( $pipes[1] );
 	stream_get_contents( $pipes[2] );
 	proc_close( $proc );
-	return trim( $out );
+	return explode( ' ', trim( $out ) )[0];
 }
 ct_test_assert( 'enabled' === ct_test_gate( array() ) && 'refused' === ct_test_gate( array( 'CT_TEST_EGRESS' => '0' ) ), 'The integration enabled itself without egress_enforced, or refused with it.' );
 
