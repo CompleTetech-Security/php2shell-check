@@ -1047,6 +1047,49 @@ function ct_scan_deletion_allowed( $row, $now ) {
 }
 
 /**
+ * May the tombstone loop delete this job row (one that a tombstone recognises) now, as far as its retention
+ * deadline is concerned? The loop cannot tell a row restored from a backup from a live row whose retention
+ * deletion wrote its tombstone and then failed part-way, so it never deletes a row before the deadline that
+ * retention itself would apply today: the later of the stored retain_until (never shortened) and the date
+ * required under today's configuration (ct_scan_required_retain_until()). A longer period configured after a
+ * failed deletion therefore protects that row exactly as it protects any other.
+ *
+ * When that date cannot be derived (no valid closure for a current-version acceptance, a damaged creation
+ * date), the row cannot be such a live row: retention deleted only rows whose dates were all valid, and a
+ * failed deletion leaves those dates as they were. The row is then a restored copy from before its closure
+ * (or a damaged one) and the tombstone, which records that this record was already deleted, decides.
+ */
+function ct_scan_tombstone_deadline_passed( $row, $now ) {
+	$required = ct_scan_required_retain_until( $row );
+	if ( false === $required ) {
+		return true;
+	}
+	$deadline = $required;
+	if ( isset( $row->retain_until ) && ct_scan_valid_datetime( $row->retain_until ) && $row->retain_until > $deadline ) {
+		$deadline = $row->retain_until;
+	}
+	return $deadline <= $now;
+}
+
+/**
+ * Did the query just run fail? Retention never mistakes a failed query for "nothing to do" (or, worse, for
+ * "no live record uses this id"): the caller stops that step and keeps the records. Logged once until a
+ * retention run completes without a failed query.
+ */
+function ct_scan_retention_query_failed( $step ) {
+	global $wpdb;
+	if ( '' === (string) $wpdb->last_error ) {
+		return false;
+	}
+	$GLOBALS['ct_scan_retention_query_failure'] = true;
+	if ( ! get_option( 'ct_scan_retention_query_warned' ) ) {
+		error_log( 'ct-scan: retention step "' . $step . '" stopped: a database query failed; the records are kept and the step is retried on a later run. Logged once until a run completes without a failed query.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		update_option( 'ct_scan_retention_query_warned', $step, false );
+	}
+	return true;
+}
+
+/**
  * A tombstone must not let anyone who reads it (a backup, a database export) test whether a given website
  * was ever a customer: the scope is stored as a keyed MAC, not as the plain hash of the hostname.
  */
@@ -1195,7 +1238,7 @@ function ct_scan_clock_is_sane( $now ) {
 	$limit  = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '+5 minutes' )->format( 'Y-m-d H:i:s' );
 	foreach ( array( 'created_at', 'finished_at', 'closed_at', 'terms_accepted_at' ) as $column ) {
 		$newest = $wpdb->get_var( "SELECT MAX({$column}) FROM {$table} WHERE {$column} < '2200-01-01 00:00:00'" );
-		if ( is_string( $newest ) && $newest > $limit ) {
+		if ( ct_scan_retention_query_failed( 'clock' ) || ( is_string( $newest ) && $newest > $limit ) ) {
 			return false;
 		}
 	}
@@ -1247,8 +1290,13 @@ function ct_scan_retention_steps( $now ) {
 	$table    = ct_scan_jobs_table();
 	$terminal = ct_scan_terminal_sql();
 	$deadline = microtime( true ) + 3.0;
+	$GLOBALS['ct_scan_retention_query_failure'] = false;
 	// 0. A job that can run again is not closed: forget any closure stamped on it. (Clears dates only: keeps data.)
+	// If this fails, nothing below may run: a job that can run again could still carry an old deletion date.
 	$wpdb->query( "UPDATE {$table} SET closed_at = NULL, retain_until = NULL WHERE status NOT IN ({$terminal}) AND (closed_at IS NOT NULL OR retain_until IS NOT NULL)" );
+	if ( ct_scan_retention_query_failed( 'reopen' ) ) {
+		return;
+	}
 	// Everything below stamps "now" or deletes. Refuse all of it if the clock cannot be trusted, so a wrong
 	// clock's "now" is never stamped as a closure, a deletion date or an examination time.
 	$sane = ct_scan_clock_is_sane( $now );
@@ -1258,6 +1306,7 @@ function ct_scan_retention_steps( $now ) {
 	}
 	// 1. Closure is explicit: the first time a job is seen terminal it is stamped.
 	$wpdb->query( $wpdb->prepare( "UPDATE {$table} SET closed_at = COALESCE(finished_at, %s) WHERE closed_at IS NULL AND status IN ({$terminal})", $now ) );
+	ct_scan_retention_query_failed( 'closure' ); // only stamps dates; the steps below re-read what they act on
 	// A row judged doubtful is re-examined at most daily, so doubtful rows can never starve the rest.
 	$recheck = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-1 day' )->format( 'Y-m-d H:i:s' );
 	// 1b. Jobs that predate the opaque identity get one (and so does their request) so a restored request
@@ -1267,7 +1316,8 @@ function ct_scan_retention_steps( $now ) {
 	// Paged from a stored cursor (wrapping around) so such rows can never starve later ones.
 	$identity_cursor = max( 0, (int) get_option( 'ct_scan_identity_cursor', 0 ) );
 	$anonymous       = $wpdb->get_results( $wpdb->prepare( "SELECT job_id,request_id,identity FROM {$table} WHERE (identity IS NULL OR identity = '') AND job_id > %d ORDER BY job_id ASC LIMIT 100", $identity_cursor ) );
-	foreach ( (array) $anonymous as $row ) {
+	$anonymous_failed = ct_scan_retention_query_failed( 'identity' );
+	foreach ( $anonymous_failed ? array() : (array) $anonymous as $row ) {
 		$identity_cursor = (int) $row->job_id;
 		clean_post_cache( (int) $row->request_id );
 		$post = get_post( (int) $row->request_id );
@@ -1287,11 +1337,13 @@ function ct_scan_retention_steps( $now ) {
 			$wpdb->update( $table, array( 'identity' => bin2hex( random_bytes( 16 ) ) ), array( 'job_id' => (int) $row->job_id, 'identity' => $row->identity ), array( '%s' ), array( '%d', '%s' ) );
 		}
 	}
-	update_option( 'ct_scan_identity_cursor', count( (array) $anonymous ) < 100 ? '0' : (string) $identity_cursor, false );
+	if ( ! $anonymous_failed ) {
+		update_option( 'ct_scan_identity_cursor', count( (array) $anonymous ) < 100 ? '0' : (string) $identity_cursor, false );
+	}
 	// 2. The evidence deletion date is set at closure; later it may only be extended (step 4), never shortened.
 	// An untrustworthy base leaves it NULL (kept).
 	$unset = $wpdb->get_results( $wpdb->prepare( "SELECT job_id,terms_version,terms_accepted_at,closed_at FROM {$table} WHERE closed_at IS NOT NULL AND retain_until IS NULL AND (retention_checked_at IS NULL OR retention_checked_at < %s) ORDER BY job_id ASC LIMIT 200", $recheck ) );
-	foreach ( (array) $unset as $row ) {
+	foreach ( ct_scan_retention_query_failed( 'retain_until' ) ? array() : (array) $unset as $row ) {
 		$when = ct_scan_retain_until( $row );
 		if ( false !== $when ) {
 			$wpdb->update( $table, array( 'retain_until' => $when ), array( 'job_id' => (int) $row->job_id, 'retain_until' => null ), array( '%s' ), array( '%d', '%s' ) );
@@ -1307,6 +1359,7 @@ function ct_scan_retention_steps( $now ) {
 		$findings_cutoff,
 		$grace_edge
 	) );
+	ct_scan_retention_query_failed( 'findings' ); // a failure only keeps the findings longer
 	// 4. Evidence: delete what has outlived its retain_until (extending a date that is shorter than today's
 	// rules require), except under a hold. One budget of deletion attempts for the whole run (steps 4 and 5).
 	$deletions_left = ct_scan_retention_batch_limit();
@@ -1316,7 +1369,7 @@ function ct_scan_retention_steps( $now ) {
 		$grace_edge,
 		$recheck
 	) );
-	foreach ( (array) $due as $row ) {
+	foreach ( ct_scan_retention_query_failed( 'evidence' ) ? array() : (array) $due as $row ) {
 		if ( $deletions_left < 1 || microtime( true ) > $deadline ) {
 			break; // enough for one run: continue next time
 		}
@@ -1335,6 +1388,10 @@ function ct_scan_retention_steps( $now ) {
 	// 5. A restored backup must not resurrect deleted records: delete matches again (same budget).
 	ct_scan_apply_tombstones( $now, $deadline, $deletions_left );
 	$wpdb->query( $wpdb->prepare( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE deleted_at < %s', ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . max( 90, (int) ct_scan_config()['tombstone_retention_days'] ) . ' days' )->format( 'Y-m-d H:i:s' ) ) );
+	ct_scan_retention_query_failed( 'tombstone_expiry' ); // a failure only keeps tombstones longer
+	if ( empty( $GLOBALS['ct_scan_retention_query_failure'] ) && get_option( 'ct_scan_retention_query_warned' ) ) {
+		delete_option( 'ct_scan_retention_query_warned' );
+	}
 }
 
 /**
@@ -1380,6 +1437,9 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 			$upper,
 			$grace_edge
 		) );
+		if ( ct_scan_retention_query_failed( 'tombstone_rows' ) ) {
+			break; // never "no candidates": stop here and continue from the stored cursor next run
+		}
 		if ( empty( $ghosts ) ) {
 			if ( $wrapped ) {
 				$finished = true;
@@ -1409,7 +1469,10 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 				// A restored row that holds a live lease (a scan, or a control check in progress) is left until the
 				// lease ends (bounded; maintenance reclaims it): deleting it would free the one-at-a-time gate while
 				// target traffic for it may still be in flight. Re-checked here under the lock.
-				if ( $row && hash_equals( (string) $ghost->scope_mac, ct_scan_tombstone_mac( $row->scope_hash ) ) && ! ct_scan_job_on_hold( $row, $now ) && ! ct_scan_job_holds_lease( $row ) ) {
+				// The row is also kept until the retention deadline that applies to it today has passed: a live row
+				// whose retention deletion wrote this tombstone and then failed part-way looks exactly like a restored
+				// one, and a period raised since must protect it (ct_scan_tombstone_deadline_passed()).
+				if ( $row && hash_equals( (string) $ghost->scope_mac, ct_scan_tombstone_mac( $row->scope_hash ) ) && ! ct_scan_job_on_hold( $row, $now ) && ! ct_scan_job_holds_lease( $row ) && ct_scan_tombstone_deadline_passed( $row, $now ) ) {
 					--$deletions_left;
 					// A failure leaves the row (and is retried next run); it never stops the other candidates.
 					ct_scan_delete_job_records( $row, 'restored', (string) $ghost->identity );
@@ -1435,14 +1498,17 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 		$restored = $wpdb->get_results( $wpdb->prepare(
 			'SELECT t.tombstone_id, t.job_id, t.request_id, t.identity FROM ' . $stones . ' t'
 			. ' INNER JOIN ' . $wpdb->posts . " p ON p.ID = t.request_id AND p.post_type = 'ct_promo_request'"
-			. ' INNER JOIN ' . $postmeta . " m ON m.post_id = t.request_id AND m.meta_key = '_ct_scan_identity' AND m.meta_value = t.identity"
-			. ' INNER JOIN ' . $postmeta . " k ON k.post_id = t.request_id AND k.meta_key = '_ct_scan_job_id' AND k.meta_value = t.job_id"
+			. ' INNER JOIN ' . $postmeta . " m ON m.post_id = t.request_id AND m.meta_key = '_ct_scan_identity' AND CAST(m.meta_value AS BINARY) = CAST(t.identity AS BINARY)"
+			. ' INNER JOIN ' . $postmeta . " k ON k.post_id = t.request_id AND k.meta_key = '_ct_scan_job_id' AND CAST(k.meta_value AS BINARY) = CAST(t.job_id AS BINARY)"
 			. " WHERE t.identity IS NOT NULL AND t.identity <> '' AND t.tombstone_id > %d AND t.tombstone_id <= %d"
 			. ' AND NOT EXISTS (SELECT 1 FROM ' . $table . ' j WHERE j.request_id = t.request_id OR j.job_id = t.job_id)'
 			. ' GROUP BY t.tombstone_id, t.job_id, t.request_id, t.identity ORDER BY t.tombstone_id ASC LIMIT 50',
 			$after_stone,
 			$upper_stone
 		) );
+		if ( ct_scan_retention_query_failed( 'tombstone_posts' ) ) {
+			break; // never "no candidates": stop here and continue from the stored cursor next run
+		}
 		if ( empty( $restored ) ) {
 			if ( $post_wrapped ) {
 				$post_done = true;
@@ -1463,6 +1529,11 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 			$after_stone = (int) $stone->tombstone_id;
 			try {
 				$live = $wpdb->get_var( $wpdb->prepare( "SELECT job_id FROM {$table} WHERE request_id = %d OR job_id = %d LIMIT 1", (int) $stone->request_id, (int) $stone->job_id ) );
+				if ( ct_scan_retention_query_failed( 'tombstone_posts' ) ) {
+					// A failed lookup is not "no live record": keep the post and stop; the next run retries from here.
+					update_option( 'ct_scan_restored_post_cursor', (string) max( 0, $after_stone - 1 ), false );
+					return;
+				}
 				clean_post_cache( (int) $stone->request_id );
 				if ( ! $live && hash_equals( (string) $stone->identity, ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_identity' ) ) && (string) $stone->job_id === ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_job_id' ) ) {
 					--$deletions_left;

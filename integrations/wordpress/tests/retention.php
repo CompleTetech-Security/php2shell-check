@@ -106,7 +106,7 @@ $columns = $wpdb->get_col( 'SHOW COLUMNS FROM ' . ct_scan_tombstones_table(), 0 
 ct_test_assert( array() === array_intersect( $columns, array( 'contact_email', 'contact_name', 'target_origin', 'result_json', 'terms_hash', 'scope_hash' ) ), 'The tombstone table can hold personal or customer data.' );
 
 // A restored backup brings the rows back: maintenance deletes them again.
-$ghost = array( 'job_id' => $edge_del['job_id'], 'request_id' => $edge_del['request_id'], 'target_origin' => 'https://ret-del.example.net/', 'scope_hash' => $plain, 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored Person', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => $stone->created_at, 'finished_at' => ct_test_old( '-1 day' ), 'closed_at' => ct_test_old( '-1 day' ) );
+$ghost = array( 'job_id' => $edge_del['job_id'], 'request_id' => $edge_del['request_id'], 'target_origin' => 'https://ret-del.example.net/', 'scope_hash' => $plain, 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-3 years -1 day' ), 'retention_checked_at' => ct_scan_utc_now(), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored Person', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => $stone->created_at, 'finished_at' => ct_test_old( '-1 day' ), 'closed_at' => ct_test_old( '-1 day' ) );
 $wpdb->insert( $jobs, $ghost );
 $restored_post = wp_insert_post( array( 'import_id' => $edge_del['request_id'], 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'restored' ) );
 update_post_meta( $edge_del['request_id'], '_ct_scan_job_id', $edge_del['job_id'] );
@@ -478,7 +478,7 @@ foreach ( array( 'missing' => null, 'empty' => '' ) as $kind => $value ) {
 }
 
 // Restored rows that cannot be acted on (held, leased) never starve a later restored row in the tombstone loop.
-$restored_base = array( 'target_origin' => 'https://ret-starve.example.net/', 'scope_hash' => hash( 'sha256', 'https://ret-starve.example.net/' ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => ct_test_old( '-1 hour' ) );
+$restored_base = array( 'target_origin' => 'https://ret-starve.example.net/', 'scope_hash' => hash( 'sha256', 'https://ret-starve.example.net/' ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-4 years' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => ct_test_old( '-4 years' ), 'retention_checked_at' => ct_scan_utc_now() );
 for ( $i = 0; $i < 56; $i++ ) {
 	$extra = 9 === $i % 10 ? array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => str_repeat( 'b', 64 ), 'lease_until' => ct_test_old( '+1 hour' ) ) : array( 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) );
 	ct_test_assert( 1 === $wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 887000100 + $i, 'request_id' => 886000100 + $i ), $extra ) ), 'Fixture insert of a restored row failed: ' . $wpdb->last_error );
@@ -693,7 +693,7 @@ ct_test_make_due( $recycled );
 $saved = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$jobs} WHERE job_id = %d", $recycled['job_id'] ), ARRAY_A );
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $recycled ) && ! get_post( $recycled['request_id'] ), 'Fixture expected the recycled-id job to be deleted.' );
-$saved['retain_until'] = ct_test_old( '+1 year' ); // only the tombstone can recognise it
+$saved['retention_checked_at'] = ct_scan_utc_now(); // examined just now: only the tombstone loop reaches it
 $wpdb->insert( $jobs, $saved );
 wp_insert_post( array( 'import_id' => $recycled['request_id'], 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'another record' ) );
 update_post_meta( $recycled['request_id'], '_ct_scan_identity', str_repeat( 'e', 32 ) );
@@ -715,7 +715,7 @@ for ( $i = 0; $i < 10; $i++ ) {
 ct_test_maintain();
 ct_test_assert( 0 === count( array_filter( $ghost_jobs, 'ct_test_exists' ) ), 'Fixture expected the budget ghosts to be deleted.' );
 foreach ( $ghost_rows as $g ) {
-	$g['retain_until'] = ct_test_old( '+1 year' ); // only the tombstone loop can reach these
+	$g['retention_checked_at'] = ct_scan_utc_now(); // examined just now: only the tombstone loop reaches these
 	$wpdb->insert( $jobs, $g );
 }
 $budget_jobs = array();
@@ -765,7 +765,7 @@ foreach ( array( 'control' => array( 'status' => 'awaiting_control', 'control_re
 	ct_test_maintain();
 	ct_test_assert( ! ct_test_exists( $gone ), 'Fixture expected the job to be deleted first.' );
 	$gstone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $gone['job_id'] ) );
-	$wpdb->insert( $jobs, array_merge( array( 'job_id' => $gone['job_id'], 'request_id' => $gone['request_id'], 'target_origin' => "https://ret-restore-{$kind}.example.net/", 'scope_hash' => hash( 'sha256', "https://ret-restore-{$kind}.example.net/" ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'created_at' => $gstone->created_at ), $leased ) );
+	$wpdb->insert( $jobs, array_merge( array( 'job_id' => $gone['job_id'], 'request_id' => $gone['request_id'], 'target_origin' => "https://ret-restore-{$kind}.example.net/", 'scope_hash' => hash( 'sha256', "https://ret-restore-{$kind}.example.net/" ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-3 years -1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'created_at' => $gstone->created_at ), $leased ) );
 	ct_test_maintain();
 	ct_test_assert( ct_test_exists( $gone ), "A restored row holding a live {$kind} lease was deleted by its tombstone mid-lease." );
 	$wpdb->update( $jobs, 'control' === $kind ? array( 'control_lease_until' => ct_test_old( '-1 minute' ) ) : array( 'lease_until' => ct_test_old( '-1 minute' ) ), array( 'job_id' => $gone['job_id'] ) );
@@ -848,6 +848,93 @@ foreach ( array_merge( $refused_posts, $foreign_posts ) as $id ) {
 	wp_delete_post( $id, true );
 }
 $wpdb->query( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE job_id BETWEEN 887100000 AND 887100200' );
+
+// ---- Sixth review: collations, failed queries, a failed deletion under a raised period ---------------------------
+// A tombstones table whose collation differs from the post meta's (utf8mb4_unicode_ci post meta beside a
+// utf8mb4_unicode_520_ci tombstones table, say) must not make the restored-post comparison fail silently.
+$stones_table = ct_scan_tombstones_table();
+$column_info  = static function ( $table, $column ) use ( $wpdb ) {
+	return $wpdb->get_row( $wpdb->prepare( 'SELECT CHARACTER_SET_NAME AS charset, COLLATION_NAME AS collation FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s', $table, $column ) );
+};
+$meta_column     = $column_info( $wpdb->postmeta, 'meta_value' );
+$identity_column = $column_info( $stones_table, 'identity' );
+ct_test_assert( $meta_column && $identity_column && $meta_column->charset && $identity_column->collation, 'Fixture could not read the column collations.' );
+$other_collation = null;
+foreach ( array( '_general_ci', '_unicode_ci', '_unicode_520_ci' ) as $suffix ) {
+	$candidate = $meta_column->charset . $suffix;
+	if ( $candidate !== $meta_column->collation && $wpdb->get_var( $wpdb->prepare( 'SELECT COLLATION_NAME FROM information_schema.COLLATIONS WHERE COLLATION_NAME = %s', $candidate ) ) ) {
+		$other_collation = $candidate;
+		break;
+	}
+}
+ct_test_assert( null !== $other_collation, 'Fixture found no second collation for ' . $meta_column->charset . '.' );
+$collated = ct_test_aged_job( 'ret-collation.example.net', 'failed', '-3 years -1 day', '-1 day' );
+ct_test_maintain();
+ct_test_assert( ! ct_test_exists( $collated ) && ! get_post( $collated['request_id'] ), 'Fixture expected the collation job to be deleted.' );
+$collated_stone = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$stones_table} WHERE job_id = %d", $collated['job_id'] ) );
+try {
+	ct_test_assert( false !== $wpdb->query( "ALTER TABLE {$stones_table} MODIFY identity char(32) CHARACTER SET {$meta_column->charset} COLLATE {$other_collation} NULL" ), 'Fixture could not change the identity collation: ' . $wpdb->last_error );
+	// The fixture really reproduces the problem: a plain comparison across the two columns is refused.
+	$suppressed = $wpdb->suppress_errors( true );
+	$wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->postmeta} m INNER JOIN {$stones_table} t ON m.meta_value = t.identity" );
+	$plain_error = $wpdb->last_error;
+	$wpdb->suppress_errors( $suppressed );
+	ct_test_assert( '' !== $plain_error, "Fixture expected {$meta_column->collation} against {$other_collation} to be an illegal mix of collations." );
+	wp_insert_post( array( 'import_id' => $collated['request_id'], 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'restored' ) );
+	update_post_meta( $collated['request_id'], '_ct_scan_job_id', $collated['job_id'] );
+	update_post_meta( $collated['request_id'], '_ct_scan_identity', $collated_stone->identity );
+	delete_option( 'ct_scan_retention_query_warned' );
+	ct_test_maintain();
+	ct_test_assert( ! get_post( $collated['request_id'] ) && empty( $GLOBALS['ct_scan_retention_query_failure'] ) && ! get_option( 'ct_scan_retention_query_warned' ), "A restored request was not deleted again when the tombstones table uses another collation ({$other_collation}) than the post meta ({$meta_column->collation})." );
+} finally {
+	$wpdb->query( "ALTER TABLE {$stones_table} MODIFY identity char(32) CHARACTER SET {$identity_column->charset} COLLATE {$identity_column->collation} NULL" );
+}
+ct_test_assert( $identity_column->collation === $column_info( $stones_table, 'identity' )->collation, 'Fixture could not restore the identity collation.' );
+
+// A failed retention query is never read as "nothing to do" or "no live record": the records are kept, the failure
+// is logged once, and the next clean run does the work and forgets the warning.
+$failing = ct_test_aged_job( 'ret-failing-query.example.net', 'failed', '-3 years -1 day', '-1 day' );
+ct_test_maintain();
+ct_test_assert( ! ct_test_exists( $failing ), 'Fixture expected the failing-query job to be deleted.' );
+$failing_stone = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$stones_table} WHERE job_id = %d", $failing['job_id'] ) );
+wp_insert_post( array( 'import_id' => $failing['request_id'], 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'restored' ) );
+update_post_meta( $failing['request_id'], '_ct_scan_job_id', $failing['job_id'] );
+update_post_meta( $failing['request_id'], '_ct_scan_identity', $failing_stone->identity );
+foreach ( array( 'candidates' => "'_ct_scan_identity'", 'live lookup' => ' OR job_id = ' ) as $kind => $marker ) {
+	$break_query = static function ( $query ) use ( $marker, $jobs ) {
+		$is_target = ' OR job_id = ' === $marker ? 0 === strpos( $query, "SELECT job_id FROM {$jobs} WHERE request_id = " ) : ( false !== strpos( $query, 'INNER JOIN' ) && false !== strpos( $query, $marker ) );
+		return $is_target ? $query . ' AND (' : $query; // a syntax error
+	};
+	delete_option( 'ct_scan_retention_query_warned' );
+	add_filter( 'query', $break_query );
+	$suppressed = $wpdb->suppress_errors( true );
+	ct_test_maintain();
+	$wpdb->suppress_errors( $suppressed );
+	remove_filter( 'query', $break_query );
+	ct_test_assert( get_post( $failing['request_id'] ) && 'tombstone_posts' === get_option( 'ct_scan_retention_query_warned' ), "A failed restored-post query ({$kind}) was treated as no candidates or no live record, or was not logged." );
+}
+ct_test_maintain();
+ct_test_assert( ! get_post( $failing['request_id'] ) && ! get_option( 'ct_scan_retention_query_warned' ), 'After the query recovered, the restored request was not deleted or the warning was not cleared.' );
+
+// A live row whose retention deletion wrote its tombstone and then failed part-way is not deleted by that tombstone
+// before the deadline of a retention period raised since (holds aside, the tombstone loop applies the same deadline).
+$partial = ct_test_aged_job( 'ret-partial.example.net', 'cancelled', '-6 years -3 days', '-6 years -2 days', '2027-06-01-r3' );
+ct_test_make_due( $partial );
+$block_partial = static function ( $check, $post ) use ( $partial ) {
+	return (int) $partial['request_id'] === (int) $post->ID ? false : $check;
+};
+add_filter( 'pre_delete_post', $block_partial, 10, 2 );
+ct_test_maintain();
+remove_filter( 'pre_delete_post', $block_partial, 10 );
+$pr = ct_scan_row( $partial['job_id'] );
+ct_test_assert( $pr && get_post( $partial['request_id'] ) && null !== $wpdb->get_var( $wpdb->prepare( "SELECT job_id FROM {$stones_table} WHERE job_id = %d", $partial['job_id'] ) ), 'Fixture expected a deletion that wrote its tombstone and then failed.' );
+// Examined just now, so the evidence step leaves it alone: only the tombstone loop decides in the next run.
+$wpdb->update( $jobs, array( 'retention_checked_at' => ct_scan_utc_now() ), array( 'job_id' => $partial['job_id'] ) );
+$run_raised(); // eight years from closure: not due for almost two years
+ct_test_assert( ct_test_exists( $partial ) && get_post( $partial['request_id'] ) && $pr->retain_until === ct_scan_row( $partial['job_id'] )->retain_until, 'A tombstone deleted a live row (whose deletion had failed) before the deadline of a period raised since.' );
+// Under the period in force when it was due, the tombstone loop completes the deletion.
+ct_test_maintain();
+ct_test_assert( ! ct_test_exists( $partial ) && ! get_post( $partial['request_id'] ), 'The tombstone loop did not complete a failed deletion whose deadline has passed.' );
 
 foreach ( $request_ids as $id ) {
 	$wpdb->delete( $jobs, array( 'request_id' => $id ), array( '%d' ) );

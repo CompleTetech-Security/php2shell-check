@@ -618,7 +618,19 @@ queue page):
   reach a live record). A restored job row that holds a lease (a leased or
   running scan, or a control check in progress) is deleted again only after
   that bounded lease ends, so the one-at-a-time gate is never freed while its
-  traffic may be in flight. Restored rows that cannot be acted on (held or
+  traffic may be in flight. A recognised job row is also deleted again only once
+  the retention deadline that applies to it today has passed (the later of its
+  stored `retain_until` and the date required under the current configuration):
+  a live row whose retention deletion wrote its tombstone and then failed
+  part-way cannot be told apart from a restored one, and a period raised since
+  must protect it. (A row without a derivable deadline cannot be such a live row,
+  because retention only deletes rows whose dates are all valid; the tombstone
+  then decides.) The identity comparison between the tombstone and the request's
+  post meta is binary, so differing table collations (for example
+  `utf8mb4_unicode_ci` post meta beside a `utf8mb4_unicode_520_ci` tombstones
+  table) cannot make it fail. A retention query that fails is never read as
+  "nothing to do": that step stops, the records are kept, and the failure is
+  logged once until a run completes cleanly. Restored rows that cannot be acted on (held or
   leased) are skipped in the query, and the candidates are paged from where the
   previous run stopped (wrapping around), so neither skipped rows nor rows whose
   deletion keeps failing can hide later restored rows. Restored request posts are
