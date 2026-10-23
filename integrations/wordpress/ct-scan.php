@@ -1324,39 +1324,49 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 		$deletions_left = ct_scan_retention_batch_limit();
 	}
 	// Candidates by numeric ids and creation time; the keyed scope MAC is compared in PHP, under the lock.
-	// Rows that cannot be acted on now are excluded in SQL (held or in grace, holding a lease, or whose
-	// deletion failed within the last day), and the candidates are paged by key, so rows that are skipped
-	// can never starve later restored rows.
+	// Rows that cannot be acted on now (held or in grace, holding a lease) are excluded in SQL. The rest are
+	// paged by key from where the previous run stopped, wrapping around once, so rows that are skipped or
+	// whose deletion keeps failing can never starve later restored rows.
 	$grace_edge = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
-	$recheck    = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-1 day' )->format( 'Y-m-d H:i:s' );
-	$after_job  = 0;
-	$after_stone = 0;
-	for ( $page = 0; $page < 20; $page++ ) {
+	$cursor     = max( 0, (int) get_option( 'ct_scan_tombstone_cursor', 0 ) );
+	$after_job  = $cursor;
+	$after_id   = 0;
+	$upper      = PHP_INT_MAX;
+	$wrapped    = 0 === $cursor;
+	$finished   = false;
+	for ( $page = 0; $page < 40; $page++ ) {
 		$ghosts = $wpdb->get_results( $wpdb->prepare(
 			'SELECT j.job_id, t.tombstone_id, t.scope_mac, t.identity FROM ' . $table . ' j INNER JOIN ' . $stones . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.created_at = j.created_at'
-			. ' WHERE (j.job_id > %d OR (j.job_id = %d AND t.tombstone_id > %d))'
+			. ' WHERE (j.job_id > %d OR (j.job_id = %d AND t.tombstone_id > %d)) AND j.job_id <= %d'
 			. " AND (j.hold_reason IS NULL OR (j.hold_until >= '2020-01-01 00:00:00' AND j.hold_until <= %s))"
 			. " AND j.status NOT IN ('leased','running') AND NOT (j.status = 'awaiting_control' AND COALESCE(j.control_state, '') = 'checking')"
-			. ' AND (j.retention_checked_at IS NULL OR j.retention_checked_at < %s)'
 			. ' ORDER BY j.job_id ASC, t.tombstone_id ASC LIMIT 50',
 			$after_job,
 			$after_job,
-			$after_stone,
-			$grace_edge,
-			$recheck
+			$after_id,
+			$upper,
+			$grace_edge
 		) );
 		if ( empty( $ghosts ) ) {
-			break;
+			if ( $wrapped ) {
+				$finished = true;
+				break;
+			}
+			// Reached the end: start again from the beginning, up to where this run started.
+			$wrapped   = true;
+			$after_job = 0;
+			$after_id  = 0;
+			$upper     = $cursor;
+			continue;
 		}
 		foreach ( (array) $ghosts as $ghost ) {
-			$after_job   = (int) $ghost->job_id;
-			$after_stone = (int) $ghost->tombstone_id;
-			if ( $deletions_left < 1 || microtime( true ) > $deadline ) {
+			if ( $deletions_left < 1 || microtime( true ) > $deadline || ! ct_scan_lock_acquire() ) {
+				// Out of budget or time, or the queue is busy: the next run continues from here.
+				update_option( 'ct_scan_tombstone_cursor', (string) $after_job, false );
 				return;
 			}
-			if ( ! ct_scan_lock_acquire() ) {
-				return;
-			}
+			$after_job = (int) $ghost->job_id;
+			$after_id  = (int) $ghost->tombstone_id;
 			try {
 				$row = ct_scan_row( (int) $ghost->job_id );
 				// A restored row that holds a live lease (a scan, or a control check in progress) is left until the
@@ -1364,17 +1374,15 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 				// target traffic for it may still be in flight. Re-checked here under the lock.
 				if ( $row && hash_equals( (string) $ghost->scope_mac, ct_scan_tombstone_mac( $row->scope_hash ) ) && ! ct_scan_job_on_hold( $row, $now ) && ! ct_scan_job_holds_lease( $row ) ) {
 					--$deletions_left;
-					// A failure leaves the row (retried after a day, so it cannot take the budget of every run);
-					// it never stops the other candidates.
-					if ( ! ct_scan_delete_job_records( $row, 'restored', (string) $ghost->identity ) ) {
-						$wpdb->update( $table, array( 'retention_checked_at' => $now ), array( 'job_id' => (int) $row->job_id ), array( '%s' ), array( '%d' ) );
-					}
+					// A failure leaves the row (and is retried next run); it never stops the other candidates.
+					ct_scan_delete_job_records( $row, 'restored', (string) $ghost->identity );
 				}
 			} finally {
 				ct_scan_lock_release();
 			}
 		}
 	}
+	update_option( 'ct_scan_tombstone_cursor', $finished ? '0' : (string) $after_job, false );
 	// A restored request post whose job row was not restored: matched in SQL on the opaque identity
 	// (never on recyclable numeric ids alone), and only where no job row currently uses that request or
 	// job id, so a live record can never be reached. Re-checked under the lock before each deletion.

@@ -610,9 +610,10 @@ queue page):
   reach a live record). A restored job row that holds a lease (a leased or
   running scan, or a control check in progress) is deleted again only after
   that bounded lease ends, so the one-at-a-time gate is never freed while its
-  traffic may be in flight. Restored rows that cannot be acted on (held, leased,
-  or whose deletion failed in the last day) are skipped in the query and the
-  candidates are paged, so they cannot hide later restored rows. Jobs created before the identity existed are given one
+  traffic may be in flight. Restored rows that cannot be acted on (held or
+  leased) are skipped in the query, and the candidates are paged from where the
+  previous run stopped (wrapping around), so neither skipped rows nor rows whose
+  deletion keeps failing can hide later restored rows. Jobs created before the identity existed are given one
   (adopting what their request already carries) by the next maintenance run. Tombstones are kept 120 days, longer than the 90-day backup
   rotation, then purged. The scope MAC is keyed with `wp_salt( 'secure_auth' )`:
   rotating that salt (or `SECURE_AUTH_KEY`/`SECURE_AUTH_SALT`) stops existing
