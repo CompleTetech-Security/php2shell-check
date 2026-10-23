@@ -97,7 +97,8 @@ restart cannot create a fresh budget. A grant is consumed when issued, is
 valid for one second and covers one connection and one request. `probe` only
 reports whether the job is still live; it takes no budget and has no pacing.
 Refusals use `410` (permanent: cancelled, expired, revoked, lease, profile,
-unconfirmed, clock anomaly), `409` (`budget_exhausted`), `429` (`rate_wait`
+unconfirmed, clock anomaly), `409` (`budget_exhausted`; `already_admitted` for a
+control lease that was already admitted), `429` (`rate_wait`
 with `retry_after_ms`, bounded retries) and `503` (`queue_busy`, the lock is
 held elsewhere). A `503` for a disabled integration or a schema mismatch also
 refuses. Nothing is admitted unless WordPress says so.
@@ -118,8 +119,9 @@ Enforcement in the supervisor and scanner:
 - The grant's one-second lifetime and ten-second request bound are measured
   from just before the call WordPress granted, not from delivery to the
   scanner. A grant that took more than 0.6 s to come back is discarded and
-  asked for again (the discarded slot stays spent), at most twice; after that
-  the admission is refused (`admission_expired`). No admission is requested
+  asked for again (the discarded slot stays spent), at most twice and never
+  after the admission's four-second retry deadline; after that the admission is
+  refused (`admission_expired`). No admission is requested
   after the scan's own deadline, and a shutdown interrupts a slow guard call.
 - One grant is outstanding at a time. A second request, an out-of-sequence or
   unexpected message or an oversized message ends the scan
@@ -133,9 +135,13 @@ Enforcement in the supervisor and scanner:
   that the job is cancelled, expired or revoked, or that the integration is
   disabled (the operator kill switch). Cancellation therefore aborts the one
   admitted request within about two seconds plus the probe's own latency, and
-  never later than the ten-second bound. A probe that cannot reach WordPress
-  does not abort a request already admitted, and the next admission fails closed
-  (`admission_guard_unavailable`). Expired authorization is refused locally
+  never later than the ten-second bound. A probe that finds the queue lock held
+  elsewhere (often by the supervisor's own concurrent admission) retries briefly
+  within one call budget. An inconclusive probe (WordPress unreachable or slow,
+  a malformed answer, a still-busy lock or an internal `admission_error`) does
+  not abort a request already admitted or end the scan, and the next admission
+  fails closed on the same condition (for example
+  `admission_guard_unavailable`). Expired authorization is refused locally
   without a call.
 - `SubprocessRunner.run` refuses to start without a gate.
 
@@ -191,7 +197,15 @@ page, request checks or use up the three attempts:
 - a DNS TXT record at `_ct-scan-challenge.<hostname>` with the value
   `ct-scan-verify=<token>`, or
 - the file `https://<hostname>/.well-known/ct-scan-challenge.txt` whose entire
-  content is the token.
+  content is the token (surrounding whitespace and a leading UTF-8 byte-order
+  mark are ignored).
+
+The TXT lookup asks for TXT records at exactly that name: a CNAME there is not
+followed, so a TXT record delegated through a CNAME (as some DNS providers do)
+does not verify. Resolvers cache a "no such record" answer for the zone's
+negative-caching time, so a check requested before a new record has propagated
+can see no record, and it still uses one of the three checks; the customer page
+says to wait until the record is publicly visible.
 
 The customer's page (address shown once; GET only displays it, a nonce-protected
 POST acts) lets them request a check. The disclosed limits: at most three checks
@@ -201,7 +215,11 @@ timeout; no probe of any kind is sent to help a failed check pass. A scheduled
 check is taken by the worker (`control/claim`), admitted exactly once through the
 same guard as a scan (`admit` with `kind` `control`; the attempt is consumed in the
 admission's compare-and-set, with its own pacing, budget, cancellation, expiry and
-lease checks, and `control_probe` for liveness), run inside the unprivileged
+lease checks, and `control_probe` for liveness). WordPress records the admission
+on the lease (`control_admitted`), so a second `admit` under the same lease is
+refused with `409` `already_admitted` for the rest of the two-minute lease, even
+after the one-minute interval has passed, and the worker ends the check without
+retrying. The check is run inside the unprivileged
 child, and reported with `control/result`. The worker relays what it observed
 (untrusted, length-bounded); WordPress compares it with the stored hash. A result
 is accepted only if an admission happened under that lease, so no check can
@@ -214,7 +232,9 @@ detailed report. There is no fallback from a failed challenge to a scan.
 An administrator can instead record an **authority review** (admin queue,
 `authority_review`): the evidence reviewed (20 to 1000 characters), the target,
 the reviewer's account, the time and the expiry (the authorization expiry) are
-stored, and the job is released the same way. An expired review ends the
+stored, and the job is released the same way. A review is refused while a DNS or
+file check is in flight (`control_state` `checking`); record it once that check
+has reported or its lease has lapsed. An expired review ends the
 authorization. Detailed reports (`ct_scan_admin_send_report`) additionally
 require control of the target for jobs that required it, in any terminal state.
 
@@ -227,6 +247,9 @@ The gate is on by default and cannot be dropped by omission: the integration
 refuses to enable unless the served terms version has an explicit `terms_policy`
 entry, a new version is strict whatever the configuration says, and a profile
 broader than the r2 header screening always requires control.
+The requirement is frozen per job: jobs created before the upgrade to schema 5
+have `control_required = 0` and keep their earlier behaviour; a row whose value
+is missing is treated as requiring control.
 One piece of target traffic runs at a time worker-wide: a scan claim is refused
 while a check is in progress and the reverse, enforced in WordPress. If every
 check is spent but the last result was lost, maintenance blocks the job.
@@ -260,7 +283,10 @@ the request closes). The form, the site recorder and this plugin render
 byte-identical text from that one function, so the limits the signer saw are the
 limits the job runs under. Any missing, oversized, mismatched, stale,
 non-canonical or partial piece refuses the job (`ct_scan_binding_mismatch` /
-`ct_scan_binding_required`), and the job row stores the summary digest, so a
+`ct_scan_binding_required`). Every recorded digest is compared, even when the
+terms and the Summary are byte-identical. An evidence key (the marker, the
+snapshot, the Summary or any of their digests) that holds more than one meta row
+is ambiguous and refuses the job (`ct_scan_evidence_duplicate`). The job row stores the summary digest, so a
 later edit of the retained evidence makes the authorization no longer live and
 cancels a queued or running job. A change of the profile's limits changes the
 text and therefore requires a new acceptance.
@@ -283,12 +309,15 @@ confirmation sends the verified contact their copy: the Target Summary, the
 hashes, the filled-in copy and, for a bound acceptance, the exact terms bytes
 as an attachment (written to a private temporary directory and attached only if
 it reproduces the recorded hash). The recipient must still be the confirmed,
-authorized address. It is sent at most once (the status is claimed by
+authorized address, and the job must still be live (awaiting target control,
+queued, leased or running, not revoked, and its retained evidence unchanged), re-checked under the queue
+lock immediately before the send is claimed. It is sent at most once (the status is claimed by
 compare-and-set before mail is handed off), only to the verified address, and
 never to a referrer. An uncertain or failed hand-off is recorded as `unknown`
 and never resent automatically; `accepted` means transport acceptance, not
 receipt. A failure cannot cancel, delay or repeat a scan. The wording of that
 message has not been reviewed by the owner.
+
 ## Egress (activation requirement)
 
 The admission guard, the unprivileged UID and the resource limits are
@@ -431,8 +460,17 @@ The default configuration is disabled, and no historical request sweep exists.
 5. Enforce egress (see "Egress"), then set `egress_enforced` true. Apply the
    reviewed site patch/terms update, then set `enabled` true. The runner must
    authenticate successfully before accepting live submissions. A matching
-   revision and key and `egress_enforced` are required; otherwise the
-   integration stays disabled.
+   revision and key, `egress_enforced`, and an explicit `terms_policy` entry
+   (`strict` or `legacy`, see "Bound acceptance evidence") for the served
+   `supported_terms_version` are required; otherwise the integration stays
+   disabled.
+
+**Upgrading an existing deployment:** add the `terms_policy` entry for the
+served terms version before (or together with) installing this plugin
+version. Without it the integration is disabled: the whole worker API answers
+503, new acceptances are not queued, and in-flight (queued, leased or running)
+jobs stall (they are not claimed, admitted or finished) until the entry is
+added or their authorization expires.
 
 Take a database backup first: the upgrade changes the jobs table in place. If it
 cannot complete, the failure is written to the PHP error log once, the worker
@@ -440,7 +478,10 @@ API stays refused, and the upgrade is not retried for five minutes (so a broken
 table cannot make every public request re-run it).
 Schema 3 adds `profile_id`, `http_admitted` and `last_admit_ms` to the jobs
 table (existing rows default to `r2-header-v1` with empty counters); schema 4
-adds `summary_sha256`, `accepted_copy_status` and `accepted_copy_at`. Upgrades
+adds `summary_sha256`, `bound_required` (the job's frozen evidence requirement;
+existing rows default to `0`), `accepted_copy_status` and `accepted_copy_at`; schema 7
+adds the closure, retention, hold and identity columns and the tombstones table
+(and re-checks `control_admitted`). Upgrades
 run on `init` and the worker API refuses requests until they complete.
 
 The healthcheck requires a successful authenticated exchange in the last ten
@@ -484,7 +525,8 @@ queue page):
   (`completed`, `failed`, `failed_unknown`, `cancelled`, `expired`, `blocked`)
   it is stamped `closed_at`; an accepted request that was never confirmed or
   never showed target control closes when it expires. A job that can still run
-  is never closed or deleted, however old its dates say it is; if one is ever
+  (including one in `awaiting_control`, with a control check pending or leased)
+  is never closed or deleted for age, however old its dates say it is; if one is ever
   reopened, its closure stamp is cleared.
 - **Findings** (`result_json`, manual remainder notes): cleared twelve months
   (366 days, so a leap day cannot make it early) after closure. The signed
@@ -555,7 +597,10 @@ queue page):
   the post id was recycled and belongs to another record); a restored request post matches
   only on its opaque identity and only when no job row currently uses that request
   or job id (auto-increment ids can be recycled after a restore and must never
-  reach a live record). Jobs created before the identity existed are given one
+  reach a live record). A restored job row that holds a lease (a leased or
+  running scan, or a control check in progress) is deleted again only after
+  that bounded lease ends, so the one-at-a-time gate is never freed while its
+  traffic may be in flight. Jobs created before the identity existed are given one
   (adopting what their request already carries) by the next maintenance run. Tombstones are kept 120 days, longer than the 90-day backup
   rotation, then purged.
 - Deletion scrubs the contact fields first, then deletes the private request and

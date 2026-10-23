@@ -17,7 +17,9 @@ if ( ! defined( 'CT_SCAN_DEFAULT_TERMS_VERSION' ) ) {
 }
 
 if ( ! defined( 'CT_SCAN_SCHEMA_VERSION' ) ) {
-	define( 'CT_SCAN_SCHEMA_VERSION', '6' );
+	// 7: the retention/hold/tombstone columns (introduced as 6) together with `control_admitted`, so an
+	// install that already recorded 6 before `control_admitted` existed re-runs the upgrade.
+	define( 'CT_SCAN_SCHEMA_VERSION', '7' );
 }
 
 /**
@@ -267,6 +269,7 @@ function ct_scan_maybe_install_schema() {
 		control_attempts tinyint(3) unsigned NOT NULL DEFAULT 0,
 		control_last_attempt_ms bigint(20) unsigned NULL,
 		control_leased_ms bigint(20) unsigned NULL,
+		control_admitted tinyint(1) unsigned NOT NULL DEFAULT 0,
 		control_lease_hash char(64) NULL,
 		control_lease_until datetime NULL,
 		control_method varchar(16) NULL,
@@ -317,7 +320,7 @@ function ct_scan_maybe_install_schema() {
 	) {$charset};";
 	dbDelta( $sql );
 	$required = array(
-		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at', 'identity', 'retention_checked_at' ),
+		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_admitted', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at', 'identity', 'retention_checked_at' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
 		$tombstones => array( 'tombstone_id', 'job_id', 'request_id', 'scope_mac', 'created_at', 'deleted_at', 'reason', 'identity' ),
 	);
@@ -438,6 +441,13 @@ function ct_scan_meta_string( $post_id, $key ) {
  * unless the operator grandfathered an r2-or-earlier version as `legacy` in config `terms_policy`.
  */
 function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $required, $profile ) {
+	// get_post_meta( ..., true ) silently returns the first of several rows, so an evidence key that
+	// holds more than one value is ambiguous: refuse rather than pick one.
+	foreach ( array( '_ct_terms_binding', '_ct_terms_snapshot', '_ct_terms_sha256', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
+		if ( count( (array) get_post_meta( $request_id, $key, false ) ) > 1 ) {
+			return new WP_Error( 'ct_scan_evidence_duplicate', 'The saved acceptance holds more than one value for a piece of evidence.' );
+		}
+	}
 	$marker  = ct_scan_meta_string( $request_id, '_ct_terms_binding' );
 	$partial = false;
 	foreach ( array( '_ct_terms_snapshot', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
@@ -458,15 +468,18 @@ function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $req
 	}
 	$snapshot_hash = hash( 'sha256', $snapshot );
 	$summary_hash  = hash( 'sha256', $summary );
+	// A list of [computed, recorded] pairs, never keyed by the computed hash: byte-identical terms and
+	// Summary would share a key and silently drop the terms comparison.
 	$checks = array(
-		$snapshot_hash => array( $terms_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_terms_shown_digest' ) ) ),
-		$summary_hash  => array( strtolower( ct_scan_meta_string( $request_id, '_ct_summary_sha256' ) ), strtolower( ct_scan_meta_string( $request_id, '_ct_summary_shown_digest' ) ) ),
+		array( $snapshot_hash, $terms_hash ),
+		array( $snapshot_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_terms_shown_digest' ) ) ),
+		array( $summary_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_summary_sha256' ) ) ),
+		array( $summary_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_summary_shown_digest' ) ) ),
 	);
-	foreach ( $checks as $computed => $recorded ) {
-		foreach ( $recorded as $value ) {
-			if ( ! is_string( $value ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $value ) || ! hash_equals( $computed, $value ) ) {
-				return new WP_Error( 'ct_scan_binding_mismatch', 'The retained evidence does not match the digest the signer was shown.' );
-			}
+	foreach ( $checks as $check ) {
+		list( $computed, $value ) = $check;
+		if ( ! is_string( $value ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $value ) || ! hash_equals( $computed, $value ) ) {
+			return new WP_Error( 'ct_scan_binding_mismatch', 'The retained evidence does not match the digest the signer was shown.' );
 		}
 	}
 	// The Target Summary must be exactly the canonical text of the authorized request (website, client,
@@ -775,6 +788,11 @@ function ct_scan_row( $job_id ) {
 	return $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE job_id = %d", absint( $job_id ) ) );
 }
 
+/** Does this job require proof of control of the exact target? A missing value counts as required. */
+function ct_scan_control_required( $row ) {
+	return ! is_object( $row ) || ! isset( $row->control_required ) || ! empty( $row->control_required );
+}
+
 function ct_scan_authorization_is_live( $row ) {
 	if ( ! is_object( $row ) || ! empty( $row->revoked_at ) || ! empty( $row->report_delivered_at )
 		|| strtotime( $row->authorization_expires_at . ' UTC' ) <= time() ) {
@@ -784,7 +802,7 @@ function ct_scan_authorization_is_live( $row ) {
 		return false;
 	}
 	// A job that required proof of control of the exact target is runnable only while that proof stands.
-	if ( ! empty( $row->control_required ) && in_array( $row->status, array( 'queued', 'leased', 'running' ), true ) ) {
+	if ( ct_scan_control_required( $row ) && in_array( $row->status, array( 'queued', 'leased', 'running' ), true ) ) {
 		if ( empty( $row->control_verified_at )
 			|| ( ! empty( $row->control_valid_until ) && strtotime( $row->control_valid_until . ' UTC' ) <= time() ) ) {
 			return false;
@@ -860,6 +878,12 @@ function ct_scan_maintenance_locked() {
 /** Statuses from which a job never runs again; reaching one is the request's closure. */
 function ct_scan_terminal_statuses() {
 	return array( 'completed', 'failed', 'failed_unknown', 'cancelled', 'expired', 'blocked' );
+}
+
+/** Does this job hold a lease for target traffic: a leased or running scan, or a control check being made? */
+function ct_scan_job_holds_lease( $row ) {
+	return in_array( $row->status, array( 'leased', 'running' ), true )
+		|| ( 'awaiting_control' === $row->status && 'checking' === $row->control_state );
 }
 
 function ct_scan_terminal_sql() {
@@ -1303,7 +1327,10 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 		}
 		try {
 			$row = ct_scan_row( (int) $ghost->job_id );
-			if ( $row && hash_equals( (string) $ghost->scope_mac, ct_scan_tombstone_mac( $row->scope_hash ) ) && ! ct_scan_job_on_hold( $row, $now ) ) {
+			// A restored row that holds a live lease (a scan, or a control check in progress) is left until the
+			// lease ends (bounded; maintenance reclaims it): deleting it would free the one-at-a-time gate while
+			// target traffic for it may still be in flight.
+			if ( $row && hash_equals( (string) $ghost->scope_mac, ct_scan_tombstone_mac( $row->scope_hash ) ) && ! ct_scan_job_on_hold( $row, $now ) && ! ct_scan_job_holds_lease( $row ) ) {
 				--$deletions_left;
 				// A failure leaves the row (and is retried next run); it never stops the other candidates.
 				ct_scan_delete_job_records( $row, 'restored', (string) $ghost->identity );
@@ -1467,7 +1494,7 @@ function ct_scan_confirm_job( $job_id, $token ) {
 			&& strtotime( $row->confirmation_expires_at . ' UTC' ) > time() && ct_scan_authorization_is_live( $row ) ) {
 			// Mailbox control is not control of the website: a job that requires target control waits
 			// for it. The challenge token is shown once; only its hash is stored.
-			$needs_control = ! empty( $row->control_required );
+			$needs_control = ct_scan_control_required( $row );
 			// Two independent secrets: the challenge value (published by design, so world-readable) and
 			// the page capability that lets the holder request checks (never published).
 			$control_page  = $needs_control ? bin2hex( random_bytes( 32 ) ) : '';
@@ -1563,8 +1590,14 @@ function ct_scan_send_accepted_copy( $job_id ) {
 		if ( ! $row || empty( $row->confirmed_at ) || ! is_email( $row->contact_email )
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_scan_email' ) !== $row->contact_email
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_version' ) !== $row->terms_version
-			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) !== $row->terms_hash ) {
+			|| strtolower( ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) ) !== $row->terms_hash ) {
 			return new WP_Error( 'accepted_copy_unavailable', 'The accepted copy requires the confirmed, authorized recipient.' );
+		}
+		// Re-checked under the queue lock right before the claim: a job that was cancelled, stopped,
+		// expired or whose evidence changed since confirmation gets no copy. A confirmed job waiting for
+		// proof of target control is live (confirmation sends the copy then); control gates the scan, not the copy.
+		if ( ! in_array( $row->status, array( 'awaiting_control', 'queued', 'leased', 'running' ), true ) || ! ct_scan_authorization_is_live( $row ) ) {
+			return new WP_Error( 'accepted_copy_unavailable', 'The accepted copy requires a live authorization.' );
 		}
 		$claimed = $wpdb->update(
 			$table,
@@ -1673,7 +1706,7 @@ function ct_scan_control_markup( $row, $page_token, $notice, $attempts_used ) {
 		$html .= '<p><strong>' . esc_html( $notice ) . '</strong></p>';
 	}
 	$html .= '<p>No screening runs until control of <strong>' . esc_html( $host ) . '</strong> is shown. Publish ONE of the following, then press Check.</p>';
-	$html .= '<p>DNS TXT record at <code>' . esc_html( $limits['dns_label'] . '.' . $host ) . '</code> with the value:<br><code>' . esc_html( $limits['dns_prefix'] . $challenge ) . '</code></p>';
+	$html .= '<p>DNS TXT record at <code>' . esc_html( $limits['dns_label'] . '.' . $host ) . '</code> with the value:<br><code>' . esc_html( $limits['dns_prefix'] . $challenge ) . '</code><br><small>The TXT record must be at that exact name: a CNAME there is not followed. Wait until the record is visible in public DNS before checking; a check made too early can be answered from a cached "no record" and still uses one of your checks.</small></p>';
 	$html .= '<p>or the file <code>https://' . esc_html( $host . $limits['path'] ) . '</code> whose entire content is:<br><code>' . esc_html( $challenge ) . '</code></p>';
 	$html .= '<p>Keep this page\'s address private: it is the only way to return here and to request checks. Checks used: ' . (int) $attempts_used . ' of ' . (int) $limits['max_attempts'] . '; at least one minute apart.</p>';
 	$html .= '<form method="post" action="' . $action . '"><input type="hidden" name="action" value="ct_scan_control"><input type="hidden" name="job" value="' . esc_attr( (string) (int) $row->job_id ) . '"><input type="hidden" name="ctl" value="' . esc_attr( $page_token ) . '"><input type="hidden" name="_wpnonce" value="' . esc_attr( $nonce ) . '">';
@@ -1792,6 +1825,9 @@ function ct_scan_admin_record_authority_review( $job_id, $evidence_note ) {
 		if ( ! $row || 'awaiting_control' !== $row->status || empty( $row->control_required ) || ! empty( $row->revoked_at ) || ! ct_scan_authorization_is_live( $row ) ) {
 			return new WP_Error( 'authority_review_unavailable', 'This job is not waiting for target control.' );
 		}
+		if ( 'checking' === $row->control_state ) {
+			return new WP_Error( 'authority_review_check_in_progress', 'A DNS or file check for this job is in progress. Wait for its result (at most two minutes), then reload this page and record the review if the job is still waiting.' );
+		}
 		$now      = ct_scan_utc_now();
 		$evidence = wp_json_encode( array(
 			'method'      => 'manual_review',
@@ -1805,9 +1841,9 @@ function ct_scan_admin_record_authority_review( $job_id, $evidence_note ) {
 		$updated  = $wpdb->update(
 			$table,
 			array( 'status' => 'queued', 'control_state' => 'none', 'control_method' => 'manual_review', 'control_verified_at' => $now, 'control_valid_until' => $row->authorization_expires_at, 'control_evidence' => $evidence, 'control_token_hash' => null, 'control_page_hash' => null, 'control_lease_hash' => null, 'control_lease_until' => null ),
-			array( 'job_id' => (int) $row->job_id, 'status' => 'awaiting_control' ),
+			array( 'job_id' => (int) $row->job_id, 'status' => 'awaiting_control', 'control_state' => $row->control_state ),
 			array_fill( 0, 10, '%s' ),
-			array( '%d', '%s' )
+			array( '%d', '%s', '%s' )
 		);
 		if ( 1 !== $updated ) {
 			return new WP_Error( 'authority_review_write_failed', 'The review could not be durably recorded.' );
@@ -2481,6 +2517,11 @@ function ct_scan_admit_control_locked( $data, $now_ms ) {
 	if ( 'control_probe' === $data['kind'] ) {
 		return array( 200, array( 'ok' => true, 'live' => true ) );
 	}
+	// One lease, one check: a lease that was already admitted is never admitted again, however
+	// long it has left. The lease (two minutes) outlives the one-minute interval between checks.
+	if ( ! empty( $row->control_admitted ) ) {
+		return $refuse( 409, 'already_admitted' );
+	}
 	$used = (int) $row->control_attempts;
 	if ( $used >= $limits['max_attempts'] ) {
 		return $refuse( 409, 'budget_exhausted' );
@@ -2497,10 +2538,10 @@ function ct_scan_admit_control_locked( $data, $now_ms ) {
 	}
 	$updated = $wpdb->update(
 		$table,
-		array( 'control_attempts' => $used + 1, 'control_last_attempt_ms' => $now_ms ),
-		array( 'job_id' => (int) $row->job_id, 'status' => 'awaiting_control', 'control_state' => 'checking', 'control_lease_hash' => $row->control_lease_hash, 'control_attempts' => $used ),
-		array( '%d', '%d' ),
-		array( '%d', '%s', '%s', '%s', '%d' )
+		array( 'control_attempts' => $used + 1, 'control_last_attempt_ms' => $now_ms, 'control_admitted' => 1 ),
+		array( 'job_id' => (int) $row->job_id, 'status' => 'awaiting_control', 'control_state' => 'checking', 'control_lease_hash' => $row->control_lease_hash, 'control_attempts' => $used, 'control_admitted' => 0 ),
+		array( '%d', '%d', '%d' ),
+		array( '%d', '%s', '%s', '%s', '%d', '%d' )
 	);
 	if ( 1 !== $updated ) {
 		return $refuse( 503, 'admission_write_failed' );
@@ -2554,9 +2595,9 @@ function ct_scan_control_claim( WP_REST_Request $request ) {
 		}
 		$updated = $wpdb->update(
 			$table,
-			array( 'control_state' => 'checking', 'control_lease_hash' => hash( 'sha256', $lease ), 'control_lease_until' => gmdate( 'Y-m-d H:i:s', $lease_until ), 'control_leased_ms' => (int) floor( microtime( true ) * 1000 ) ),
+			array( 'control_state' => 'checking', 'control_lease_hash' => hash( 'sha256', $lease ), 'control_lease_until' => gmdate( 'Y-m-d H:i:s', $lease_until ), 'control_leased_ms' => (int) floor( microtime( true ) * 1000 ), 'control_admitted' => 0 ),
 			array( 'job_id' => (int) $row->job_id, 'status' => 'awaiting_control', 'control_state' => 'requested' ),
-			array( '%s', '%s', '%s', '%d' ),
+			array( '%s', '%s', '%s', '%d', '%d' ),
 			array( '%d', '%s', '%s' )
 		);
 		if ( 1 !== $updated ) {
@@ -2591,6 +2632,10 @@ function ct_scan_control_value_matches( $method, $value, $token_hash ) {
 		}
 		$token = substr( $value, strlen( $prefix ) );
 	} else {
+		// Editors on some systems save a UTF-8 byte-order mark first; it is not part of the value.
+		if ( 0 === strncmp( $value, "\xEF\xBB\xBF", 3 ) ) {
+			$value = substr( $value, 3 );
+		}
 		$token = trim( $value, " \t\r\n" );
 	}
 	return 1 === preg_match( '/\A[a-f0-9]{64}\z/', $token ) && hash_equals( $token_hash, hash( 'sha256', $token ) );
@@ -2633,7 +2678,7 @@ function ct_scan_control_result( WP_REST_Request $request ) {
 			return ct_scan_rest_error( 410, 'lease_invalid_or_expired' );
 		}
 		// The result of a check counts only if the guard admitted that check under this lease.
-		if ( null === $row->control_last_attempt_ms || null === $row->control_leased_ms || (int) $row->control_last_attempt_ms < (int) $row->control_leased_ms ) {
+		if ( empty( $row->control_admitted ) || null === $row->control_last_attempt_ms || null === $row->control_leased_ms || (int) $row->control_last_attempt_ms < (int) $row->control_leased_ms ) {
 			return ct_scan_rest_error( 409, 'no_admission' );
 		}
 		if ( ! ct_scan_authorization_is_live( $row ) ) {
@@ -2885,13 +2930,14 @@ function ct_scan_admin_send_report( $job_id ) {
 			return new WP_Error( 'report_recipient_unconfirmed', 'The recipient never confirmed this request. Detailed findings cannot be sent.' );
 		}
 		// ...and, when the job required it, only for a target whose control was established.
-		if ( ! empty( $row->control_required ) && empty( $row->control_verified_at ) ) {
+		if ( ct_scan_control_required( $row ) && empty( $row->control_verified_at ) ) {
 			return new WP_Error( 'report_target_unverified', 'Control of the target was never established. Detailed findings cannot be sent.' );
 		}
 		if ( ! is_email( $row->contact_email )
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_scan_email' ) !== $row->contact_email
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_version' ) !== $row->terms_version
-			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) !== $row->terms_hash ) {
+			// The job stores the recorded terms hash lowercased (as the accepted-copy path compares it).
+			|| strtolower( ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) ) !== $row->terms_hash ) {
 			return new WP_Error( 'report_contact_changed', 'The original authorized report contact could not be verified.' );
 		}
 		$body = ct_scan_build_report_body( $row );

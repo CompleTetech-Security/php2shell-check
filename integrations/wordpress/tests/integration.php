@@ -158,6 +158,17 @@ ct_test_assert( is_wp_error( ct_scan_admin_save_manual_remainder( $unknown_event
 ct_test_assert( true === ct_scan_admin_record_delivery( $unknown_event['job_id'] ), 'Independent proof must allow recording delivery from unknown state.' );
 $mail_mode = true;
 
+// The recorded terms hash is compared case-insensitively at report time (the job stores it lowercased).
+list( $upper_id, $upper_fields ) = ct_test_request( 'upper-hash-report-fixture.example.net' );
+$request_ids[] = $upper_id;
+update_post_meta( $upper_id, '_ct_terms_sha256', strtoupper( get_post_meta( $upper_id, '_ct_terms_sha256', true ) ) );
+$upper_event = ct_scan_on_request_ready( $upper_id, $upper_fields );
+ct_test_assert( is_array( $upper_event ), 'A request with an upper-case terms hash was refused.' );
+ct_test_queue_job( $upper_event['job_id'] );
+$wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $upper_event['job_id'] ) );
+ct_test_assert( true === ct_scan_admin_save_manual_remainder( $upper_event['job_id'], 'No remaining work was performed in this fixture.' ), 'Upper-case hash fixture manual notes failed.' );
+ct_test_assert( true === ct_scan_admin_send_report( $upper_event['job_id'] ), 'An upper-case recorded terms hash blocked the reviewed report.' );
+
 // Old requests are never backfilled, and any changed saved target permanently cancels authorization.
 list( $legacy_id, $legacy_fields ) = ct_test_request( 'legacy-fixture.example.net' );
 $request_ids[] = $legacy_id;

@@ -656,6 +656,30 @@ ct_test_assert( null === $idle['job'] && ! ct_test_exists( $claim_due ), 'A clai
 ct_test_end_job( (int) $claimed['job']['id'] );
 delete_transient( 'ct_scan_retention_last' );
 
+// ---- Target control: a job waiting for (or in the middle of) a control check never closes -----------------------
+foreach ( array( 'pending' => null, 'checking' => '+2 minutes' ) as $state => $lease_for ) {
+	$ctl = ct_test_aged_job( "ret-control-{$state}.example.net", 'failed', '-3 years -1 day', '-1 day' );
+	$wpdb->update( $jobs, array( 'status' => 'awaiting_control', 'control_required' => 1, 'control_state' => $state, 'control_attempts' => 1, 'control_lease_hash' => $lease_for ? str_repeat( 'c', 64 ) : null, 'control_lease_until' => $lease_for ? ct_test_old( $lease_for ) : null, 'authorization_expires_at' => ct_test_old( '+30 days' ), 'finished_at' => null, 'closed_at' => ct_test_old( '-4 years' ), 'retain_until' => ct_test_old( '-1 day' ) ), array( 'job_id' => $ctl['job_id'] ) );
+	ct_test_maintain();
+	$cr = ct_scan_row( $ctl['job_id'] );
+	ct_test_assert( $cr && 'awaiting_control' === $cr->status && $state === $cr->control_state && null === $cr->closed_at && null === $cr->retain_until && get_post( $ctl['request_id'] ), "A job awaiting target control ({$state}) was closed or deleted by retention." );
+	$wpdb->delete( $jobs, array( 'job_id' => $ctl['job_id'] ) );
+}
+// A restored row that a tombstone recognises is not deleted while it holds a lease (a control check in progress or a
+// running scan): that would free the one-at-a-time gate while its traffic may be in flight. Once the lease ends, it is.
+foreach ( array( 'control' => array( 'status' => 'awaiting_control', 'control_required' => 1, 'control_state' => 'checking', 'control_attempts' => 1, 'control_lease_hash' => str_repeat( 'c', 64 ), 'control_lease_until' => ct_test_old( '+2 minutes' ) ), 'scan' => array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => str_repeat( 'b', 64 ), 'lease_until' => ct_test_old( '+2 minutes' ) ) ) as $kind => $leased ) {
+	$gone = ct_test_aged_job( "ret-restore-{$kind}.example.net", 'failed', '-3 years -1 day', '-1 day' );
+	ct_test_maintain();
+	ct_test_assert( ! ct_test_exists( $gone ), 'Fixture expected the job to be deleted first.' );
+	$gstone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $gone['job_id'] ) );
+	$wpdb->insert( $jobs, array_merge( array( 'job_id' => $gone['job_id'], 'request_id' => $gone['request_id'], 'target_origin' => "https://ret-restore-{$kind}.example.net/", 'scope_hash' => hash( 'sha256', "https://ret-restore-{$kind}.example.net/" ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'created_at' => $gstone->created_at ), $leased ) );
+	ct_test_maintain();
+	ct_test_assert( ct_test_exists( $gone ), "A restored row holding a live {$kind} lease was deleted by its tombstone mid-lease." );
+	$wpdb->update( $jobs, 'control' === $kind ? array( 'control_lease_until' => ct_test_old( '-1 minute' ) ) : array( 'lease_until' => ct_test_old( '-1 minute' ) ), array( 'job_id' => $gone['job_id'] ) );
+	ct_test_maintain();
+	ct_test_assert( ! ct_test_exists( $gone ), "A restored row was not deleted again after its {$kind} lease ended." );
+}
+
 foreach ( $request_ids as $id ) {
 	$wpdb->delete( $jobs, array( 'request_id' => $id ), array( '%d' ) );
 	wp_delete_post( $id, true );

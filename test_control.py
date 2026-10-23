@@ -415,6 +415,23 @@ class GateKindTests(unittest.TestCase):
         time.sleep(0.05)
         self.assertEqual(pump.service(), "admission_protocol_violation")
 
+    def test_an_already_admitted_lease_ends_the_check_without_retry(self):
+        calls = []
+
+        class API:
+            def admit(self, claim, kind):
+                calls.append(kind)
+                if len(calls) == 1:
+                    raise APIError("api_http_409", status=409, payload={"ok": False, "reason": "already_admitted"})
+                return {"ok": True, "admitted": True, "sequence": 2, "valid_ms": 1000, "timeout_ms": 10000, "http_remaining": 1}
+
+        task = ControlTask(5, TARGET, "h" * 64, "dns_txt", datetime.fromtimestamp(NOW + 100, timezone.utc), "l" * 64, datetime.fromtimestamp(NOW + 50, timezone.utc))
+        gate = AdmissionGate(API(), task, kind="control", clock=lambda: NOW)
+        with self.assertRaises(AdmissionDenied) as denied:
+            gate.admit()
+        self.assertEqual(denied.exception.slug, "already_admitted")
+        self.assertEqual(calls, ["control"], "an already admitted lease must not be retried into a second check")
+
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "the supervisor uses Linux process isolation APIs")
 class ScannerControlTests(unittest.TestCase):

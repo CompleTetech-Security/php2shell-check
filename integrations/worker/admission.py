@@ -48,6 +48,12 @@ MAX_MESSAGE_BYTES = 256
 CHILD_REPLY_TIMEOUT_SECONDS = 15.0
 REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 RETRYABLE_BUSY = {"queue_busy", "admission_write_failed"}
+# Probe answers that say nothing about whether the job is live. They never abort a
+# request already admitted (its own ten-second bound still applies) and the next
+# admission fails closed on them. ``queue_busy`` only means the queue lock was held
+# elsewhere (often by this supervisor's own concurrent admission); ``admission_error``
+# means WordPress failed while deciding. Every explicit refusal stays fatal.
+PROBE_INCONCLUSIVE = {"guard_unavailable", "guard_timeout", "admission_response_invalid", "queue_busy", "admission_error"}
 
 
 class AdmissionDenied(Exception):
@@ -178,7 +184,8 @@ class AdmissionGate:
                 if self._monotonic() - started > MAX_GRANT_AGE_SECONDS:
                     # WordPress answered, but too slowly for the one-second lifetime to be useful.
                     stale += 1
-                    if stale > MAX_STALE_REGRANTS:
+                    if stale > MAX_STALE_REGRANTS or self._monotonic() >= deadline:
+                        # Bounded by the same admission deadline as every other retry.
                         raise AdmissionDenied("admission_expired")
                     continue
                 return grant
@@ -193,9 +200,22 @@ class AdmissionGate:
                     raise
 
     def probe(self):
-        """Ask whether the job is still live. Consumes no budget and does not pace."""
-        self._check_local()
-        response = self._call("probe" if self.kind == "http" else "control_probe")
+        """Ask whether the job is still live. Consumes no budget and does not pace.
+
+        A busy queue lock is retried briefly within one call budget; if it stays
+        busy the probe reports ``queue_busy``, which the pump treats as inconclusive.
+        """
+        probe_kind = "probe" if self.kind == "http" else "control_probe"
+        busy_until = self._monotonic() + CALL_BUDGET_SECONDS
+        while True:
+            self._check_local()
+            try:
+                response = self._call(probe_kind)
+                break
+            except AdmissionDenied as denied:
+                if denied.slug != "queue_busy" or self._monotonic() + BUSY_RETRY_SECONDS >= busy_until:
+                    raise
+                self._wait(BUSY_RETRY_SECONDS)
         if not isinstance(response, dict) or set(response) != {"ok", "live"} or response["ok"] is not True or response["live"] is not True:
             raise AdmissionDenied("admission_response_invalid")
 
@@ -346,10 +366,11 @@ class AdmissionPump:
         if thread is not None and not thread.is_alive():
             self._probe_thread = None
             denied, self._probe_result = self._probe_result, None
-            # An unreachable guard does not abort the request already admitted (its own
-            # ten-second bound applies), and the next admission fails closed. An explicit
-            # refusal, including a disabled integration, stops the scanner now.
-            if denied is not None and denied.slug not in {"guard_unavailable", "guard_timeout", "admission_response_invalid"}:
+            # An inconclusive probe (unreachable guard, busy queue lock, store error) does
+            # not abort the request already admitted (its own ten-second bound applies),
+            # and the next admission fails closed. An explicit refusal, including a
+            # disabled integration, stops the scanner now.
+            if denied is not None and denied.slug not in PROBE_INCONCLUSIVE:
                 return self._fail(denied.slug)
             thread = None
         if self._probe_thread is None and now - self._last_probe >= PROBE_INTERVAL_SECONDS:
