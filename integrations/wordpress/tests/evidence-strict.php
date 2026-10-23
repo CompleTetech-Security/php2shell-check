@@ -82,6 +82,17 @@ ct_test_queue_job( $upper_event['job_id'] );
 $count = count( $mail );
 ct_test_assert( 'sent' === ct_scan_send_accepted_copy( $upper_event['job_id'] ) && count( $mail ) === $count + 1, 'An upper-case recorded terms hash blocked the accepted copy.' );
 
+// The strict policy requires target control: confirmation leaves the job awaiting control and still sends the copy.
+list( $ctl_id, $ctl_fields ) = ct_test_request( 'strict-awaiting-control.example.net', 'control.customer@example.com' );
+$request_ids[] = $ctl_id;
+ct_test_bind( $ctl_id, $ctl_fields );
+$count = count( $mail );
+$ctl_event = ct_scan_on_request_ready( $ctl_id, $ctl_fields );
+ct_test_assert( is_array( $ctl_event ) && 1 === (int) ct_scan_row( $ctl_event['job_id'] )->control_required && 1 === preg_match( '/token=([a-f0-9]{64})/', $mail[ $count ]['message'], $ctl_m ), 'The control-required fixture job or its confirmation mail is missing.' );
+list( , $ctl_status ) = ct_scan_confirm_job( $ctl_event['job_id'], $ctl_m[1] );
+$ctl_row = ct_scan_row( $ctl_event['job_id'] );
+ct_test_assert( 200 === $ctl_status && 'awaiting_control' === $ctl_row->status && 'accepted' === $ctl_row->accepted_copy_status && array( 'control.customer@example.com' ) === array_values( (array) $mail[ count( $mail ) - 1 ]['to'] ), 'Confirming a job that awaits target control did not send the accepted copy.' );
+
 // A job that is no longer live when the copy would be sent gets none, and its copy state is untouched.
 foreach ( array( 'cancelled', 'revoked', 'evidence_changed' ) as $how ) {
 	list( $dead_id, $dead_fields ) = ct_test_request( 'strict-dead-' . str_replace( '_', '-', $how ) . '.example.net' );

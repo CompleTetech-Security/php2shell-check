@@ -94,7 +94,16 @@ function ct_test_result( $target ) {
 
 function ct_test_queue_job( $job_id ) {
 	global $wpdb;
-	$wpdb->update( ct_scan_jobs_table(), array( 'status' => 'queued', 'confirmation_token_hash' => null, 'confirmation_expires_at' => null, 'confirmed_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $job_id ) );
+	$update = array( 'status' => 'queued', 'confirmation_token_hash' => null, 'confirmation_expires_at' => null, 'confirmed_at' => ct_scan_utc_now() );
+	$row    = ct_scan_row( $job_id );
+	if ( $row && ! empty( $row->control_required ) ) {
+		// A job that must show control of its target is released only by that proof; fixtures that are not
+		// about the control gate stand in for it.
+		$update['control_verified_at'] = ct_scan_utc_now();
+		$update['control_valid_until'] = $row->authorization_expires_at;
+		$update['control_method']      = 'manual_review';
+	}
+	$wpdb->update( ct_scan_jobs_table(), $update, array( 'job_id' => (int) $job_id ) );
 }
 
 

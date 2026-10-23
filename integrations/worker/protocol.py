@@ -22,8 +22,10 @@ API_HOST = "complete.tech"
 API_BASE_PATH = "/wp-json/ct-scan/v1"
 AUTH_ROUTE_PREFIX = "/ct-scan/v1"
 ROUTES = frozenset(
-    f"{AUTH_ROUTE_PREFIX}/{name}" for name in ("claim", "start", "admit", "result")
+    f"{AUTH_ROUTE_PREFIX}/{name}" for name in ("claim", "start", "admit", "result", "control/claim", "control/result")
 )
+CONTROL_METHODS = frozenset({"dns_txt", "https_file"})
+CONTROL_OUTCOMES = frozenset({"observed", "not_found", "error"})
 API_MAX_BODY = 64 * 1024
 API_MAX_RESPONSE = 16 * 1024
 MAX_JOB_ID = 2**63 - 1
@@ -50,6 +52,19 @@ class JobClaim:
     target: str
     scope_hash: str
     terms_hash: str
+    expires_at: datetime
+    lease: str
+    lease_until: datetime
+
+
+@dataclass(frozen=True)
+class ControlTask:
+    """One customer-requested target-control check: a single TXT lookup or HTTPS request."""
+
+    job_id: int
+    target: str
+    scope_hash: str
+    method: str
     expires_at: datetime
     lease: str
     lease_until: datetime
@@ -123,6 +138,25 @@ def validate_claim(value, *, now: datetime | None = None) -> JobClaim | None:
     return JobClaim(job_id, target, scope_hash, terms_hash, expires_at, lease, lease_until)
 
 
+def validate_control_task(value, *, now: datetime | None = None) -> ControlTask | None:
+    if not isinstance(value, dict) or set(value) != {"task"}:
+        raise APIError("invalid_claim_schema")
+    data = value["task"]
+    if data is None:
+        return None
+    required = {"id", "target", "scope_hash", "method", "expires_at", "lease", "lease_until"}
+    if not isinstance(data, dict) or set(data) != required:
+        raise APIError("invalid_job_schema")
+    # The binding rules are the scan claim's: same target normalization, hash, lease and bounds.
+    claim = validate_claim(
+        {"job": {**{k: data[k] for k in ("id", "target", "scope_hash", "expires_at", "lease", "lease_until")}, "terms_hash": "0" * 64}},
+        now=now,
+    )
+    if data["method"] not in CONTROL_METHODS:
+        raise APIError("invalid_control_method")
+    return ControlTask(claim.job_id, claim.target, claim.scope_hash, data["method"], claim.expires_at, claim.lease, claim.lease_until)
+
+
 class APIClient:
     """One-shot API calls to the fixed CompleteTech HTTPS origin."""
 
@@ -191,12 +225,31 @@ class APIClient:
 
         A short timeout keeps a slow store from stalling the supervisor; a timeout is a refusal.
         """
-        if kind not in {"http", "probe"}:
+        if kind not in {"http", "probe", "control", "control_probe"}:
             raise APIError("invalid_admission_kind")
         return self.post(
             "/ct-scan/v1/admit",
             {"id": claim.job_id, "lease": claim.lease, "scope_hash": claim.scope_hash, "kind": kind},
             timeout=5.0,
+        )
+
+    def control_claim(self) -> ControlTask | None:
+        response = self.post("/ct-scan/v1/control/claim", {})
+        return validate_control_task(response)
+
+    def control_result(self, task: ControlTask, outcome: str, observed: list[str]) -> dict:
+        if outcome not in CONTROL_OUTCOMES or not isinstance(observed, list):
+            raise APIError("invalid_control_result")
+        return self.post(
+            "/ct-scan/v1/control/result",
+            {
+                "id": task.job_id,
+                "lease": task.lease,
+                "scope_hash": task.scope_hash,
+                "method": task.method,
+                "outcome": outcome,
+                "observed": observed,
+            },
         )
 
     def result(self, body: bytes) -> dict:

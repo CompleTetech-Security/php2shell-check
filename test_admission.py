@@ -285,6 +285,12 @@ class GateTests(unittest.TestCase):
         self.assertEqual(denied.exception.slug, "authorization_revoked_or_expired")
         self.assertEqual(self.api.calls, ["probe"])
 
+    def test_a_control_probe_retries_a_busy_queue_lock_on_its_own_route(self):
+        self.api = _AdmitAPI(_refusal(503, "queue_busy"), {"ok": True, "live": True})
+        gate = AdmissionGate(self.api, _claim(expires_at=NOW + 7200), kind="control", stop_event=self.stop, clock=lambda: NOW, monotonic=self.clock)
+        gate.probe()
+        self.assertEqual(self.api.calls, ["control_probe", "control_probe"])
+
 
 class ApiClientAdmitTests(unittest.TestCase):
     def test_admit_is_signed_for_its_own_route_with_a_short_timeout_and_exact_body(self):

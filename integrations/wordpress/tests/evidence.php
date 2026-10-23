@@ -28,6 +28,7 @@ list( $legacy_id, $legacy_fields ) = ct_test_request( 'evidence-legacy.example.n
 $request_ids[] = $legacy_id;
 $legacy = ct_scan_on_request_ready( $legacy_id, $legacy_fields );
 ct_test_assert( is_array( $legacy ) && null === ct_scan_row( $legacy['job_id'] )->summary_sha256, 'A legacy acceptance was refused or gained a summary digest.' );
+ct_test_assert( 0 === (int) ct_scan_row( $legacy['job_id'] )->bound_required && 0 === (int) ct_scan_row( $legacy['job_id'] )->control_required, 'An explicitly grandfathered r2 job was made to require evidence or control.' );
 
 // A valid bound acceptance creates a job that records the summary digest.
 list( $ok_id, $ok_fields ) = ct_test_request( 'evidence-ok.example.net' );

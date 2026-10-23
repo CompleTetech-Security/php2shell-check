@@ -58,8 +58,8 @@ flowchart LR
 
 ## Worker protocol
 
-The four POST routes are `claim`, `start`, `admit` and `result`, under
-`/wp-json/ct-scan/v1/`.
+The POST routes are `claim`, `start`, `admit`, `result`, `control/claim` and
+`control/result`, under `/wp-json/ct-scan/v1/`.
 Each request carries `X-CT-Timestamp` (Unix seconds), `X-CT-Nonce` (32 lowercase
 hex characters), and `X-CT-Signature` (HMAC-SHA256 hex). The signed string is the
 timestamp, nonce, `POST`, route without `/wp-json`, and raw-body SHA-256 joined
@@ -97,7 +97,8 @@ restart cannot create a fresh budget. A grant is consumed when issued, is
 valid for one second and covers one connection and one request. `probe` only
 reports whether the job is still live; it takes no budget and has no pacing.
 Refusals use `410` (permanent: cancelled, expired, revoked, lease, profile,
-unconfirmed, clock anomaly), `409` (`budget_exhausted`), `429` (`rate_wait`
+unconfirmed, clock anomaly), `409` (`budget_exhausted`; `already_admitted` for a
+control lease that was already admitted), `429` (`rate_wait`
 with `retry_after_ms`, bounded retries) and `503` (`queue_busy`, the lock is
 held elsewhere). A `503` for a disabled integration or a schema mismatch also
 refuses. Nothing is admitted unless WordPress says so.
@@ -175,6 +176,87 @@ Before upgrading the pinned revision or rotating the key, stop accepting new
 work, drain/reconcile existing receipts and stop the controller. Do not change
 the expected revision while old receipts are awaiting acknowledgement.
 
+## Exact-target control
+
+Mailbox confirmation shows control of an email address, not of the website, and
+a referral code shows neither. **Every job must show control of the exact
+hostname before any scan can be claimed, unless its terms version was explicitly
+grandfathered**: the `strict` policy (the default for every version; see "Strict
+by default" above) requires it, and only an r2-or-earlier version listed as
+`legacy` in `terms_policy` is exempt. Each job freezes that requirement when it
+is created.
+For such a job, confirmation no longer queues it: it waits as
+`awaiting_control`, and the confirmation page shows a one-time challenge token
+(only its hash is stored) with two ways to publish it. The published challenge
+value and the customer's page capability are two independent secrets: the page
+address (which contains the capability, and is the only way back to the page)
+is never published, and the challenge shown on it is derived from the capability
+with a keyed hash, so someone who reads the published challenge cannot open the
+page, request checks or use up the three attempts:
+
+- a DNS TXT record at `_ct-scan-challenge.<hostname>` with the value
+  `ct-scan-verify=<token>`, or
+- the file `https://<hostname>/.well-known/ct-scan-challenge.txt` whose entire
+  content is the token (surrounding whitespace and a leading UTF-8 byte-order
+  mark are ignored).
+
+The TXT lookup asks for TXT records at exactly that name: a CNAME there is not
+followed, so a TXT record delegated through a CNAME (as some DNS providers do)
+does not verify. Resolvers cache a "no such record" answer for the zone's
+negative-caching time, so a check requested before a new record has propagated
+can see no record, and it still uses one of the three checks; the customer page
+says to wait until the record is publicly visible.
+
+The customer's page (address shown once; GET only displays it, a nonce-protected
+POST acts) lets them request a check. The disclosed limits: at most three checks
+per job, at least a minute apart; each check is one TXT lookup or one HTTPS
+request to the fixed path, with no redirects, at most 4096 bytes and a ten-second
+timeout; no probe of any kind is sent to help a failed check pass. A scheduled
+check is taken by the worker (`control/claim`), admitted exactly once through the
+same guard as a scan (`admit` with `kind` `control`; the attempt is consumed in the
+admission's compare-and-set, with its own pacing, budget, cancellation, expiry and
+lease checks, and `control_probe` for liveness). WordPress records the admission
+on the lease (`control_admitted`), so a second `admit` under the same lease is
+refused with `409` `already_admitted` for the rest of the two-minute lease, even
+after the one-minute interval has passed, and the worker ends the check without
+retrying. The check is run inside the unprivileged
+child, and reported with `control/result`. The worker relays what it observed
+(untrusted, length-bounded); WordPress compares it with the stored hash. A result
+is accepted only if an admission happened under that lease, so no check can
+count without having been admitted. A match releases the job (`queued`,
+`control_method`, `control_verified_at`, evidence limited to the method, attempt,
+time, target and a hash of the matched value). Three failed checks end the job as
+`blocked` (`target_control_failed`); a blocked job is never scanned and gets no
+detailed report. There is no fallback from a failed challenge to a scan.
+
+An administrator can instead record an **authority review** (admin queue,
+`authority_review`): the evidence reviewed (20 to 1000 characters), the target,
+the reviewer's account, the time and the expiry (the authorization expiry) are
+stored, and the job is released the same way. A review is refused while a DNS or
+file check is in flight (`control_state` `checking`); record it once that check
+has reported or its lease has lapsed. An expired review ends the
+authorization. Detailed reports (`ct_scan_admin_send_report`) additionally
+require control of the target for jobs that required it, in any terminal state.
+
+DNS answers are parsed defensively (matching id, question and source address; a
+truncated or malformed answer is an error, with no TCP or resolver fallback) and
+come from the container's first configured resolver; they grant no exemption from
+the connection-safety rules, which still apply to the HTTPS check. Control checks
+and the scan share the single worker loop; no check can start while a scan runs.
+The gate is on by default and cannot be dropped by omission: the integration
+refuses to enable unless the served terms version has an explicit `terms_policy`
+entry, a new version is strict whatever the configuration says, and a profile
+broader than the r2 header screening always requires control.
+The requirement is frozen per job: jobs created before the upgrade to schema 5
+have `control_required = 0` and keep their earlier behaviour; a row whose value
+is missing is treated as requiring control.
+One piece of target traffic runs at a time worker-wide: a scan claim is refused
+while a check is in progress and the reverse, enforced in WordPress. If every
+check is spent but the last result was lost, maintenance blocks the job.
+Not done: reissuing a challenge after `blocked` (a new request is needed),
+per-contact/domain/IP quotas for fresh challenges, and customer-facing wording
+(the pages are functional placeholders marked `TODO(owner)`).
+
 ## Bound acceptance evidence and the accepted copy
 
 A request is queued only if its saved acceptance reads back completely. A
@@ -227,8 +309,8 @@ confirmation sends the verified contact their copy: the Target Summary, the
 hashes, the filled-in copy and, for a bound acceptance, the exact terms bytes
 as an attachment (written to a private temporary directory and attached only if
 it reproduces the recorded hash). The recipient must still be the confirmed,
-authorized address, and the job must still be live (queued, leased or running,
-not revoked, and its retained evidence unchanged), re-checked under the queue
+authorized address, and the job must still be live (awaiting target control,
+queued, leased or running, not revoked, and its retained evidence unchanged), re-checked under the queue
 lock immediately before the send is claimed. It is sent at most once (the status is claimed by
 compare-and-set before mail is handed off), only to the verified address, and
 never to a referrer. An uncertain or failed hand-off is recorded as `unknown`
@@ -378,8 +460,17 @@ The default configuration is disabled, and no historical request sweep exists.
 5. Enforce egress (see "Egress"), then set `egress_enforced` true. Apply the
    reviewed site patch/terms update, then set `enabled` true. The runner must
    authenticate successfully before accepting live submissions. A matching
-   revision and key and `egress_enforced` are required; otherwise the
-   integration stays disabled.
+   revision and key, `egress_enforced`, and an explicit `terms_policy` entry
+   (`strict` or `legacy`, see "Bound acceptance evidence") for the served
+   `supported_terms_version` are required; otherwise the integration stays
+   disabled.
+
+**Upgrading an existing deployment:** add the `terms_policy` entry for the
+served terms version before (or together with) installing this plugin
+version. Without it the integration is disabled: the whole worker API answers
+503, new acceptances are not queued, and in-flight (queued, leased or running)
+jobs stall (they are not claimed, admitted or finished) until the entry is
+added or their authorization expires.
 
 Take a database backup first: the upgrade changes the jobs table in place. If it
 cannot complete, the failure is written to the PHP error log once, the worker

@@ -116,9 +116,12 @@ def parse_refusal(error: APIError) -> AdmissionDenied:
 class AdmissionGate:
     """Supervisor-side client for the WordPress admission route."""
 
-    def __init__(self, api, claim, *, stop_event=None, deadline=None, clock=time.time, monotonic=time.monotonic):
+    def __init__(self, api, claim, *, kind="http", stop_event=None, deadline=None, clock=time.time, monotonic=time.monotonic):
+        if kind not in {"http", "control"}:
+            raise ValueError("invalid_admission_kind")
         self.api = api
         self.claim = claim
+        self.kind = kind
         self.stop_event = stop_event
         # Wall-clock (epoch) time after which no further admission is requested at all.
         self.deadline = deadline
@@ -177,7 +180,7 @@ class AdmissionGate:
             self._check_local()
             started = self._monotonic()
             try:
-                grant = replace(parse_grant(self._call("http")), issued_at=started)
+                grant = replace(parse_grant(self._call(self.kind)), issued_at=started)
                 if self._monotonic() - started > MAX_GRANT_AGE_SECONDS:
                     # WordPress answered, but too slowly for the one-second lifetime to be useful.
                     stale += 1
@@ -202,11 +205,12 @@ class AdmissionGate:
         A busy queue lock is retried briefly within one call budget; if it stays
         busy the probe reports ``queue_busy``, which the pump treats as inconclusive.
         """
+        probe_kind = "probe" if self.kind == "http" else "control_probe"
         busy_until = self._monotonic() + CALL_BUDGET_SECONDS
         while True:
             self._check_local()
             try:
-                response = self._call("probe")
+                response = self._call(probe_kind)
                 break
             except AdmissionDenied as denied:
                 if denied.slug != "queue_busy" or self._monotonic() + BUSY_RETRY_SECONDS >= busy_until:
@@ -228,9 +232,12 @@ class AdmissionPump:
     advance by exactly one.
     """
 
-    def __init__(self, sock, gate, *, monotonic=time.monotonic):
+    def __init__(self, sock, gate, *, kind="http", monotonic=time.monotonic):
+        if kind not in {"http", "control"}:
+            raise ValueError("invalid_admission_kind")
         self.sock = sock
         self.gate = gate
+        self.kind = kind
         self._monotonic = monotonic
         self._buffer = bytearray()
         self._inflight_until = None
@@ -275,7 +282,7 @@ class AdmissionPump:
             self._inflight_until = None
             self._inflight_n = None
             return None
-        if set(message) == {"op", "kind", "n"} and message["op"] == "admit" and message["kind"] == "http":
+        if set(message) == {"op", "kind", "n"} and message["op"] == "admit" and message["kind"] == self.kind:
             if self.inflight or number != self._last_n + 1:
                 # One connection at a time and strictly sequential requests.
                 return self._fail("admission_protocol_violation")
@@ -384,8 +391,11 @@ class AdmissionRefused(Exception):
 class ChildAdmission:
     """Scanner-side client of the supervisor socket. Holds no key and no state of record."""
 
-    def __init__(self, sock, *, monotonic=time.monotonic):
+    def __init__(self, sock, *, kind="http", monotonic=time.monotonic):
+        if kind not in {"http", "control"}:
+            raise ValueError("invalid_admission_kind")
         self.sock = sock
+        self.kind = kind
         self._monotonic = monotonic
         self._granted_at = None
         self._valid_seconds = 0.0
@@ -431,7 +441,7 @@ class ChildAdmission:
         self._n += 1
         try:
             self.sock.settimeout(5.0)
-            self.sock.sendall(json.dumps({"op": "admit", "kind": "http", "n": self._n}, separators=(",", ":")).encode("ascii") + b"\n")
+            self.sock.sendall(json.dumps({"op": "admit", "kind": self.kind, "n": self._n}, separators=(",", ":")).encode("ascii") + b"\n")
         except OSError:
             self._poison("admission_channel_failed")
         try:

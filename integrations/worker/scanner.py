@@ -13,6 +13,7 @@ from dataclasses import asdict
 from wordpress_check import Checker
 
 from .admission import AdmissionRefused, ChildAdmission
+from .control import ControlError, fetch_challenge_file, lookup_txt, system_resolver
 from .network import PinnedOpener, RequestOrigin
 
 
@@ -54,6 +55,24 @@ def _admission_channel():
     return channel
 
 
+def _control(task, scope, guard):
+    """One exact-target control check: a single TXT lookup or HTTPS request, once admitted."""
+    method = "dns_txt" if task == "control_dns" else "https_file"
+    try:
+        if task == "control_dns":
+            observed = lookup_txt(scope.hostname, system_resolver(), guard)
+            outcome = "observed" if observed else "not_found"
+        else:
+            outcome, observed = fetch_challenge_file(PinnedOpener(scope, guard=guard), scope.hostname)
+    except AdmissionRefused as exc:
+        reason = str(exc)
+        slug = reason if reason.startswith("admission_") else "admission_" + reason
+        return _write({"ok": False, "error": slug[:64]}, 2)
+    except ControlError:
+        outcome, observed = "error", []
+    return _write({"ok": True, "control": {"method": method, "outcome": outcome, "observed": observed}}, 0)
+
+
 def _timeout(_signum, _frame):
     raise TimeoutError("scanner_timeout")
 
@@ -71,8 +90,14 @@ def main() -> int:
         if len(raw) > MAX_INPUT_BYTES:
             return _write({"ok": False, "error": "scanner_input_too_large"}, 2)
         data = json.loads(raw.decode("utf-8"))
-        if not isinstance(data, dict) or set(data) != {"target"} or not isinstance(data["target"], str):
+        if (
+            not isinstance(data, dict)
+            or set(data) not in ({"target"}, {"target", "task"})
+            or not isinstance(data["target"], str)
+            or data.get("task", "scan") not in {"scan", "control_dns", "control_https"}
+        ):
             return _write({"ok": False, "error": "invalid_scanner_input"}, 2)
+        task = data.get("task", "scan")
         scope, target = RequestOrigin.from_target(data["target"])
         if target != data["target"]:
             return _write({"ok": False, "error": "invalid_scanner_input"}, 2)
@@ -80,7 +105,9 @@ def main() -> int:
         if channel is None:
             # Fail closed: a scanner that cannot ask for admission never sends a request.
             return _write({"ok": False, "error": "admission_channel_unavailable"}, 2)
-        guard = ChildAdmission(channel)
+        guard = ChildAdmission(channel, kind="control" if task != "scan" else "http")
+        if task != "scan":
+            return _control(task, scope, guard)
         checker = Checker(timeout=10.0, delay=1.0, contact=CONTACT)
         checker.opener = PinnedOpener(scope, guard=guard)
         try:
