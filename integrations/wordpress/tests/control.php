@@ -1,8 +1,8 @@
 <?php
 /**
  * Exact-target control: DNS TXT / HTTPS file challenge limits, manual authority review, blocked
- * outcome, and the report/admission gates. Disposable fixture only. Re-runs itself with the terms
- * version listed as requiring target control.
+ * outcome, and the report/admission gates. Disposable fixture only. Re-runs itself with the strict
+ * terms policy (which requires target control).
  */
 if ( 'strict' !== getenv( 'CT_TEST_POLICY' ) ) {
 	$env  = array_merge( getenv(), array( 'CT_TEST_POLICY' => 'strict' ) );
@@ -122,7 +122,14 @@ $grant = ct_test_control_admit( $task );
 $gd = $grant->get_data();
 ct_test_assert( 200 === $grant->get_status() && 1 === $gd['sequence'] && 1000 === $gd['valid_ms'] && 10000 === $gd['timeout_ms'] && 2 === $gd['http_remaining'] && 1 === (int) ct_scan_row( $a['job_id'] )->control_attempts, 'The first control admission was not granted with the disclosed bounds.' );
 $again = ct_test_control_admit( $task );
-ct_test_assert( 429 === $again->get_status() && 'rate_wait' === $again->get_data()['reason'] && 1 === (int) ct_scan_row( $a['job_id'] )->control_attempts, 'A second control request inside a minute was admitted.' );
+ct_test_assert( 409 === $again->get_status() && 'already_admitted' === $again->get_data()['reason'] && 1 === (int) ct_scan_row( $a['job_id'] )->control_attempts, 'A second control request under the same lease was admitted.' );
+// The lease (two minutes) outlives the one-minute interval: once the interval has passed, the same
+// lease is still refused and the customer's remaining checks are untouched.
+$wpdb->query( $wpdb->prepare( "UPDATE {$jobs} SET control_last_attempt_ms = control_last_attempt_ms - 61000, control_leased_ms = control_leased_ms - 61000 WHERE job_id = %d", $a['job_id'] ) );
+$late = ct_test_control_admit( $task );
+$row  = ct_scan_row( $a['job_id'] );
+ct_test_assert( 409 === $late->get_status() && 'already_admitted' === $late->get_data()['reason'] && 1 === (int) $row->control_attempts && 'checking' === $row->control_state, 'A lease was admitted twice once the one-minute interval had passed.' );
+$wpdb->query( $wpdb->prepare( "UPDATE {$jobs} SET control_last_attempt_ms = control_last_attempt_ms + 61000, control_leased_ms = control_leased_ms + 61000 WHERE job_id = %d", $a['job_id'] ) );
 // A forged / wrong-method / malformed result is rejected and keeps the check open.
 foreach ( array(
 	array( 'observed', array( 'ct-scan-verify=' . $a['token'] ), array( 'method' => 'https_file' ), 410 ),
@@ -147,10 +154,10 @@ foreach ( array(
 	ct_test_assert( ! ct_scan_control_value_matches( 'dns_txt', $near, hash( 'sha256', $token ) ), 'A near-miss DNS value verified: ' . bin2hex( substr( $near, 0, 20 ) ) );
 }
 ct_test_assert( ct_scan_control_value_matches( 'dns_txt', 'ct-scan-verify=' . $token, hash( 'sha256', $token ) ), 'The exact DNS value did not verify.' );
-foreach ( array( $token, $token . "\n", $token . "\r\n", " \t" . $token ) as $ok ) {
+foreach ( array( $token, $token . "\n", $token . "\r\n", " \t" . $token, "\xEF\xBB\xBF" . $token . "\n" ) as $ok ) {
 	ct_test_assert( ct_scan_control_value_matches( 'https_file', $ok, hash( 'sha256', $token ) ), 'The file challenge did not verify with harmless whitespace.' );
 }
-foreach ( array( 'prefix ' . $token, $token . ' suffix', strtoupper( $token ), 'ct-scan-verify=' . $token, '' ) as $near ) {
+foreach ( array( 'prefix ' . $token, $token . ' suffix', strtoupper( $token ), 'ct-scan-verify=' . $token, '', "\xEF\xBB\xBF\xEF\xBB\xBF" . $token, $token . "\xEF\xBB\xBF" ) as $near ) {
 	ct_test_assert( ! ct_scan_control_value_matches( 'https_file', $near, hash( 'sha256', $token ) ), 'A near-miss file value verified.' );
 }
 // First honest failure: the DNS record is not there yet. The check is used, the job keeps waiting.
@@ -315,6 +322,18 @@ ct_test_assert( is_array( $scan_claim ) && (int) $scan_claim['id'] === (int) $q_
 ct_test_assert( null === ct_test_control_claim(), 'A control check was claimed while a scan was leased.' );
 
 // ---- Recorded manual authority review ------------------------------------------------------------------
+// Not while a check is in flight: its result could otherwise land on a job already released by review.
+$wpdb->update( $jobs, array( 'status' => 'cancelled', 'error_code' => 'test_cleanup' ), array( 'job_id' => (int) $scan_claim['id'] ) );
+$n = ct_test_control_job( 'control-n.example.net' );
+ct_scan_request_control_check( $n['job_id'], $n['page'], 'dns_txt' );
+$task_n = ct_test_control_claim();
+ct_test_assert( $task_n && (int) $task_n['id'] === $n['job_id'], 'Fixture control claim failed.' );
+wp_set_current_user( 1 );
+$busy_review = ct_scan_admin_record_authority_review( $n['job_id'], 'Reviewed the signed engagement letter naming this website.' );
+$rn = ct_scan_row( $n['job_id'] );
+ct_test_assert( is_wp_error( $busy_review ) && 'authority_review_check_in_progress' === $busy_review->get_error_code() && 'awaiting_control' === $rn->status && 'checking' === $rn->control_state && null === $rn->control_verified_at, 'An authority review was recorded while a control check was in flight.' );
+$wpdb->update( $jobs, array( 'status' => 'cancelled', 'error_code' => 'test_cleanup', 'control_state' => 'none' ), array( 'job_id' => $n['job_id'] ) );
+
 $f = ct_test_control_job( 'control-f.example.net' );
 wp_set_current_user( 0 );
 ct_test_assert( 'authority_review_forbidden' === ct_scan_admin_record_authority_review( $f['job_id'], str_repeat( 'Reviewed the signed engagement letter. ', 2 ) )->get_error_code(), 'An anonymous caller recorded an authority review.' );
@@ -334,6 +353,10 @@ ct_test_assert( null === ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim'
 // A job that never required control cannot be reviewed into the control path.
 $wpdb->update( $jobs, array( 'status' => 'awaiting_control', 'control_required' => 0 ), array( 'job_id' => $f['job_id'] ) );
 ct_test_assert( is_wp_error( ct_scan_admin_record_authority_review( $f['job_id'], 'Reviewing a job that does not require control should fail.' ) ), 'A review was recorded for a job that does not require control.' );
+
+// A row without the control_required value (an incomplete upgrade) is treated as requiring control.
+$missing = (object) array( 'control_verified_at' => null );
+ct_test_assert( ct_scan_control_required( $missing ) && ct_scan_control_required( (object) array( 'control_required' => null ) ) && ! ct_scan_control_required( (object) array( 'control_required' => '0' ) ), 'A missing control_required value was treated as not required.' );
 
 foreach ( $request_ids as $id ) {
 	$wpdb->delete( $jobs, array( 'request_id' => $id ), array( '%d' ) );

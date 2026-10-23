@@ -97,7 +97,8 @@ restart cannot create a fresh budget. A grant is consumed when issued, is
 valid for one second and covers one connection and one request. `probe` only
 reports whether the job is still live; it takes no budget and has no pacing.
 Refusals use `410` (permanent: cancelled, expired, revoked, lease, profile,
-unconfirmed, clock anomaly), `409` (`budget_exhausted`), `429` (`rate_wait`
+unconfirmed, clock anomaly), `409` (`budget_exhausted`; `already_admitted` for a
+control lease that was already admitted), `429` (`rate_wait`
 with `retry_after_ms`, bounded retries) and `503` (`queue_busy`, the lock is
 held elsewhere). A `503` for a disabled integration or a schema mismatch also
 refuses. Nothing is admitted unless WordPress says so.
@@ -191,7 +192,15 @@ page, request checks or use up the three attempts:
 - a DNS TXT record at `_ct-scan-challenge.<hostname>` with the value
   `ct-scan-verify=<token>`, or
 - the file `https://<hostname>/.well-known/ct-scan-challenge.txt` whose entire
-  content is the token.
+  content is the token (surrounding whitespace and a leading UTF-8 byte-order
+  mark are ignored).
+
+The TXT lookup asks for TXT records at exactly that name: a CNAME there is not
+followed, so a TXT record delegated through a CNAME (as some DNS providers do)
+does not verify. Resolvers cache a "no such record" answer for the zone's
+negative-caching time, so a check requested before a new record has propagated
+can see no record, and it still uses one of the three checks; the customer page
+says to wait until the record is publicly visible.
 
 The customer's page (address shown once; GET only displays it, a nonce-protected
 POST acts) lets them request a check. The disclosed limits: at most three checks
@@ -201,7 +210,11 @@ timeout; no probe of any kind is sent to help a failed check pass. A scheduled
 check is taken by the worker (`control/claim`), admitted exactly once through the
 same guard as a scan (`admit` with `kind` `control`; the attempt is consumed in the
 admission's compare-and-set, with its own pacing, budget, cancellation, expiry and
-lease checks, and `control_probe` for liveness), run inside the unprivileged
+lease checks, and `control_probe` for liveness). WordPress records the admission
+on the lease (`control_admitted`), so a second `admit` under the same lease is
+refused with `409` `already_admitted` for the rest of the two-minute lease, even
+after the one-minute interval has passed, and the worker ends the check without
+retrying. The check is run inside the unprivileged
 child, and reported with `control/result`. The worker relays what it observed
 (untrusted, length-bounded); WordPress compares it with the stored hash. A result
 is accepted only if an admission happened under that lease, so no check can
@@ -214,7 +227,9 @@ detailed report. There is no fallback from a failed challenge to a scan.
 An administrator can instead record an **authority review** (admin queue,
 `authority_review`): the evidence reviewed (20 to 1000 characters), the target,
 the reviewer's account, the time and the expiry (the authorization expiry) are
-stored, and the job is released the same way. An expired review ends the
+stored, and the job is released the same way. A review is refused while a DNS or
+file check is in flight (`control_state` `checking`); record it once that check
+has reported or its lease has lapsed. An expired review ends the
 authorization. Detailed reports (`ct_scan_admin_send_report`) additionally
 require control of the target for jobs that required it, in any terminal state.
 
@@ -227,6 +242,9 @@ The gate is on by default and cannot be dropped by omission: the integration
 refuses to enable unless the served terms version has an explicit `terms_policy`
 entry, a new version is strict whatever the configuration says, and a profile
 broader than the r2 header screening always requires control.
+The requirement is frozen per job: jobs created before the upgrade to schema 5
+have `control_required = 0` and keep their earlier behaviour; a row whose value
+is missing is treated as requiring control.
 One piece of target traffic runs at a time worker-wide: a scan claim is refused
 while a check is in progress and the reverse, enforced in WordPress. If every
 check is spent but the last result was lost, maintenance blocks the job.
