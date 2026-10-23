@@ -477,7 +477,8 @@ evidence must remain available. A started job with a missing receipt needs
 operator investigation, not a blind retry.
 
 Retention follows the owner's decisions of 2026-10-22, implemented in
-maintenance (which runs on every worker claim and on the admin queue page):
+maintenance (which runs on worker polls that hand out no job and on the admin
+queue page):
 
 - **Closure is explicit.** The first time a job is seen in a terminal state
   (`completed`, `failed`, `failed_unknown`, `cancelled`, `expired`, `blocked`)
@@ -489,35 +490,58 @@ maintenance (which runs on every worker claim and on the admin queue page):
   (366 days, so a leap day cannot make it early) after closure. The signed
   evidence stays.
 - **Signed authorization evidence** (the job row and its linked private request,
-  in whatever post status it is in): deleted at `retain_until`, fixed once at
-  closure: **six years after closure**, except that r2 and earlier acceptances
+  in whatever post status it is in): deleted at `retain_until`, set at closure
+  and afterwards only ever extended, never shortened: **six years after
+  closure**, except that r2 and earlier acceptances
   (versions `YYYY-MM-DD-rN` up to `2026-10-21-r2`) keep their promised **three
   years from acceptance**. Never less than three years, whatever the
   configuration; a version that cannot be parsed gets the longer period. The
   configured `evidence_retention_years` is floored at **six** for non-legacy
   versions: a word, null, a boolean, 0 or a value below six means six, never
   less.
+- **`retain_until` can be extended, never shortened.** When a job's stored date
+  comes due, it is compared with the date required today: the period derived
+  from the row under the current configuration, and never less than three years
+  after the job's creation. If the stored date is earlier (for example,
+  `evidence_retention_years` or `legacy_retention_years` was raised after
+  closure), it is extended to the required date (compare-and-set, under the
+  queue lock) and the job is deleted only when that later date arrives. Lowering
+  the configuration never moves a stored date earlier. A displayed date can
+  therefore grow when it comes due after a configuration change.
+- **Legacy acceptance dated before its record.** A record is created within
+  moments of the acceptance it records. If an r2-or-earlier acceptance is dated
+  more than a day before the job's creation, the stated acceptance date and the
+  plugin's own creation stamp disagree. The job then gets three full years from
+  creation. That is later than the promised three years from acceptance, and it
+  is a definite date rather than "never".
 - **Doubtful data is kept.** Deletion requires every date involved to be a real
   `Y-m-d H:i:s` date no earlier than 2020 (zero dates and other restore debris
-  are refused), the stored deletion date to be no earlier than the one derived
-  from the row today and no earlier than three years after the job's creation,
-  (less a day) and the job to be in a terminal state. A job whose base date cannot be trusted
-  keeps `retain_until` empty and is shown as "unknown (kept)" in the admin queue.
-  A record that appears to have closed before it was created is kept. Nothing is
-  deleted while the server clock is earlier than a stored job timestamp (a clock
-  jumped backwards, a bad restore): the run logs once and only the
-  non-destructive steps proceed. Each run examines at most 50 due jobs, and a job judged doubtful is looked at
-  again at most daily (`retention_checked_at`), so doubtful rows cannot hide due
-  ones and the queue lock is held briefly.
+  are refused), the stored deletion date to have arrived and to be no earlier
+  than the date required today (see above), and the job to be in a terminal
+  state. A job whose base date cannot be trusted keeps `retain_until` empty and
+  is shown as "unknown (kept)" in the admin queue. A record that appears to
+  have closed before it was created is kept. Nothing is deleted while the PHP
+  clock and the database clock (`UTC_TIMESTAMP()`) disagree by more than five
+  minutes, or while the server clock is earlier than a stored job timestamp (a
+  clock jumped backwards, a bad restore). The problem is logged once (not on
+  every run) until the clocks agree again, and only the non-destructive steps
+  proceed. A forward jump of both clocks together cannot be detected. Each run
+  makes at most 50 deletion attempts in total, shared by the evidence step and
+  the tombstone clean-up. A job judged doubtful is looked at again at most daily
+  (`retention_checked_at`), so doubtful rows cannot hide due ones, and the queue
+  lock is held briefly.
 - **Narrow preservation hold** (admin queue): one job, a stated purpose of 20 to
   190 characters, a mandatory expiry of at most 730 days, recorded with who set
   it and when (and who released it). While it stands nothing about that job is
   cleared or deleted, including by a tombstone; after it expires or is released,
-  the job stays preserved for a further three days. A damaged hold (purpose
+  the job stays preserved for a further three days. Releasing ends the hold at
+  that moment (an already expired hold keeps its own end). The stated purpose is
+  kept, and who released it and when are recorded. A damaged hold (purpose
   without an expiry) preserves rather than deletes.
 - **Retention runs outside the queue lock.** Only one retention run at a time
-  (its own advisory lock, throttled to about once a minute on the worker's poll
-  and run again on the admin queue page). The non-destructive steps are single
+  (its own advisory lock, throttled to about once a minute on worker polls that
+  hand out no job, so a lease is never delayed by it, and run again on the admin
+  queue page; a failure is logged and never breaks the poll or the page). The non-destructive steps are single
   statements; every deletion takes the queue lock for that one job only, without
   waiting (a busy queue means "next run"), re-reads the row under it and
   re-checks every condition, so Stop (which waits up to three seconds for that
@@ -526,7 +550,9 @@ maintenance (which runs on every worker claim and on the admin queue page):
   request id, a keyed MAC of the scope, creation time, an opaque random identity, time and
   reason; no personal or customer data) before the deletion. If a restored backup
   brings the rows back, the next maintenance run deletes them again: a job row
-  matches on its ids, scope and creation time; a restored request post matches
+  matches on its ids, scope and creation time, and its request post is deleted
+  with it only if the post carries the tombstone's opaque identity (otherwise
+  the post id was recycled and belongs to another record); a restored request post matches
   only on its opaque identity and only when no job row currently uses that request
   or job id (auto-increment ids can be recycled after a restore and must never
   reach a live record). Jobs created before the identity existed are given one
@@ -534,7 +560,8 @@ maintenance (which runs on every worker claim and on the admin queue page):
   rotation, then purged.
 - Deletion scrubs the contact fields first, then deletes the private request and
   the job row; if any step fails the record stays (and is retried) rather than
-  being half-deleted.
+  being half-deleted. A due job whose linked request carries another record's
+  identity is not touched at all.
 
 Not covered here: backup rotation itself, the contract archive's historical Git
 objects and clones (issue 11), unsigned caller leads (there is no lead record in

@@ -942,31 +942,64 @@ function ct_scan_job_on_hold( $row, $now ) {
 }
 
 /**
- * May this job's records be deleted now? Every date involved must be trustworthy, the stored date must
- * not be earlier than the one derived from the row today or than three years (less a day) after creation,
- * and no hold may apply. Anything doubtful is kept.
+ * The earliest date this job's evidence may be deleted, judged from the row today: the period derived from
+ * the row under today's configuration (so a longer period configured after closure is honoured), and never
+ * less than three years after the record's creation. False if a base date cannot be trusted.
+ *
+ * A record is created within moments of the acceptance it records, so a derived date within a day of
+ * "creation + 3 years" is accepted as it is. A derived date more than a day short of that (in practice: an
+ * r2-or-earlier acceptance dated more than a day before its record was created, the stated acceptance date
+ * and the plugin's own creation stamp disagreeing) is replaced by three full years from creation. That date
+ * is later than the promised three years from acceptance, and it is a definite date rather than "never".
  */
-function ct_scan_deletion_allowed( $row, $now ) {
-	if ( ! in_array( $row->status, ct_scan_terminal_statuses(), true ) || ct_scan_job_on_hold( $row, $now ) ) {
+function ct_scan_required_retain_until( $row ) {
+	$derived = ct_scan_retain_until( $row );
+	if ( false === $derived || ! ct_scan_valid_datetime( $row->created_at ) ) {
 		return false;
+	}
+	try {
+		$created = new DateTimeImmutable( $row->created_at, new DateTimeZone( 'UTC' ) );
+		if ( $derived >= $created->modify( '+3 years -1 day' )->format( 'Y-m-d H:i:s' ) ) {
+			return $derived;
+		}
+		return max( $derived, $created->modify( '+3 years' )->format( 'Y-m-d H:i:s' ) );
+	} catch ( Throwable $error ) {
+		return false;
+	}
+}
+
+/**
+ * What retention may do with this job now: array( 'keep' | 'extend' | 'delete', $date ). Every date involved
+ * must be trustworthy, the job terminal and not held, or it is kept. A stored deletion date earlier than the
+ * one required today (ct_scan_required_retain_until()) is never honoured: it is EXTENDED to the required date
+ * ($date), and the job is deleted only when that later date arrives. A stored date is never shortened.
+ */
+function ct_scan_deletion_decision( $row, $now ) {
+	if ( ! in_array( $row->status, ct_scan_terminal_statuses(), true ) || ct_scan_job_on_hold( $row, $now ) ) {
+		return array( 'keep', null );
 	}
 	foreach ( array( $row->created_at, $row->closed_at, $row->retain_until ) as $date ) {
 		if ( ! ct_scan_valid_datetime( $date ) ) {
-			return false;
+			return array( 'keep', null );
 		}
 	}
 	// A record cannot have closed before it was created; if it appears to, a date is wrong.
 	if ( $row->closed_at < $row->created_at ) {
-		return false;
+		return array( 'keep', null );
 	}
-	$expected = ct_scan_retain_until( $row );
-	if ( false === $expected || $row->retain_until < $expected ) {
-		return false;
+	$required = ct_scan_required_retain_until( $row );
+	if ( false === $required ) {
+		return array( 'keep', null );
 	}
-	// A record is created within moments of the acceptance it records; a deletion date more than a day
-	// short of three years after creation means a date somewhere is wrong, and the record is kept.
-	$floor = ( new DateTimeImmutable( $row->created_at, new DateTimeZone( 'UTC' ) ) )->modify( '+3 years -1 day' )->format( 'Y-m-d H:i:s' );
-	return $row->retain_until >= $floor && $row->retain_until <= $now;
+	if ( $row->retain_until < $required ) {
+		return array( 'extend', $required );
+	}
+	return array( $row->retain_until <= $now ? 'delete' : 'keep', null );
+}
+
+/** May this job's records be deleted now? Only when ct_scan_deletion_decision() says so; anything doubtful is kept. */
+function ct_scan_deletion_allowed( $row, $now ) {
+	return 'delete' === ct_scan_deletion_decision( $row, $now )[0];
 }
 
 /**
@@ -993,14 +1026,33 @@ function ct_scan_record_tombstone( $row, $reason ) {
 	return false !== $result;
 }
 
-/** Delete one job and its linked request, whatever status that post is in. True only if both are gone and a tombstone exists. */
-function ct_scan_delete_job_records( $row, $reason ) {
+/**
+ * Delete one job and its linked request, whatever status that post is in. True only if the job row is gone
+ * and a tombstone exists.
+ *
+ * The request post is deleted only when it provably belongs to this job (post ids can be recycled after a
+ * restore). For a retention deletion, a post that carries a different opaque identity than the job keeps
+ * everything (nothing is deleted; retried later). For a restored job row recognised by its tombstone
+ * ($tombstone_identity given), the post is deleted only if it carries exactly that identity; otherwise the
+ * post is another record and is left alone while the restored row itself is deleted again.
+ */
+function ct_scan_delete_job_records( $row, $reason, $tombstone_identity = null ) {
 	global $wpdb;
 	$table = ct_scan_jobs_table();
+	clean_post_cache( (int) $row->request_id );
+	$post = get_post( (int) $row->request_id );
+	$ours = $post && 'ct_promo_request' === $post->post_type && (int) $post->ID === (int) $row->request_id;
+	if ( $ours ) {
+		$post_identity = ct_scan_meta_string( (int) $post->ID, '_ct_scan_identity' );
+		if ( null !== $tombstone_identity ) {
+			$ours = is_string( $tombstone_identity ) && '' !== $tombstone_identity && hash_equals( $tombstone_identity, $post_identity );
+		} elseif ( '' !== $post_identity && is_string( $row->identity ) && '' !== $row->identity && ! hash_equals( $row->identity, $post_identity ) ) {
+			return false;
+		}
+	}
 	if ( ! ct_scan_record_tombstone( $row, $reason ) ) {
 		return false;
 	}
-	$post = get_post( (int) $row->request_id );
 	// Scrub personal fields first so a failure part-way never leaves contact data behind a deleted link.
 	$personal_scrubbed = $wpdb->update( $table, array( 'contact_email' => '', 'contact_name' => '' ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%s' ), array( '%d' ) );
 	if ( false === $personal_scrubbed ) {
@@ -1014,7 +1066,7 @@ function ct_scan_delete_job_records( $row, $reason ) {
 	}
 	// The request carries the contact details and the full contract copy: delete it in any status
 	// (a trashed or re-published copy must not outlive the job that pointed to it).
-	if ( $post && 'ct_promo_request' === $post->post_type && (int) $post->ID === (int) $row->request_id ) {
+	if ( $ours ) {
 		if ( ! wp_delete_post( (int) $row->request_id, true ) ) {
 			return false;
 		}
@@ -1061,12 +1113,38 @@ function ct_scan_retention_run( $force = false ) {
 	return true;
 }
 
+/** Retention from a request path (worker poll, admin page): a failure keeps the records and is logged, never propagated. */
+function ct_scan_retention_run_safely() {
+	try {
+		return ct_scan_retention_run();
+	} catch ( Throwable $error ) {
+		error_log( 'ct-scan: a retention run failed (' . get_class( $error ) . '); records are kept and the run is retried later.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		return false;
+	}
+}
+
+/** At most this many deletion attempts per retention run, shared by every deleting step. */
+function ct_scan_retention_batch_limit() {
+	return 50;
+}
+
+/** The largest disagreement tolerated between the PHP clock and the database clock before deletions stop. */
+function ct_scan_clock_skew_limit_seconds() {
+	return 300;
+}
+
 /**
- * Deletion is refused when the server clock looks wrong: if any job carries a (plausible) timestamp later
- * than "now", now cannot be trusted to decide that a retention period has passed.
+ * Deletion is refused when the server clock looks wrong: if the PHP clock and the database clock disagree
+ * by more than five minutes (one of them jumped, forwards or backwards), or if any job carries a (plausible)
+ * timestamp later than "now" (a clock that jumped backwards, a bad restore). A forward jump of both clocks
+ * together cannot be detected here.
  */
 function ct_scan_clock_is_sane( $now ) {
 	global $wpdb;
+	$db_now = $wpdb->get_var( 'SELECT UTC_TIMESTAMP()' );
+	if ( ! is_string( $db_now ) || ! ct_scan_valid_datetime( $db_now ) || abs( strtotime( $db_now . ' UTC' ) - time() ) > ct_scan_clock_skew_limit_seconds() ) {
+		return false;
+	}
 	$table  = ct_scan_jobs_table();
 	$limit  = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '+5 minutes' )->format( 'Y-m-d H:i:s' );
 	foreach ( array( 'created_at', 'finished_at', 'closed_at', 'terms_accepted_at' ) as $column ) {
@@ -1078,14 +1156,38 @@ function ct_scan_clock_is_sane( $now ) {
 	return $now >= '2020-01-01 00:00:00' && $now < '2200-01-01 00:00:00';
 }
 
-/** Delete one job if, under the queue lock and from a fresh read, it is still due. Returns 'deleted'|'kept'|'failed'|'busy'. */
+/** Log a clock that stops deletions once per occurrence (not on every run); forget it once the clock is sane again. */
+function ct_scan_note_clock_state( $sane ) {
+	$flag = 'ct_scan_retention_clock_warned';
+	if ( ! $sane && ! get_option( $flag ) ) {
+		error_log( 'ct-scan: retention deletions skipped: the server clock disagrees with the database clock or is earlier than a stored job timestamp. Logged once until the clock is consistent again.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		update_option( $flag, ct_scan_utc_now(), false );
+	} elseif ( $sane && get_option( $flag ) ) {
+		delete_option( $flag );
+	}
+}
+
+/**
+ * Act on one job if, under the queue lock and from a fresh read, retention may: delete it, or extend a
+ * stored deletion date that is earlier than the one required today (compare-and-set, never shorter).
+ * Returns 'deleted'|'extended'|'kept'|'failed'|'busy'.
+ */
 function ct_scan_delete_if_due( $job_id, $now ) {
+	global $wpdb;
 	if ( ! ct_scan_lock_acquire() ) {
 		return 'busy';
 	}
 	try {
 		$row = ct_scan_row( $job_id );
-		if ( ! $row || ! ct_scan_deletion_allowed( $row, $now ) ) {
+		if ( ! $row ) {
+			return 'kept';
+		}
+		list( $action, $until ) = ct_scan_deletion_decision( $row, $now );
+		if ( 'extend' === $action ) {
+			$updated = $wpdb->update( ct_scan_jobs_table(), array( 'retain_until' => $until, 'retention_checked_at' => null ), array( 'job_id' => (int) $row->job_id, 'retain_until' => $row->retain_until ), array( '%s', '%s' ), array( '%d', '%s' ) );
+			return 1 === $updated ? 'extended' : 'kept';
+		}
+		if ( 'delete' !== $action ) {
 			return 'kept';
 		}
 		return ct_scan_delete_job_records( $row, 'retention' ) ? 'deleted' : 'failed';
@@ -1098,7 +1200,7 @@ function ct_scan_retention_steps( $now ) {
 	global $wpdb;
 	$table    = ct_scan_jobs_table();
 	$terminal = ct_scan_terminal_sql();
-	$budget   = microtime( true ) + 3.0;
+	$deadline = microtime( true ) + 3.0;
 	// 0. A job that can run again is not closed: forget any closure stamped on it.
 	$wpdb->query( "UPDATE {$table} SET closed_at = NULL, retain_until = NULL WHERE status NOT IN ({$terminal}) AND (closed_at IS NOT NULL OR retain_until IS NOT NULL)" );
 	// 1. Closure is explicit: the first time a job is seen terminal it is stamped.
@@ -1119,7 +1221,8 @@ function ct_scan_retention_steps( $now ) {
 			}
 		}
 	}
-	// 2. The evidence deletion date is fixed once, at closure. An untrustworthy base leaves it NULL (kept).
+	// 2. The evidence deletion date is set at closure; later it may only be extended (step 4), never shortened.
+	// An untrustworthy base leaves it NULL (kept).
 	$unset = $wpdb->get_results( $wpdb->prepare( "SELECT job_id,terms_version,terms_accepted_at,closed_at FROM {$table} WHERE closed_at IS NOT NULL AND retain_until IS NULL AND (retention_checked_at IS NULL OR retention_checked_at < %s) ORDER BY job_id ASC LIMIT 200", $recheck ) );
 	foreach ( (array) $unset as $row ) {
 		$when = ct_scan_retain_until( $row );
@@ -1130,8 +1233,9 @@ function ct_scan_retention_steps( $now ) {
 		}
 	}
 	// Everything below deletes. Refuse all of it if the clock cannot be trusted.
-	if ( ! ct_scan_clock_is_sane( $now ) ) {
-		error_log( 'ct-scan: retention deletions skipped: the server clock is earlier than a stored job timestamp.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+	$sane = ct_scan_clock_is_sane( $now );
+	ct_scan_note_clock_state( $sane );
+	if ( ! $sane ) {
 		return;
 	}
 	// 3. Findings: twelve months after closure (366 days, so a leap day cannot make it early), unless held.
@@ -1142,7 +1246,9 @@ function ct_scan_retention_steps( $now ) {
 		$findings_cutoff,
 		$grace_edge
 	) );
-	// 4. Evidence: delete what has outlived its retain_until, except under a hold. Bounded per run.
+	// 4. Evidence: delete what has outlived its retain_until (extending a date that is shorter than today's
+	// rules require), except under a hold. One budget of deletion attempts for the whole run (steps 4 and 5).
+	$deletions_left = ct_scan_retention_batch_limit();
 	$due = $wpdb->get_results( $wpdb->prepare(
 		"SELECT job_id FROM {$table} WHERE retain_until IS NOT NULL AND retain_until <= %s AND closed_at IS NOT NULL AND status IN ({$terminal}) AND (hold_reason IS NULL OR (hold_until >= '2020-01-01 00:00:00' AND hold_until <= %s)) AND (retention_checked_at IS NULL OR retention_checked_at < %s) ORDER BY retain_until ASC LIMIT 50",
 		$now,
@@ -1150,35 +1256,46 @@ function ct_scan_retention_steps( $now ) {
 		$recheck
 	) );
 	foreach ( (array) $due as $row ) {
-		$outcome = ct_scan_delete_if_due( (int) $row->job_id, $now );
-		if ( 'busy' === $outcome || microtime( true ) > $budget ) {
-			break; // the queue is in use (or the run is long enough): continue next time
+		if ( $deletions_left < 1 || microtime( true ) > $deadline ) {
+			break; // enough for one run: continue next time
 		}
-		if ( 'deleted' !== $outcome ) {
+		$outcome = ct_scan_delete_if_due( (int) $row->job_id, $now );
+		if ( 'busy' === $outcome ) {
+			break; // the queue is in use: continue next time
+		}
+		if ( 'deleted' === $outcome || 'failed' === $outcome ) {
+			--$deletions_left;
+		}
+		if ( 'kept' === $outcome || 'failed' === $outcome ) {
 			// Doubtful or failed: keep it, and look at it again tomorrow rather than on every run.
 			$wpdb->update( $table, array( 'retention_checked_at' => $now ), array( 'job_id' => (int) $row->job_id ), array( '%s' ), array( '%d' ) );
 		}
 	}
-	// 5. A restored backup must not resurrect deleted records: delete matches again.
-	ct_scan_apply_tombstones( $now, $budget );
+	// 5. A restored backup must not resurrect deleted records: delete matches again (same budget).
+	ct_scan_apply_tombstones( $now, $deadline, $deletions_left );
 	$wpdb->query( $wpdb->prepare( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE deleted_at < %s', ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . max( 90, (int) ct_scan_config()['tombstone_retention_days'] ) . ' days' )->format( 'Y-m-d H:i:s' ) ) );
 }
 
 /**
  * Delete again any job row (and linked request) that a deletion tombstone recognises after a restore.
- * A job row matches on its numeric identifiers AND creation time AND scope; a request post matches only
- * on the opaque identity recorded at creation, and only when no job row currently uses that request or
- * job id (recycled auto-increment ids must never reach a live record). Holds are honoured.
+ * A job row matches on its numeric identifiers AND creation time AND scope; its request post is deleted with
+ * it only if the post carries the tombstone's opaque identity (a recycled post id is another record). A
+ * request post whose job row was not restored matches only on the opaque identity recorded at creation, and
+ * only when no job row currently uses that request or job id (recycled auto-increment ids must never reach a
+ * live record). Holds are honoured. Every attempt counts against $deletions_left (shared with step 4).
  */
-function ct_scan_apply_tombstones( $now, $budget = null ) {
+function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = null ) {
 	global $wpdb;
-	$table  = ct_scan_jobs_table();
-	$stones = ct_scan_tombstones_table();
-	$budget = null === $budget ? microtime( true ) + 3.0 : $budget;
+	$table    = ct_scan_jobs_table();
+	$stones   = ct_scan_tombstones_table();
+	$deadline = null === $deadline ? microtime( true ) + 3.0 : $deadline;
+	if ( null === $deletions_left ) {
+		$deletions_left = ct_scan_retention_batch_limit();
+	}
 	// Candidates by numeric ids and creation time; the keyed scope MAC is compared in PHP, under the lock.
-	$ghosts = $wpdb->get_results( 'SELECT j.job_id, t.scope_mac FROM ' . $table . ' j INNER JOIN ' . $stones . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.created_at = j.created_at ORDER BY j.job_id ASC LIMIT 50' );
+	$ghosts = $wpdb->get_results( 'SELECT j.job_id, t.scope_mac, t.identity FROM ' . $table . ' j INNER JOIN ' . $stones . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.created_at = j.created_at ORDER BY j.job_id ASC LIMIT 50' );
 	foreach ( (array) $ghosts as $ghost ) {
-		if ( microtime( true ) > $budget ) {
+		if ( $deletions_left < 1 || microtime( true ) > $deadline ) {
 			return;
 		}
 		if ( ! ct_scan_lock_acquire() ) {
@@ -1187,7 +1304,9 @@ function ct_scan_apply_tombstones( $now, $budget = null ) {
 		try {
 			$row = ct_scan_row( (int) $ghost->job_id );
 			if ( $row && hash_equals( (string) $ghost->scope_mac, ct_scan_tombstone_mac( $row->scope_hash ) ) && ! ct_scan_job_on_hold( $row, $now ) ) {
-				ct_scan_delete_job_records( $row, 'restored' );
+				--$deletions_left;
+				// A failure leaves the row (and is retried next run); it never stops the other candidates.
+				ct_scan_delete_job_records( $row, 'restored', (string) $ghost->identity );
 			}
 		} finally {
 			ct_scan_lock_release();
@@ -1206,14 +1325,19 @@ function ct_scan_apply_tombstones( $now, $budget = null ) {
 		. ' ORDER BY t.tombstone_id DESC LIMIT 50'
 	);
 	foreach ( (array) $restored as $stone ) {
-		if ( microtime( true ) > $budget || ! ct_scan_lock_acquire() ) {
+		if ( $deletions_left < 1 || microtime( true ) > $deadline || ! ct_scan_lock_acquire() ) {
 			return;
 		}
 		try {
 			$live = $wpdb->get_var( $wpdb->prepare( "SELECT job_id FROM {$table} WHERE request_id = %d OR job_id = %d LIMIT 1", (int) $stone->request_id, (int) $stone->job_id ) );
 			clean_post_cache( (int) $stone->request_id );
 			if ( ! $live && hash_equals( (string) $stone->identity, ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_identity' ) ) && (string) $stone->job_id === ct_scan_meta_string( (int) $stone->request_id, '_ct_scan_job_id' ) ) {
-				wp_delete_post( (int) $stone->request_id, true );
+				--$deletions_left;
+				if ( ! wp_delete_post( (int) $stone->request_id, true ) ) {
+					// Refused (a filter or the database): the post is kept and retried next run. This attempt
+					// has been counted, and the loop moves on, so one stuck post can neither spin nor block the rest.
+					clean_post_cache( (int) $stone->request_id );
+				}
 			}
 		} finally {
 			ct_scan_lock_release();
@@ -1262,10 +1386,15 @@ function ct_scan_admin_release_hold( $job_id ) {
 	}
 	try {
 		$row = ct_scan_row( $job_id );
-		if ( ! $row || empty( $row->hold_reason ) ) {
+		if ( ! $row || empty( $row->hold_reason ) || ! empty( $row->hold_released_at ) ) {
 			return new WP_Error( 'hold_unavailable', 'This job has no hold to release.' );
 		}
-		$updated = $wpdb->update( ct_scan_jobs_table(), array( 'hold_reason' => null, 'hold_until' => null, 'hold_released_by' => (int) $user->ID, 'hold_released_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%s', '%d', '%s' ), array( '%d' ) );
+		// Releasing ends the hold now, it does not erase it: the purpose stays (with who released it and
+		// when), and the job keeps the same three-day grace as a hold that expires. A hold that already
+		// expired keeps its own (earlier) end, so a release never lengthens it.
+		$now     = ct_scan_utc_now();
+		$until   = ( ct_scan_valid_datetime( $row->hold_until ) && $row->hold_until < $now ) ? $row->hold_until : $now;
+		$updated = $wpdb->update( ct_scan_jobs_table(), array( 'hold_until' => $until, 'hold_released_by' => (int) $user->ID, 'hold_released_at' => $now ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%d', '%s' ), array( '%d' ) );
 		if ( false === $updated ) {
 			return new WP_Error( 'hold_write_failed', 'The hold could not be released.' );
 		}
@@ -1284,8 +1413,9 @@ function ct_scan_maintain() {
 	} finally {
 		ct_scan_lock_release();
 	}
-	// Retention runs after the queue lock is released (see ct_scan_retention_run()).
-	ct_scan_retention_run();
+	// Retention runs after the queue lock is released (see ct_scan_retention_run()); a failure there never
+	// breaks the admin page.
+	ct_scan_retention_run_safely();
 	return true;
 }
 
@@ -1854,12 +1984,12 @@ function ct_scan_is_list( $value ) {
 
 function ct_scan_claim( WP_REST_Request $request ) {
 	$response = ct_scan_claim_locked( $request );
-	// The worker polls this route every few seconds; retention piggybacks on it, outside the queue lock.
+	// The worker polls this route every few seconds; retention piggybacks on it, outside the queue lock, and
+	// only on a poll that hands out no job, so a lease is never delayed by a retention run.
 	if ( $response instanceof WP_REST_Response && 200 === $response->get_status() ) {
-		try {
-			ct_scan_retention_run();
-		} catch ( Throwable $error ) {
-			unset( $error ); // retention must never affect a claim
+		$data = $response->get_data();
+		if ( is_array( $data ) && array_key_exists( 'job', $data ) && null === $data['job'] ) {
+			ct_scan_retention_run_safely(); // retention must never affect a claim
 		}
 	}
 	return $response;
@@ -2969,9 +3099,14 @@ function ct_scan_admin_page() {
 		if ( 'awaiting_control' === $row->status && empty( $row->revoked_at ) ) {
 			echo ct_scan_admin_form( (int) $row->job_id, 'authority_review', 'Record authority review', '<br><textarea name="ct_scan_authority_note" rows="3" cols="42" maxlength="1000" placeholder="Evidence reviewed that this client controls this exact website (who, what, when)."></textarea><br><label><input type="checkbox" name="ct_scan_authority_confirm" value="1" required> I reviewed evidence that this client controls the exact website above.</label> ' );
 		}
-		if ( ct_scan_job_on_hold( $row, ct_scan_utc_now() ) ) {
+		$on_hold = ct_scan_job_on_hold( $row, ct_scan_utc_now() );
+		if ( $on_hold && empty( $row->hold_released_at ) ) {
 			echo '<p>Preservation hold until ' . esc_html( $row->hold_until ) . ' UTC: ' . esc_html( $row->hold_reason ) . '</p>' . ct_scan_admin_form( (int) $row->job_id, 'release_hold', 'Release hold', '<label><input type="checkbox" name="ct_scan_hold_release_confirm" value="1" required> Release this hold.</label> ' );
 		} else {
+			if ( $on_hold ) {
+				// Released, still inside the grace period: show it, and allow a new hold.
+				echo '<p>Preservation hold released ' . esc_html( $row->hold_released_at ) . ' UTC (records kept for a further ' . (int) ct_scan_hold_grace_days() . ' days): ' . esc_html( $row->hold_reason ) . '</p>';
+			}
 			echo ct_scan_admin_form( (int) $row->job_id, 'set_hold', 'Place preservation hold', '<br><input type="text" name="ct_scan_hold_reason" maxlength="190" size="40" placeholder="Narrow purpose, e.g. dispute #123 about this job"> <input type="number" name="ct_scan_hold_days" min="1" max="730" value="90"> days<br><label><input type="checkbox" name="ct_scan_hold_confirm" value="1" required> Preserve this job\'s records for this stated purpose only.</label> ' );
 		}
 		if ( empty( $row->revoked_at ) && empty( $row->report_delivered_at ) ) {
