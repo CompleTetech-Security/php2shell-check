@@ -540,7 +540,8 @@ queue page):
   configuration; a version that cannot be parsed gets the longer period. The
   configured `evidence_retention_years` is floored at **six** for non-legacy
   versions: a word, null, a boolean, 0 or a value below six means six, never
-  less.
+  less. A value above 100 years (which would push the date past 2200, where no
+  date is trusted) is clamped to 100 years and logged once.
 - **`retain_until` can be extended, never shortened.** When a job's stored date
   comes due, it is compared with the date required today: the period derived
   from the row under the current configuration, and never less than three years
@@ -566,14 +567,18 @@ queue page):
   clock and the database clock (`UTC_TIMESTAMP()`) disagree by more than five
   minutes, or while the server clock is earlier than a stored job timestamp (a
   clock jumped backwards, a bad restore). The problem is logged once (not on
-  every run) until the clocks agree again, and only the non-destructive steps
-  proceed. A forward jump of both clocks together cannot be detected. Each run
+  every run) until the clocks agree again; while it lasts no closure, deletion
+  date or examination time is stamped either (a wrong "now" is never recorded),
+  and only the reopening of non-terminal jobs proceeds. A forward jump of both clocks together cannot be detected. Each run
   makes at most 50 deletion attempts in total, shared by the evidence step and
   the tombstone clean-up. A job judged doubtful is looked at again at most daily
   (`retention_checked_at`), so doubtful rows cannot hide due ones, and the queue
   lock is held briefly. A job that has no opaque identity yet (created before it
-  existed and not yet reached by the backfill, which handles 100 jobs per run) is
-  kept until it has one. A single implausible far-future timestamp on any job
+  existed and not yet reached by the backfill, which handles 100 jobs per run
+  from a stored cursor) is kept until it has one. The backfill adopts or writes
+  the request post's identity only when that post names this job
+  (`_ct_scan_job_id`); a post that names another job is left alone and the job
+  stays without identity, so it is kept. A single implausible far-future timestamp on any job
   (later than now, before 2200) halts every deletion until it is corrected; this
   is logged once, not on every run.
 - **Narrow preservation hold** (admin queue): one job, a stated purpose of 20 to
@@ -589,7 +594,10 @@ queue page):
   POST) is refused and changes nothing, so it can neither shorten the hold nor
   erase its purpose and setter. To change a hold, release it first (the job stays
   protected through the grace period), then place the new one; a new hold never
-  ends earlier than the released one.
+  ends earlier than the released one. The "Release hold" form carries the
+  identity of the hold it shows (purpose, expiry, setter, when set); a release
+  is a compare-and-set on those values, so a stale form can never end a newer
+  hold that replaced it ("hold changed: reload the queue").
 - **Retention runs outside the queue lock.** Only one retention run at a time
   (its own advisory lock, throttled to about once a minute on worker polls that
   hand out no job, so a lease is never delayed by it, and run again on the admin
@@ -605,7 +613,7 @@ queue page):
   matches on its ids, scope and creation time, and its request post is deleted
   with it only if the post carries the tombstone's opaque identity (otherwise
   the post id was recycled and belongs to another record); a restored request post matches
-  only on its opaque identity and only when no job row currently uses that request
+  only on its opaque identity and the job id it names, and only when no job row currently uses that request
   or job id (auto-increment ids can be recycled after a restore and must never
   reach a live record). A restored job row that holds a lease (a leased or
   running scan, or a control check in progress) is deleted again only after
@@ -613,8 +621,11 @@ queue page):
   traffic may be in flight. Restored rows that cannot be acted on (held or
   leased) are skipped in the query, and the candidates are paged from where the
   previous run stopped (wrapping around), so neither skipped rows nor rows whose
-  deletion keeps failing can hide later restored rows. Jobs created before the identity existed are given one
-  (adopting what their request already carries) by the next maintenance run. Tombstones are kept 120 days, longer than the 90-day backup
+  deletion keeps failing can hide later restored rows. Restored request posts are
+  paged the same way (by tombstone, from a stored cursor), and the job-row loop
+  leaves a fifth of the shared budget for them, so posts whose deletion is
+  refused cannot hide others either. Jobs created before the identity existed are given one
+  (adopting what their request already carries, if that request names the job) by the next maintenance run. Tombstones are kept 120 days, longer than the 90-day backup
   rotation, then purged. The scope MAC is keyed with `wp_salt( 'secure_auth' )`:
   rotating that salt (or `SECURE_AUTH_KEY`/`SECURE_AUTH_SALT`) stops existing
   tombstones from recognising restored job rows (restored request posts are still

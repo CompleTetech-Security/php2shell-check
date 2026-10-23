@@ -8,7 +8,7 @@ global $wpdb;
 $jobs = ct_scan_jobs_table();
 ct_test_purge_fixtures();
 // Leftovers of an aborted earlier run of this script.
-$wpdb->query( "DELETE FROM {$jobs} WHERE job_id >= 888000000" );
+$wpdb->query( "DELETE FROM {$jobs} WHERE job_id >= 888000000 OR job_id BETWEEN 887000000 AND 887999999" );
 $wpdb->query( 'DELETE FROM ' . ct_scan_tombstones_table() );
 $request_ids = array();
 add_filter( 'pre_wp_mail', '__return_true' );
@@ -285,7 +285,8 @@ ct_test_assert( 0 === count( array_filter( $batch, 'ct_test_exists' ) ), 'The re
 // Release works; a damaged hold (purpose without expiry) preserves rather than deletes.
 $rel = ct_test_aged_job( 'ret-release.example.net', 'failed', '-3 years -1 day', '-1 day' );
 ct_scan_admin_set_hold( $rel['job_id'], 'Preserving records for dispute number 456.', 10 );
-ct_test_assert( true === ct_scan_admin_release_hold( $rel['job_id'] ), 'Release failed.' );
+ct_test_assert( 'hold_changed' === ct_scan_admin_release_hold( $rel['job_id'] )->get_error_code() && 'hold_changed' === ct_scan_admin_release_hold( $rel['job_id'], str_repeat( 'a', 64 ) )->get_error_code() && empty( ct_scan_row( $rel['job_id'] )->hold_released_at ), 'A release without the identity of the hold shown was accepted.' );
+ct_test_assert( true === ct_scan_admin_release_hold( $rel['job_id'], ct_scan_hold_identity( ct_scan_row( $rel['job_id'] ) ) ), 'Release failed.' );
 $released = ct_scan_row( $rel['job_id'] );
 ct_test_assert( 'Preserving records for dispute number 456.' === $released->hold_reason && $released->hold_until <= ct_scan_utc_now() && $released->hold_until >= ct_test_old( '-1 minute' ) && 1 === (int) $released->hold_released_by && ! empty( $released->hold_released_at ), 'Release did not end the hold now (keeping its purpose) or did not record who released it.' );
 ct_test_assert( 'hold_unavailable' === ct_scan_admin_release_hold( $rel['job_id'] )->get_error_code() && 'hold_unavailable' === ct_scan_admin_release_hold( 999999999 )->get_error_code() && 'hold_unavailable' === ct_scan_admin_release_hold( 0 )->get_error_code(), 'Releasing a hold that does not exist reported success.' );
@@ -302,7 +303,7 @@ $lapsed = ct_test_aged_job( 'ret-lapsed.example.net', 'failed', '-1 day', '-1 ho
 ct_scan_admin_set_hold( $lapsed['job_id'], 'Preserving records for dispute number 789.', 10 );
 $lapsed_until = ct_test_old( '-2 days' );
 $wpdb->update( $jobs, array( 'hold_until' => $lapsed_until ), array( 'job_id' => $lapsed['job_id'] ) );
-ct_test_assert( true === ct_scan_admin_release_hold( $lapsed['job_id'] ) && $lapsed_until === ct_scan_row( $lapsed['job_id'] )->hold_until, 'Releasing an expired hold lengthened it.' );
+ct_test_assert( true === ct_scan_admin_release_hold( $lapsed['job_id'], ct_scan_hold_identity( ct_scan_row( $lapsed['job_id'] ) ) ) && $lapsed_until === ct_scan_row( $lapsed['job_id'] )->hold_until, 'Releasing an expired hold lengthened it.' );
 wp_set_current_user( 0 );
 ct_test_assert( 'hold_forbidden' === ct_scan_admin_release_hold( $damaged['job_id'] )->get_error_code() && ct_test_exists( $damaged ) && ! empty( ct_scan_row( $damaged['job_id'] )->hold_reason ), 'An anonymous caller released a hold.' );
 
@@ -402,7 +403,7 @@ wp_set_current_user( 1 );
 // Placing a new hold clears the audit of an earlier release.
 $reheld = ct_test_aged_job( 'ret-reheld.example.net', 'failed', '-1 day', '-1 hour' );
 ct_scan_admin_set_hold( $reheld['job_id'], 'First preservation purpose for this job.', 10 );
-ct_scan_admin_release_hold( $reheld['job_id'] );
+ct_scan_admin_release_hold( $reheld['job_id'], ct_scan_hold_identity( ct_scan_row( $reheld['job_id'] ) ) );
 ct_scan_admin_set_hold( $reheld['job_id'], 'Second preservation purpose for this job.', 10 );
 $rh = ct_scan_row( $reheld['job_id'] );
 ct_test_assert( null === $rh->hold_released_by && null === $rh->hold_released_at && 'Second preservation purpose for this job.' === $rh->hold_reason, 'A new hold kept the audit of an earlier release.' );
@@ -430,7 +431,7 @@ ct_test_assert( is_wp_error( $grace_try ) && 'hold_active' === $grace_try->get_e
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $long_hold ), 'A job in its hold grace period was deleted.' );
 // Released (still in grace): a new hold may be placed, and it never ends earlier than the released one.
-ct_test_assert( true === ct_scan_admin_release_hold( $long_hold['job_id'] ) && $lh->hold_until === ct_scan_row( $long_hold['job_id'] )->hold_until, 'Releasing an expired hold changed its end.' );
+ct_test_assert( true === ct_scan_admin_release_hold( $long_hold['job_id'], ct_scan_hold_identity( $lh ) ) && $lh->hold_until === ct_scan_row( $long_hold['job_id'] )->hold_until, 'Releasing an expired hold changed its end.' );
 ct_test_assert( true === ct_scan_admin_set_hold( $long_hold['job_id'], 'A different, later purpose for this job.', 30 ), 'A new hold after a release was refused.' );
 $lh2 = ct_scan_row( $long_hold['job_id'] );
 ct_test_assert( 'A different, later purpose for this job.' === $lh2->hold_reason && (int) $second_admin === (int) $lh2->hold_set_by && $lh2->hold_until > ct_test_old( '+29 days' ) && null === $lh2->hold_released_at, 'A new hold after a release was not recorded with its own purpose and setter.' );
@@ -480,16 +481,16 @@ foreach ( array( 'missing' => null, 'empty' => '' ) as $kind => $value ) {
 $restored_base = array( 'target_origin' => 'https://ret-starve.example.net/', 'scope_hash' => hash( 'sha256', 'https://ret-starve.example.net/' ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => ct_test_old( '-1 hour' ) );
 for ( $i = 0; $i < 56; $i++ ) {
 	$extra = 9 === $i % 10 ? array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => str_repeat( 'b', 64 ), 'lease_until' => ct_test_old( '+1 hour' ) ) : array( 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) );
-	$wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 888000100 + $i, 'request_id' => 889000100 + $i ), $extra ) );
-	$wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => 888000100 + $i, 'request_id' => 889000100 + $i, 'scope_mac' => ct_scan_tombstone_mac( $restored_base['scope_hash'] ), 'created_at' => $restored_base['created_at'], 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => bin2hex( random_bytes( 16 ) ) ) );
+	ct_test_assert( 1 === $wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 887000100 + $i, 'request_id' => 886000100 + $i ), $extra ) ), 'Fixture insert of a restored row failed: ' . $wpdb->last_error );
+	$wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => 887000100 + $i, 'request_id' => 886000100 + $i, 'scope_mac' => ct_scan_tombstone_mac( $restored_base['scope_hash'] ), 'created_at' => $restored_base['created_at'], 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => bin2hex( random_bytes( 16 ) ) ) );
 }
-$wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 888000200, 'request_id' => 889000200 ) ) );
-$wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => 888000200, 'request_id' => 889000200, 'scope_mac' => ct_scan_tombstone_mac( $restored_base['scope_hash'] ), 'created_at' => $restored_base['created_at'], 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => bin2hex( random_bytes( 16 ) ) ) );
+ct_test_assert( 1 === $wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 887000200, 'request_id' => 886000200 ) ) ), 'Fixture insert of a restored row failed: ' . $wpdb->last_error );
+$wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => 887000200, 'request_id' => 886000200, 'scope_mac' => ct_scan_tombstone_mac( $restored_base['scope_hash'] ), 'created_at' => $restored_base['created_at'], 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => bin2hex( random_bytes( 16 ) ) ) );
 ct_scan_retention_run( true );
-$starve_left = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$jobs} WHERE job_id BETWEEN 888000100 AND 888000155" );
-ct_test_assert( ! ct_scan_row( 888000200 ) && 56 === $starve_left, "Held or leased restored rows starved a later restored row, or were deleted ($starve_left of 56 kept)." );
-$wpdb->query( "DELETE FROM {$jobs} WHERE job_id BETWEEN 888000100 AND 888000200" );
-$wpdb->query( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE job_id BETWEEN 888000100 AND 888000200' );
+$starve_left = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$jobs} WHERE job_id BETWEEN 887000100 AND 887000155" );
+ct_test_assert( ! ct_scan_row( 887000200 ) && 56 === $starve_left, "Held or leased restored rows starved a later restored row, or were deleted ($starve_left of 56 kept)." );
+$wpdb->query( "DELETE FROM {$jobs} WHERE job_id BETWEEN 887000100 AND 887000200" );
+$wpdb->query( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE job_id BETWEEN 887000100 AND 887000200' );
 
 
 // ---- Second round: floors, clock, ordering, locks -----------------------------------------------------------------
@@ -503,6 +504,11 @@ foreach ( array( 'six', '', '0', '1', '5', '5.9', '-6', 'NULL', 'TRUE', 'FALSE',
 $p = proc_open( array( PHP_BINARY, __DIR__ . '/retention-years.php' ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $pp, null, array_merge( getenv(), array( 'CT_TEST_WP_ROOT' => getenv( 'CT_TEST_WP_ROOT' ) ?: '/var/www/html', 'CT_TEST_EVIDENCE_YEARS' => '8' ) ) );
 ct_test_assert( '2034-01-01 00:00:00 2028-01-01 00:00:00' === trim( stream_get_contents( $pp[1] ) ), 'A longer configured retention was not honoured.' );
 proc_close( $p );
+// A retention period that would push the date past 2200 (where no date is trusted, so "kept forever") is clamped to 100 years.
+$p = proc_open( array( PHP_BINARY, __DIR__ . '/retention-years.php' ), array( 1 => array( 'pipe', 'w' ), 2 => array( 'pipe', 'w' ) ), $pp, null, array_merge( getenv(), array( 'CT_TEST_WP_ROOT' => getenv( 'CT_TEST_WP_ROOT' ) ?: '/var/www/html', 'CT_TEST_EVIDENCE_YEARS' => '500' ) ) );
+$capped = trim( stream_get_contents( $pp[1] ) );
+proc_close( $p );
+ct_test_assert( '2126-01-01 00:00:00 2028-01-01 00:00:00' === $capped && 100 === ct_scan_clamp_years( 500, 6 ) && 100 === ct_scan_clamp_years( '1e10', 6 ) && 100 === ct_scan_clamp_years( 100, 6 ) && 99 === ct_scan_clamp_years( 99, 6 ), "An oversized retention period was not clamped to 100 years ($capped)." );
 ct_test_assert( 6 === ct_scan_clamp_years( 'six', 6 ) && 6 === ct_scan_clamp_years( null, 6 ) && 6 === ct_scan_clamp_years( 0, 6 ) && 6 === ct_scan_clamp_years( 1, 6 ) && 6 === ct_scan_clamp_years( true, 6 ) && 6 === ct_scan_clamp_years( array( 9 ), 6 ) && 7 === ct_scan_clamp_years( '7', 6 ) && 3 === ct_scan_clamp_years( 0, 1 ), 'The retention floors do not hold.' );
 
 // A deletion is refused when the record appears to have closed before it was created (every other check passes).
@@ -517,13 +523,16 @@ ct_test_assert( ct_test_exists( $backwards ) && get_post( $backwards['request_id
 $clocked = ct_test_aged_job( 'ret-clock.example.net', 'failed', '-3 years -1 day', '-1 day' );
 $future_row = ct_test_aged_job( 'ret-future-row.example.net', 'queued', '-1 day', null );
 $wpdb->update( $jobs, array( 'created_at' => ct_test_old( '+10 days' ), 'authorization_expires_at' => ct_test_old( '+60 days' ) ), array( 'job_id' => $future_row['job_id'] ) );
+$clock_closing = ct_test_aged_job( 'ret-clock-closing.example.net', 'cancelled', '-1 day', null ); // no finished_at: closure would stamp "now"
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $clocked ) && get_post( $clocked['request_id'] ), 'Evidence was deleted although the clock was earlier than a stored job timestamp.' );
+ct_test_assert( null === ct_scan_row( $clock_closing['job_id'] )->closed_at && null === ct_scan_row( $clocked['job_id'] )->closed_at && null === ct_scan_row( $clocked['job_id'] )->retain_until, 'A closure or deletion date was stamped while the clock could not be trusted.' );
 ct_test_assert( ! ct_scan_clock_is_sane( ct_scan_utc_now() ) && ct_scan_clock_is_sane( ct_test_old( '+11 days' ) ), 'The clock sanity check does not compare with the newest stored timestamp.' );
 $wpdb->delete( $jobs, array( 'job_id' => $future_row['job_id'] ) );
 wp_delete_post( $future_row['request_id'], true );
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $clocked ), 'Deletion did not resume once the clock was consistent.' );
+ct_test_assert( ! empty( ct_scan_row( $clock_closing['job_id'] )->closed_at ), 'Closure was not stamped once the clock was consistent.' );
 ct_test_assert( ! ct_scan_clock_is_sane( '1999-01-01 00:00:00' ) && ! ct_scan_clock_is_sane( '2300-01-01 00:00:00' ), 'Absurd clocks were accepted.' );
 
 /** Stamp closure and the deletion date directly, without running a pass (the job is due as soon as retention runs). */
@@ -763,6 +772,82 @@ foreach ( array( 'control' => array( 'status' => 'awaiting_control', 'control_re
 	ct_test_maintain();
 	ct_test_assert( ! ct_test_exists( $gone ), "A restored row was not deleted again after its {$kind} lease ended." );
 }
+
+// ---- Fifth review: stale release, identity backfill ownership, restored-post paging ----------------------------
+wp_set_current_user( 1 );
+// A stale "Release hold" form (for hold H1) cannot end a newer hold H2 placed after H1 was released.
+$stale = ct_test_aged_job( 'ret-stale-release.example.net', 'failed', '-3 years -1 day', '-1 day' );
+ct_test_make_due( $stale );
+ct_test_assert( true === ct_scan_admin_set_hold( $stale['job_id'], 'First hold H1 for dispute number 1357.', 10 ), 'Fixture hold H1 was refused.' );
+$h1_identity = ct_scan_hold_identity( ct_scan_row( $stale['job_id'] ) );
+ct_test_assert( true === ct_scan_admin_release_hold( $stale['job_id'], $h1_identity ), 'Releasing H1 failed.' );
+ct_test_assert( true === ct_scan_admin_set_hold( $stale['job_id'], 'Second hold H2 for litigation number 2468.', 730 ), 'Fixture hold H2 was refused.' );
+$h2 = ct_scan_row( $stale['job_id'] );
+$replayed = ct_scan_admin_release_hold( $stale['job_id'], $h1_identity );
+$h2_now = ct_scan_row( $stale['job_id'] );
+ct_test_assert( is_wp_error( $replayed ) && 'hold_changed' === $replayed->get_error_code() && $h2->hold_until === $h2_now->hold_until && $h2->hold_reason === $h2_now->hold_reason && null === $h2_now->hold_released_at && null === $h2_now->hold_released_by, 'A stale release form for an earlier hold released a newer hold.' );
+ct_test_maintain();
+ct_test_assert( ct_test_exists( $stale ) && get_post( $stale['request_id'] ), 'A due job under a newer hold was deleted after a stale release.' );
+ct_test_assert( true === ct_scan_admin_release_hold( $stale['job_id'], ct_scan_hold_identity( $h2_now ) ), 'The current hold could not be released with its own identity.' );
+$wpdb->delete( $jobs, array( 'job_id' => $stale['job_id'] ) );
+
+// The identity backfill never adopts or overwrites the identity of a request post that names another job.
+$owner = ct_test_aged_job( 'ret-backfill-owner.example.net', 'failed', '-3 years -1 day', '-1 day' );
+ct_test_make_due( $owner );
+$wpdb->update( $jobs, array( 'identity' => null ), array( 'job_id' => $owner['job_id'] ) );
+update_post_meta( $owner['request_id'], '_ct_scan_job_id', 999999998 );
+update_post_meta( $owner['request_id'], '_ct_scan_identity', str_repeat( 'c', 32 ) );
+ct_test_maintain();
+ct_test_assert( null === ct_scan_row( $owner['job_id'] )->identity && str_repeat( 'c', 32 ) === ct_scan_meta_string( $owner['request_id'], '_ct_scan_identity' ) && ct_test_exists( $owner ) && get_post( $owner['request_id'] ), 'The identity backfill adopted, or the job lost records to, a request post that names another job.' );
+delete_post_meta( $owner['request_id'], '_ct_scan_identity' );
+ct_test_maintain();
+ct_test_assert( null === ct_scan_row( $owner['job_id'] )->identity && '' === ct_scan_meta_string( $owner['request_id'], '_ct_scan_identity' ) && ct_test_exists( $owner ), 'The identity backfill wrote an identity onto a request post that names another job.' );
+update_post_meta( $owner['request_id'], '_ct_scan_job_id', $owner['job_id'] );
+update_post_meta( $owner['request_id'], '_ct_scan_identity', str_repeat( 'c', 32 ) );
+ct_test_maintain();
+ct_test_assert( str_repeat( 'c', 32 ) === $wpdb->get_var( $wpdb->prepare( 'SELECT identity FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $owner['job_id'] ) ) && ! ct_test_exists( $owner ), 'Once the request named its job, the backfill did not adopt its identity (and allow the due deletion).' );
+
+// Restored request posts whose deletion is refused, or that name another job, never starve an older restored post.
+$stone_row = static function ( $job_id, $post_id, $identity ) {
+	return array( 'job_id' => $job_id, 'request_id' => $post_id, 'scope_mac' => str_repeat( 'd', 64 ), 'created_at' => ct_test_old( '-2 years' ), 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => $identity );
+};
+$restored_post = static function ( $job_id, $identity ) {
+	$id = wp_insert_post( array( 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'restored' ) );
+	update_post_meta( $id, '_ct_scan_job_id', $job_id );
+	update_post_meta( $id, '_ct_scan_identity', $identity );
+	return (int) $id;
+};
+$target_identity = bin2hex( random_bytes( 16 ) );
+$target_post     = $restored_post( 887100000, $target_identity );
+ct_test_assert( 1 === $wpdb->insert( ct_scan_tombstones_table(), $stone_row( 887100000, $target_post, $target_identity ) ), 'Fixture tombstone insert failed: ' . $wpdb->last_error );
+$target_stone = (int) $wpdb->insert_id;
+$refused_posts = array();
+$foreign_posts = array();
+for ( $i = 1; $i <= 55; $i++ ) {
+	$identity        = bin2hex( random_bytes( 16 ) );
+	$refused_posts[] = $restored_post( 887100000 + $i, $identity );
+	ct_test_assert( 1 === $wpdb->insert( ct_scan_tombstones_table(), $stone_row( 887100000 + $i, end( $refused_posts ), $identity ) ), 'Fixture tombstone insert failed: ' . $wpdb->last_error );
+	// Same identity as its tombstone, but the post names another job: never a candidate.
+	$identity        = bin2hex( random_bytes( 16 ) );
+	$foreign_posts[] = $restored_post( 887100100 + $i, $identity );
+	update_post_meta( end( $foreign_posts ), '_ct_scan_job_id', 999999997 );
+	ct_test_assert( 1 === $wpdb->insert( ct_scan_tombstones_table(), $stone_row( 887100100 + $i, end( $foreign_posts ), $identity ) ), 'Fixture tombstone insert failed: ' . $wpdb->last_error );
+}
+$refuse = static function ( $check, $post ) use ( $refused_posts ) {
+	return in_array( (int) $post->ID, $refused_posts, true ) ? false : $check;
+};
+add_filter( 'pre_delete_post', $refuse, 10, 2 );
+update_option( 'ct_scan_restored_post_cursor', (string) $target_stone, false ); // start just past the older post: it is reached only by wrapping around
+ct_scan_apply_tombstones( ct_scan_utc_now() );
+ct_scan_apply_tombstones( ct_scan_utc_now() );
+remove_filter( 'pre_delete_post', $refuse, 10 );
+$refused_left = count( array_filter( $refused_posts, 'get_post' ) );
+$foreign_left = count( array_filter( $foreign_posts, 'get_post' ) );
+ct_test_assert( ! get_post( $target_post ) && 55 === $refused_left && 55 === $foreign_left, "Refused or foreign restored posts starved an older restored post, or a foreign post was deleted ($refused_left refused, $foreign_left foreign of 55 kept)." );
+foreach ( array_merge( $refused_posts, $foreign_posts ) as $id ) {
+	wp_delete_post( $id, true );
+}
+$wpdb->query( 'DELETE FROM ' . ct_scan_tombstones_table() . ' WHERE job_id BETWEEN 887100000 AND 887100200' );
 
 foreach ( $request_ids as $id ) {
 	$wpdb->delete( $jobs, array( 'request_id' => $id ), array( '%d' ) );
