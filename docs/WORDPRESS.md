@@ -118,8 +118,9 @@ Enforcement in the supervisor and scanner:
 - The grant's one-second lifetime and ten-second request bound are measured
   from just before the call WordPress granted, not from delivery to the
   scanner. A grant that took more than 0.6 s to come back is discarded and
-  asked for again (the discarded slot stays spent), at most twice; after that
-  the admission is refused (`admission_expired`). No admission is requested
+  asked for again (the discarded slot stays spent), at most twice and never
+  after the admission's four-second retry deadline; after that the admission is
+  refused (`admission_expired`). No admission is requested
   after the scan's own deadline, and a shutdown interrupts a slow guard call.
 - One grant is outstanding at a time. A second request, an out-of-sequence or
   unexpected message or an oversized message ends the scan
@@ -133,9 +134,13 @@ Enforcement in the supervisor and scanner:
   that the job is cancelled, expired or revoked, or that the integration is
   disabled (the operator kill switch). Cancellation therefore aborts the one
   admitted request within about two seconds plus the probe's own latency, and
-  never later than the ten-second bound. A probe that cannot reach WordPress
-  does not abort a request already admitted, and the next admission fails closed
-  (`admission_guard_unavailable`). Expired authorization is refused locally
+  never later than the ten-second bound. A probe that finds the queue lock held
+  elsewhere (often by the supervisor's own concurrent admission) retries briefly
+  within one call budget. An inconclusive probe (WordPress unreachable or slow,
+  a malformed answer, a still-busy lock or an internal `admission_error`) does
+  not abort a request already admitted or end the scan, and the next admission
+  fails closed on the same condition (for example
+  `admission_guard_unavailable`). Expired authorization is refused locally
   without a call.
 - `SubprocessRunner.run` refuses to start without a gate.
 

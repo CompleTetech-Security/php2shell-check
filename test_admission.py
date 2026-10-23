@@ -205,6 +205,21 @@ class GateTests(unittest.TestCase):
         self.assertEqual(denied.exception.slug, "admission_expired")
         self.assertEqual(len(self.api.calls), 3)
 
+    def test_slow_regrants_stop_at_the_admission_deadline(self):
+        class SlowAPI(_AdmitAPI):
+            def admit(inner, claim, kind):
+                self.clock.now += 2.5
+                return super().admit(claim, kind)
+
+        self.api = SlowAPI(*([GRANT] * 5))
+        gate = AdmissionGate(self.api, _claim(expires_at=NOW + 7200), stop_event=self.stop, clock=lambda: NOW, monotonic=self.clock)
+        with self.assertRaises(AdmissionDenied) as denied:
+            gate.admit()
+        self.assertEqual(denied.exception.slug, "admission_expired")
+        # The second slow answer lands past the four-second deadline: no third ask.
+        self.assertEqual(len(self.api.calls), 2)
+        self.assertLessEqual(self.clock.now - 1000.0, admission.MAX_ADMIT_WAIT_SECONDS + admission.CALL_BUDGET_SECONDS)
+
     def test_no_admission_is_requested_after_the_scan_deadline(self):
         gate = AdmissionGate(_AdmitAPI(GRANT), _claim(expires_at=NOW + 7200), deadline=NOW - 1, clock=lambda: NOW, monotonic=self.clock)
         with self.assertRaises(AdmissionDenied) as denied:
@@ -252,6 +267,23 @@ class GateTests(unittest.TestCase):
         with self.assertRaises(AdmissionDenied) as denied:
             self.gate(_refusal(410, "job_cancelled")).probe()
         self.assertEqual(denied.exception.slug, "job_cancelled")
+
+
+    def test_probe_retries_a_busy_queue_lock_within_one_call_budget(self):
+        self.gate(_refusal(503, "queue_busy"), _refusal(503, "queue_busy"), {"ok": True, "live": True}).probe()
+        self.assertEqual(self.api.calls, ["probe", "probe", "probe"])
+        self.clock.now = 1000.0
+        gate = self.gate(*([_refusal(503, "queue_busy")] * 100))
+        with self.assertRaises(AdmissionDenied) as denied:
+            gate.probe()
+        self.assertEqual(denied.exception.slug, "queue_busy")
+        self.assertLess(len(self.api.calls), 100)
+        self.assertLessEqual(self.clock.now - 1000.0, admission.CALL_BUDGET_SECONDS)
+        # Only a busy lock is retried: an explicit refusal is reported at once.
+        with self.assertRaises(AdmissionDenied) as denied:
+            self.gate(_refusal(410, "authorization_revoked_or_expired"), {"ok": True, "live": True}).probe()
+        self.assertEqual(denied.exception.slug, "authorization_revoked_or_expired")
+        self.assertEqual(self.api.calls, ["probe"])
 
 
 class ApiClientAdmitTests(unittest.TestCase):
@@ -438,6 +470,31 @@ class PumpStateMachineTests(unittest.TestCase):
         harness.pump.tick()
         harness.pump.wait_probe()
         self.assertEqual(harness.pump.tick(), "admission_job_cancelled")
+
+    def test_a_busy_or_failing_store_during_a_probe_does_not_kill_the_scan(self):
+        # The supervisor's own admission can hold the no-wait queue lock while a probe runs.
+        clock = _Clock()
+        gate = _ScriptGate(
+            admit=[_grant(), _grant()],
+            probe=[AdmissionDenied("queue_busy"), AdmissionDenied("admission_error"), AdmissionDenied("authorization_revoked_or_expired")],
+        )
+        harness = _PumpHarness(self, gate, monotonic=clock)
+        self.assertEqual(harness.child_admit()[0], {"ok": True})
+        for _ in range(2):
+            clock.now += admission.PROBE_INTERVAL_SECONDS + 0.01
+            self.assertIsNone(harness.pump.tick())
+            harness.pump.wait_probe()
+            self.assertIsNone(harness.pump.tick(), "an inconclusive probe does not end the scan")
+        harness.child.done()
+        __import__("select").select([harness.parent], [], [], 1)
+        self.assertIsNone(harness.pump.service())
+        self.assertEqual(harness.child_admit(), ({"ok": True}, None), "the scan continues to its next admission")
+        self.assertEqual(gate.probes, 2)
+        # An explicit refusal from a later probe is still fatal.
+        clock.now += admission.PROBE_INTERVAL_SECONDS + 0.01
+        harness.pump.tick()
+        harness.pump.wait_probe()
+        self.assertEqual(harness.pump.tick(), "admission_authorization_revoked_or_expired")
 
     def test_a_disabled_integration_is_a_refusal_that_stops_the_scanner(self):
         clock = _Clock()
