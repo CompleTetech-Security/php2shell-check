@@ -218,19 +218,19 @@ $request_ids[] = $retention_id;
 $retention_event = ct_scan_on_request_ready( $retention_id, $retention_fields );
 $old_finished = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '-13 months' )->format( 'Y-m-d H:i:s' );
 $wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => $old_finished, 'terms_accepted_at' => $old_finished, 'result_json' => '{}', 'manual_remainder_notes' => 'private notes' ), array( 'job_id' => (int) $retention_event['job_id'] ) );
-ct_scan_maintenance_locked();
+ct_test_maintain();
 $retained = ct_scan_row( $retention_event['job_id'] );
 ct_test_assert( $retained && null === $retained->result_json && null === $retained->manual_remainder_notes && get_post( $retention_id ), '12-month cleanup must clear result/manual data but retain the request evidence.' );
 $three_years = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '-3 years -1 day' )->format( 'Y-m-d H:i:s' );
-$wpdb->update( $jobs, array( 'terms_accepted_at' => $three_years, 'finished_at' => $three_years ), array( 'job_id' => (int) $retention_event['job_id'] ) );
+$wpdb->update( $jobs, array( 'terms_accepted_at' => $three_years, 'finished_at' => $three_years, 'closed_at' => $three_years, 'created_at' => $three_years, 'retain_until' => null ), array( 'job_id' => (int) $retention_event['job_id'] ) );
 $hold_delete = static function ( $check, $post ) use ( $retention_id ) {
 	return (int) $retention_id === (int) $post->ID ? false : $check;
 };
 add_filter( 'pre_delete_post', $hold_delete, 10, 2 );
-ct_scan_maintenance_locked();
+ct_test_maintain();
 remove_filter( 'pre_delete_post', $hold_delete, 10 );
 ct_test_assert( ct_scan_row( $retention_event['job_id'] ) && get_post( $retention_id ) && '' === ct_scan_row( $retention_event['job_id'] )->contact_email && '' === ct_scan_row( $retention_event['job_id'] )->contact_name, 'Failed three-year post deletion must retain the job link while scrubbing contact fields.' );
-ct_scan_maintenance_locked();
+ct_test_maintain();
 ct_test_assert( ! ct_scan_row( $retention_event['job_id'] ) && ! get_post( $retention_id ), 'Three-year cleanup must remove the exact linked private request and job.' );
 
 // Remove only records created by this test.

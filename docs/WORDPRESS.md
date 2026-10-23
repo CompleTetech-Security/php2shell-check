@@ -479,7 +479,9 @@ table cannot make every public request re-run it).
 Schema 3 adds `profile_id`, `http_admitted` and `last_admit_ms` to the jobs
 table (existing rows default to `r2-header-v1` with empty counters); schema 4
 adds `summary_sha256`, `bound_required` (the job's frozen evidence requirement;
-existing rows default to `0`), `accepted_copy_status` and `accepted_copy_at`. Upgrades
+existing rows default to `0`), `accepted_copy_status` and `accepted_copy_at`; schema 7
+adds the closure, retention, hold and identity columns and the tombstones table
+(and re-checks `control_admitted`). Upgrades
 run on `init` and the worker API refuses requests until they complete.
 
 The healthcheck requires a successful authenticated exchange in the last ten
@@ -515,7 +517,141 @@ site files, restore the scoped backups; existing accepted contracts and queue
 evidence must remain available. A started job with a missing receipt needs
 operator investigation, not a blind retry.
 
-Retention follows the accepted policy: scan results twelve months, and request
-and acceptance records three years. Maintenance must preserve current work and
-must not delete unrelated WordPress content. Authentication replay records and
-bounded controller logs have shorter operational lifetimes.
+Retention follows the owner's decisions of 2026-10-22, implemented in
+maintenance (which runs on worker polls that hand out no job and on the admin
+queue page):
+
+- **Closure is explicit.** The first time a job is seen in a terminal state
+  (`completed`, `failed`, `failed_unknown`, `cancelled`, `expired`, `blocked`)
+  it is stamped `closed_at`; an accepted request that was never confirmed or
+  never showed target control closes when it expires. A job that can still run
+  (including one in `awaiting_control`, with a control check pending or leased)
+  is never closed or deleted for age, however old its dates say it is; if one is ever
+  reopened, its closure stamp is cleared.
+- **Findings** (`result_json`, manual remainder notes): cleared twelve months
+  (366 days, so a leap day cannot make it early) after closure. The signed
+  evidence stays.
+- **Signed authorization evidence** (the job row and its linked private request,
+  in whatever post status it is in): deleted at `retain_until`, set at closure
+  and afterwards only ever extended, never shortened: **six years after
+  closure**, except that r2 and earlier acceptances
+  (versions `YYYY-MM-DD-rN` up to `2026-10-21-r2`) keep their promised **three
+  years from acceptance**. Never less than three years, whatever the
+  configuration; a version that cannot be parsed gets the longer period. The
+  configured `evidence_retention_years` is floored at **six** for non-legacy
+  versions: a word, null, a boolean, 0 or a value below six means six, never
+  less. A value above 100 years (which would push the date past 2200, where no
+  date is trusted) is clamped to 100 years and logged once.
+- **`retain_until` can be extended, never shortened.** When a job's stored date
+  comes due, it is compared with the date required today: the period derived
+  from the row under the current configuration, and never less than three years
+  after the job's creation. If the stored date is earlier (for example,
+  `evidence_retention_years` or `legacy_retention_years` was raised after
+  closure), it is extended to the required date (compare-and-set, under the
+  queue lock) and the job is deleted only when that later date arrives. Lowering
+  the configuration never moves a stored date earlier. A displayed date can
+  therefore grow when it comes due after a configuration change.
+- **Legacy acceptance dated before its record.** A record is created within
+  moments of the acceptance it records. If an r2-or-earlier acceptance is dated
+  more than a day before the job's creation, the stated acceptance date and the
+  plugin's own creation stamp disagree. The job then gets three full years from
+  creation. That is later than the promised three years from acceptance, and it
+  is a definite date rather than "never".
+- **Doubtful data is kept.** Deletion requires every date involved to be a real
+  `Y-m-d H:i:s` date no earlier than 2020 (zero dates and other restore debris
+  are refused), the stored deletion date to have arrived and to be no earlier
+  than the date required today (see above), and the job to be in a terminal
+  state. A job whose base date cannot be trusted keeps `retain_until` empty and
+  is shown as "unknown (kept)" in the admin queue. A record that appears to
+  have closed before it was created is kept. Nothing is deleted while the PHP
+  clock and the database clock (`UTC_TIMESTAMP()`) disagree by more than five
+  minutes, or while the server clock is earlier than a stored job timestamp (a
+  clock jumped backwards, a bad restore). The problem is logged once (not on
+  every run) until the clocks agree again; while it lasts no closure, deletion
+  date or examination time is stamped either (a wrong "now" is never recorded),
+  and only the reopening of non-terminal jobs proceeds. A forward jump of both clocks together cannot be detected. Each run
+  makes at most 50 deletion attempts in total, shared by the evidence step and
+  the tombstone clean-up. A job judged doubtful is looked at again at most daily
+  (`retention_checked_at`), so doubtful rows cannot hide due ones, and the queue
+  lock is held briefly. A job that has no opaque identity yet (created before it
+  existed and not yet reached by the backfill, which handles 100 jobs per run
+  from a stored cursor) is kept until it has one. The backfill adopts or writes
+  the request post's identity only when that post names this job
+  (`_ct_scan_job_id`); a post that names another job is left alone and the job
+  stays without identity, so it is kept. A single implausible far-future timestamp on any job
+  (later than now, before 2200) halts every deletion until it is corrected; this
+  is logged once, not on every run.
+- **Narrow preservation hold** (admin queue): one job, a stated purpose of 20 to
+  190 characters, a mandatory expiry of at most 730 days, recorded with who set
+  it and when (and who released it). While it stands nothing about that job is
+  cleared or deleted, including by a tombstone; after it expires or is released,
+  the job stays preserved for a further three days. Releasing ends the hold at
+  that moment (an already expired hold keeps its own end). The stated purpose is
+  kept, and who released it and when are recorded. A damaged hold (purpose
+  without an expiry) preserves rather than deletes. A hold that still protects
+  the job (unexpired or in its grace period) and has not been released is never
+  replaced: a second "place hold" (a stale tab, another administrator, a direct
+  POST) is refused and changes nothing, so it can neither shorten the hold nor
+  erase its purpose and setter. To change a hold, release it first (the job stays
+  protected through the grace period), then place the new one; a new hold never
+  ends earlier than the released one. The "Release hold" form carries the
+  identity of the hold it shows (purpose, expiry, setter, when set); a release
+  is a compare-and-set on those values, so a stale form can never end a newer
+  hold that replaced it ("hold changed: reload the queue").
+- **Retention runs outside the queue lock.** Only one retention run at a time
+  (its own advisory lock, throttled to about once a minute on worker polls that
+  hand out no job, so a lease is never delayed by it, and run again on the admin
+  queue page; a failure is logged and never breaks the poll or the page). The non-destructive steps are single
+  statements; every deletion takes the queue lock for that one job only, without
+  waiting (a busy queue means "next run"), re-reads the row under it and
+  re-checks every condition, so Stop (which waits up to three seconds for that
+  lock) is never queued behind a batch and a hold placed a moment ago is honoured.
+- **Tombstones.** Deleting a job writes an identifier-only tombstone (job id,
+  request id, a keyed MAC of the scope, creation time, an opaque random identity, time and
+  reason; no personal or customer data) before the deletion. If a restored backup
+  brings the rows back, the next maintenance run deletes them again: a job row
+  matches on its ids, scope and creation time, and its request post is deleted
+  with it only if the post carries the tombstone's opaque identity (otherwise
+  the post id was recycled and belongs to another record); a restored request post matches
+  only on its opaque identity and the job id it names, and only when no job row currently uses that request
+  or job id (auto-increment ids can be recycled after a restore and must never
+  reach a live record). A restored job row that holds a lease (a leased or
+  running scan, or a control check in progress) is deleted again only after
+  that bounded lease ends, so the one-at-a-time gate is never freed while its
+  traffic may be in flight. A recognised job row is also deleted again only once
+  the retention deadline that applies to it today has passed (the later of its
+  stored `retain_until` and the date required under the current configuration):
+  a live row whose retention deletion wrote its tombstone and then failed
+  part-way cannot be told apart from a restored one, and a period raised since
+  must protect it. (A row without a derivable deadline cannot be such a live row,
+  because retention only deletes rows whose dates are all valid; the tombstone
+  then decides.) The identity comparison between the tombstone and the request's
+  post meta is binary, so differing table collations (for example
+  `utf8mb4_unicode_ci` post meta beside a `utf8mb4_unicode_520_ci` tombstones
+  table) cannot make it fail. A retention query that fails is never read as
+  "nothing to do": that step stops, the records are kept, and the failure is
+  logged once until a run completes cleanly. Restored rows that cannot be acted on (held or
+  leased) are skipped in the query, and the candidates are paged from where the
+  previous run stopped (wrapping around), so neither skipped rows nor rows whose
+  deletion keeps failing can hide later restored rows. Restored request posts are
+  paged the same way (by tombstone, from a stored cursor), and the job-row loop
+  leaves a fifth of the shared budget for them, so posts whose deletion is
+  refused cannot hide others either. Jobs created before the identity existed are given one
+  (adopting what their request already carries, if that request names the job) by the next maintenance run. Tombstones are kept 120 days, longer than the 90-day backup
+  rotation, then purged. The scope MAC is keyed with `wp_salt( 'secure_auth' )`:
+  rotating that salt (or `SECURE_AUTH_KEY`/`SECURE_AUTH_SALT`) stops existing
+  tombstones from recognising restored job rows (restored request posts are still
+  matched by their opaque identity). Normal retention still deletes restored rows
+  when their own deletion date is due.
+- Deletion scrubs the contact fields first, then deletes the private request and
+  the job row; if any step fails the record stays (and is retried) rather than
+  being half-deleted. When its linked request exists, a due job is deleted only
+  if that request carries exactly the job's opaque identity; if the request has
+  another identity, or none, neither the request nor the job is touched (it is
+  re-examined daily and needs an administrator to repair the identity).
+
+Not covered here: backup rotation itself, the contract archive's historical Git
+objects and clones (issue 11), unsigned caller leads (there is no lead record in
+this plugin; the current form saves nothing without a signature), and deletion
+from mail systems. Authentication replay records and bounded controller logs
+have shorter operational lifetimes.

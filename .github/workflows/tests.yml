@@ -57,6 +57,8 @@ jobs:
           token=$(printf '%s' "$fixture" | jq -r .token)
           docker run --rm --network php2shell-ci_fixture -v "$PWD:/app:ro" -w /app -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/app -e CT_FIXTURE_TOKEN="$token" python:3.12-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70 python deployment/test-http-worker.py
           docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/deployment/test-http-fixture.php cleanup
+      - name: Test closure, retention periods, holds and deletion tombstones
+        run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/retention.php
       - name: Test target control (challenge limits, manual review, blocked outcome) and its HTTP boundary
         run: |
           docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/control.php

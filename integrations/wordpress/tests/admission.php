@@ -299,11 +299,12 @@ $count = static function ( $queries ) use ( &$runs ) {
 };
 add_filter( 'dbdelta_queries', $count );
 ct_scan_maybe_install_schema();
+$first_run = $runs; // the tables dbDelta is asked to build in one upgrade attempt
 ct_scan_maybe_install_schema();
 ct_scan_maybe_install_schema();
 remove_filter( 'dbdelta_queries', $count );
 $logged = (string) file_get_contents( $log );
-ct_test_assert( 2 === $runs, "dbDelta ran $runs times (two tables, once) for three requests after a failed upgrade." );
+ct_test_assert( $first_run >= 2 && $runs === $first_run, "dbDelta ran $runs times for three requests after a failed upgrade (one attempt is $first_run)." );
 ct_test_assert( 1 === substr_count( $logged, 'ct-scan: database upgrade' ) && false !== get_transient( 'ct_scan_schema_backoff' ), 'A failed upgrade was not logged exactly once with a back-off.' );
 ct_test_assert( 503 === ct_test_admit( $jobc )->get_status() && '2' === get_option( 'ct_scan_schema_version' ), 'The worker API was not refused during an incomplete upgrade.' );
 delete_transient( 'ct_scan_schema_backoff' );

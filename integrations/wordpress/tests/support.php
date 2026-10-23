@@ -19,6 +19,10 @@ file_put_contents( $private_config, '<?php return ' . var_export( array(
 	'confirmation_ttl_hours'    => 24,
 	'global_daily_limit'        => 1000,
 	'target_daily_limit'        => 100,
+	// CT_TEST_EVIDENCE_YEARS: a raw value (words, NULL, TRUE, ARRAY, numbers) for evidence_retention_years.
+	'evidence_retention_years'  => false === getenv( 'CT_TEST_EVIDENCE_YEARS' ) ? 6 : ( array( 'NULL' => null, 'TRUE' => true, 'FALSE' => false, 'ARRAY' => array( 9 ) )[ getenv( 'CT_TEST_EVIDENCE_YEARS' ) ] ?? getenv( 'CT_TEST_EVIDENCE_YEARS' ) ),
+	// CT_TEST_LEGACY_YEARS: legacy_retention_years for r2-and-earlier acceptances (default three).
+	'legacy_retention_years'    => false === getenv( 'CT_TEST_LEGACY_YEARS' ) ? 3 : getenv( 'CT_TEST_LEGACY_YEARS' ),
 	// CT_TEST_POLICY: legacy (default; the grandfathered r2 flow), strict, or none (no decision declared).
 	'terms_policy'              => 'none' === getenv( 'CT_TEST_POLICY' ) ? array() : array( ( getenv( 'CT_TEST_VERSION' ) ?: '2026-10-21-r2' ) => 'strict' === getenv( 'CT_TEST_POLICY' ) ? 'strict' : 'legacy' ),
 	'send_accepted_copy'        => '1' === getenv( 'CT_TEST_COPY' ),
@@ -202,4 +206,10 @@ function ct_test_running_job_for_bound( $host ) {
 function ct_test_end_job( $job_id ) {
 	global $wpdb;
 	$wpdb->update( ct_scan_jobs_table(), array( 'status' => 'failed', 'outcome' => 'failed', 'finished_at' => ct_scan_utc_now(), 'lease_hash' => null, 'lease_until' => null ), array( 'job_id' => (int) $job_id ) );
+}
+
+/** One maintenance pass as production does it: state transitions under the queue lock, then retention outside it. */
+function ct_test_maintain() {
+	ct_scan_maintenance_locked();
+	ct_scan_retention_run( true );
 }
