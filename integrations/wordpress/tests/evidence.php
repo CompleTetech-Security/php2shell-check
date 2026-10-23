@@ -63,6 +63,9 @@ $cases = array(
 	'summary without the limits line'     => array( array( 'summary_drop' => 'Limits' ), 'binding_mismatch' ),
 	'summary with other limits'           => array( array( 'summary' => ct_test_summary( array( 'target' => 'https://evidence-case.example.net/', 'name' => 'Fixture Reviewer', 'email' => 'fixture@example.com' ), array( 'Limits' => 'this website only; at most 2000 requests' ) ) ), 'binding_mismatch' ),
 	'summary without the period line'     => array( array( 'summary_drop' => 'Authorization' ), 'binding_mismatch' ),
+	// Byte-identical terms and Summary share one computed hash; every recorded digest must still be compared.
+	'snapshot equals summary, terms hash differs'  => array( array( 'snapshot_is_summary' => true, 'meta' => array( '_ct_terms_sha256' => str_repeat( 'b', 64 ) ) ), 'binding_mismatch' ),
+	'snapshot equals summary, stale terms digest'  => array( array( 'snapshot_is_summary' => true, 'meta' => array( '_ct_terms_shown_digest' => str_repeat( 'a', 64 ) ) ), 'binding_mismatch' ),
 	'bound pieces without the marker'     => array( array( 'meta' => array( '_ct_terms_binding' => null ) ), 'binding_required' ),
 	'marker with another value'           => array( array( 'meta' => array( '_ct_terms_binding' => 'yes' ) ), 'binding_required' ),
 );
@@ -75,6 +78,9 @@ foreach ( $cases as $label => $case ) {
 	if ( isset( $mutations['summary_drop'] ) ) {
 		$mutations = array( 'summary' => implode( "\n", array_filter( explode( "\n", ct_test_summary( $case_fields ) ), static function ( $line ) use ( $mutations ) { return '' !== $line && 0 !== strpos( $line, $mutations['summary_drop'] . ':' ); } ) ) . "\n" );
 	}
+	if ( ! empty( $mutations['snapshot_is_summary'] ) ) {
+		$mutations['snapshot'] = ct_test_summary( $case_fields );
+	}
 	// Summaries built for "evidence-case" must name this request's website for the other checks to be the only fault.
 	if ( isset( $mutations['summary'] ) ) {
 		$mutations['summary'] = str_replace( 'https://evidence-case.example.net/', $case_fields['target'], $mutations['summary'] );
@@ -83,6 +89,29 @@ foreach ( $cases as $label => $case ) {
 	ct_test_refused_with( $case_id, $case_fields, $case[1], 'Case "' . $label . '"' );
 }
 
+// Control: byte-identical terms and Summary with every digest consistent is accepted (the cases above fail only on the digest).
+list( $same_id, $same_fields ) = ct_test_request( 'evidence-same-bytes.example.net' );
+$request_ids[] = $same_id;
+ct_test_bind( $same_id, $same_fields, array( 'snapshot' => ct_test_summary( $same_fields ) ) );
+ct_test_assert( is_array( ct_scan_on_request_ready( $same_id, $same_fields ) ), 'Byte-identical but consistent terms and Summary were refused.' );
+
+// An evidence key holding more than one row is ambiguous (get_post_meta( ..., true ) would pick the first): refused,
+// even when the extra row repeats the same value.
+foreach ( array( '_ct_terms_binding', '_ct_terms_snapshot', '_ct_terms_sha256', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $i => $key ) {
+	list( $dup_id, $dup_fields ) = ct_test_request( 'evidence-duplicate-' . $i . '.example.net' );
+	$request_ids[] = $dup_id;
+	$dup_meta = ct_test_bind( $dup_id, $dup_fields );
+	add_post_meta( $dup_id, $key, wp_slash( 0 === $i % 2 ? $dup_meta[ $key ] : $dup_meta[ $key ] . 'x' ) );
+	ct_test_refused_with( $dup_id, $dup_fields, 'evidence_duplicate', 'Duplicate ' . $key );
+}
+// ...and a duplicate row added after the job exists ends the authorization.
+$dup_running = ct_test_running_job_for_bound( 'evidence-duplicate-running.example.net' );
+$request_ids[] = $dup_running['request_id'];
+ct_test_assert( 200 === ct_test_admit( $dup_running )->get_status(), 'A bound running job was not admitted (duplicate case).' );
+add_post_meta( $dup_running['request_id'], '_ct_summary_text', wp_slash( ct_scan_meta_string( $dup_running['request_id'], '_ct_summary_text' ) ) );
+ct_test_age_admission( $dup_running['job_id'] );
+$dup_admit = ct_test_admit( $dup_running );
+ct_test_assert( 410 === $dup_admit->get_status() && 'cancelled' === ct_scan_row( $dup_running['job_id'] )->status, 'A duplicate evidence row added after acceptance did not end the authorization.' );
 
 // ---- Defaults: strict unless an r2-or-earlier version is explicitly grandfathered -------------------------------
 function ct_test_gate_env( $env ) {

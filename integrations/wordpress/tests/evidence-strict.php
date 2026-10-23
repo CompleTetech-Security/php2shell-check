@@ -71,6 +71,36 @@ foreach ( array( false, 'throw' ) as $mode ) {
 	ct_test_assert( 'already_handled' === ct_scan_send_accepted_copy( $fevent['job_id'] ) && count( $mail ) === $count, 'An uncertain accepted copy was resent automatically.' );
 }
 
+// The recorded terms hash is compared case-insensitively at send time (the job stores it lowercased).
+list( $upper_id, $upper_fields ) = ct_test_request( 'strict-upper.example.net' );
+$request_ids[] = $upper_id;
+$upper_meta = ct_test_bind( $upper_id, $upper_fields );
+update_post_meta( $upper_id, '_ct_terms_sha256', strtoupper( $upper_meta['_ct_terms_sha256'] ) );
+$upper_event = ct_scan_on_request_ready( $upper_id, $upper_fields );
+ct_test_assert( is_array( $upper_event ), 'A bound acceptance with an upper-case terms hash was refused.' );
+ct_test_queue_job( $upper_event['job_id'] );
+$count = count( $mail );
+ct_test_assert( 'sent' === ct_scan_send_accepted_copy( $upper_event['job_id'] ) && count( $mail ) === $count + 1, 'An upper-case recorded terms hash blocked the accepted copy.' );
+
+// A job that is no longer live when the copy would be sent gets none, and its copy state is untouched.
+foreach ( array( 'cancelled', 'revoked', 'evidence_changed' ) as $how ) {
+	list( $dead_id, $dead_fields ) = ct_test_request( 'strict-dead-' . str_replace( '_', '-', $how ) . '.example.net' );
+	$request_ids[] = $dead_id;
+	ct_test_bind( $dead_id, $dead_fields );
+	$dead_event = ct_scan_on_request_ready( $dead_id, $dead_fields );
+	ct_test_queue_job( $dead_event['job_id'] );
+	if ( 'cancelled' === $how ) {
+		$wpdb->update( $jobs, array( 'status' => 'cancelled', 'error_code' => 'customer_stop' ), array( 'job_id' => $dead_event['job_id'] ) );
+	} elseif ( 'revoked' === $how ) {
+		$wpdb->update( $jobs, array( 'revoked_at' => ct_scan_utc_now() ), array( 'job_id' => $dead_event['job_id'] ) );
+	} else {
+		update_post_meta( $dead_id, '_ct_summary_text', wp_slash( ct_test_summary( $dead_fields ) . "Note: edited afterwards\n" ) );
+	}
+	$count = count( $mail );
+	$dead = ct_scan_send_accepted_copy( $dead_event['job_id'] );
+	ct_test_assert( is_wp_error( $dead ) && count( $mail ) === $count && 'not_sent' === ct_scan_row( $dead_event['job_id'] )->accepted_copy_status, "An accepted copy was sent for a job that is no longer live ($how)." );
+}
+
 // The requirement is frozen into each job. A job created before the version was listed as requiring
 // bound evidence keeps working when the configuration later requires it, and one created bound keeps
 // needing it: configuration can neither cancel nor relax an authorization already given.

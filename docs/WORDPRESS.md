@@ -196,7 +196,10 @@ the request closes). The form, the site recorder and this plugin render
 byte-identical text from that one function, so the limits the signer saw are the
 limits the job runs under. Any missing, oversized, mismatched, stale,
 non-canonical or partial piece refuses the job (`ct_scan_binding_mismatch` /
-`ct_scan_binding_required`), and the job row stores the summary digest, so a
+`ct_scan_binding_required`). Every recorded digest is compared, even when the
+terms and the Summary are byte-identical. An evidence key (the marker, the
+snapshot, the Summary or any of their digests) that holds more than one meta row
+is ambiguous and refuses the job (`ct_scan_evidence_duplicate`). The job row stores the summary digest, so a
 later edit of the retained evidence makes the authorization no longer live and
 cancels a queued or running job. A change of the profile's limits changes the
 text and therefore requires a new acceptance.
@@ -219,12 +222,15 @@ confirmation sends the verified contact their copy: the Target Summary, the
 hashes, the filled-in copy and, for a bound acceptance, the exact terms bytes
 as an attachment (written to a private temporary directory and attached only if
 it reproduces the recorded hash). The recipient must still be the confirmed,
-authorized address. It is sent at most once (the status is claimed by
+authorized address, and the job must still be live (queued, leased or running,
+not revoked, and its retained evidence unchanged), re-checked under the queue
+lock immediately before the send is claimed. It is sent at most once (the status is claimed by
 compare-and-set before mail is handed off), only to the verified address, and
 never to a referrer. An uncertain or failed hand-off is recorded as `unknown`
 and never resent automatically; `accepted` means transport acceptance, not
 receipt. A failure cannot cancel, delay or repeat a scan. The wording of that
 message has not been reviewed by the owner.
+
 ## Egress (activation requirement)
 
 The admission guard, the unprivileged UID and the resource limits are
@@ -376,7 +382,8 @@ API stays refused, and the upgrade is not retried for five minutes (so a broken
 table cannot make every public request re-run it).
 Schema 3 adds `profile_id`, `http_admitted` and `last_admit_ms` to the jobs
 table (existing rows default to `r2-header-v1` with empty counters); schema 4
-adds `summary_sha256`, `accepted_copy_status` and `accepted_copy_at`. Upgrades
+adds `summary_sha256`, `bound_required` (the job's frozen evidence requirement;
+existing rows default to `0`), `accepted_copy_status` and `accepted_copy_at`. Upgrades
 run on `init` and the worker API refuses requests until they complete.
 
 The healthcheck requires a successful authenticated exchange in the last ten
