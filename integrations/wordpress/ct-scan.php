@@ -400,6 +400,13 @@ function ct_scan_meta_string( $post_id, $key ) {
  * unless the operator grandfathered an r2-or-earlier version as `legacy` in config `terms_policy`.
  */
 function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $required, $profile ) {
+	// get_post_meta( ..., true ) silently returns the first of several rows, so an evidence key that
+	// holds more than one value is ambiguous: refuse rather than pick one.
+	foreach ( array( '_ct_terms_binding', '_ct_terms_snapshot', '_ct_terms_sha256', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
+		if ( count( (array) get_post_meta( $request_id, $key, false ) ) > 1 ) {
+			return new WP_Error( 'ct_scan_evidence_duplicate', 'The saved acceptance holds more than one value for a piece of evidence.' );
+		}
+	}
 	$marker  = ct_scan_meta_string( $request_id, '_ct_terms_binding' );
 	$partial = false;
 	foreach ( array( '_ct_terms_snapshot', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
@@ -420,15 +427,18 @@ function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $req
 	}
 	$snapshot_hash = hash( 'sha256', $snapshot );
 	$summary_hash  = hash( 'sha256', $summary );
+	// A list of [computed, recorded] pairs, never keyed by the computed hash: byte-identical terms and
+	// Summary would share a key and silently drop the terms comparison.
 	$checks = array(
-		$snapshot_hash => array( $terms_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_terms_shown_digest' ) ) ),
-		$summary_hash  => array( strtolower( ct_scan_meta_string( $request_id, '_ct_summary_sha256' ) ), strtolower( ct_scan_meta_string( $request_id, '_ct_summary_shown_digest' ) ) ),
+		array( $snapshot_hash, $terms_hash ),
+		array( $snapshot_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_terms_shown_digest' ) ) ),
+		array( $summary_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_summary_sha256' ) ) ),
+		array( $summary_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_summary_shown_digest' ) ) ),
 	);
-	foreach ( $checks as $computed => $recorded ) {
-		foreach ( $recorded as $value ) {
-			if ( ! is_string( $value ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $value ) || ! hash_equals( $computed, $value ) ) {
-				return new WP_Error( 'ct_scan_binding_mismatch', 'The retained evidence does not match the digest the signer was shown.' );
-			}
+	foreach ( $checks as $check ) {
+		list( $computed, $value ) = $check;
+		if ( ! is_string( $value ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $value ) || ! hash_equals( $computed, $value ) ) {
+			return new WP_Error( 'ct_scan_binding_mismatch', 'The retained evidence does not match the digest the signer was shown.' );
 		}
 	}
 	// The Target Summary must be exactly the canonical text of the authorized request (website, client,
@@ -1001,8 +1011,14 @@ function ct_scan_send_accepted_copy( $job_id ) {
 		if ( ! $row || empty( $row->confirmed_at ) || ! is_email( $row->contact_email )
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_scan_email' ) !== $row->contact_email
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_version' ) !== $row->terms_version
-			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) !== $row->terms_hash ) {
+			|| strtolower( ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) ) !== $row->terms_hash ) {
 			return new WP_Error( 'accepted_copy_unavailable', 'The accepted copy requires the confirmed, authorized recipient.' );
+		}
+		// Re-checked under the queue lock right before the claim: a job that was cancelled, stopped,
+		// expired or whose evidence changed since confirmation gets no copy. A confirmed job waiting for
+		// proof of target control is live (confirmation sends the copy then); control gates the scan, not the copy.
+		if ( ! in_array( $row->status, array( 'awaiting_control', 'queued', 'leased', 'running' ), true ) || ! ct_scan_authorization_is_live( $row ) ) {
+			return new WP_Error( 'accepted_copy_unavailable', 'The accepted copy requires a live authorization.' );
 		}
 		$claimed = $wpdb->update(
 			$table,
