@@ -536,7 +536,8 @@ $run_raised = static function () {
 	ct_test_assert( 'maintained' === $out, "The raised-configuration maintenance run failed: $out $err" );
 	wp_cache_flush(); // the other process changed the database behind this one's object cache
 };
-$raise_past   = ct_test_aged_job( 'ret-raise-past.example.net', 'cancelled', '-8 years -3 days', '-8 years -2 days', '2027-06-01-r3' );
+// (Dates before 2020 are refused as untrustworthy, so the case whose new date has already come is a legacy one.)
+$raise_past   = ct_test_aged_job( 'ret-raise-past.example.net', 'failed', '-5 years -3 days', '-5 years -2 days' );
 $raise_future = ct_test_aged_job( 'ret-raise-future.example.net', 'cancelled', '-6 years -3 days', '-6 years -2 days', '2027-06-01-r3' );
 $raise_legacy = ct_test_aged_job( 'ret-raise-legacy.example.net', 'failed', '-3 years -2 days', '-1 day' );
 foreach ( array( $raise_past, $raise_future, $raise_legacy ) as $j ) {
@@ -550,7 +551,7 @@ $rp = ct_scan_row( $raise_past['job_id'] );
 $rf = ct_scan_row( $raise_future['job_id'] );
 $rl = ct_scan_row( $raise_legacy['job_id'] );
 ct_test_assert( $rp && $rf && $rl && get_post( $raise_past['request_id'] ) && get_post( $raise_future['request_id'] ) && get_post( $raise_legacy['request_id'] ), 'Evidence was deleted at the date fixed under a shorter configuration.' );
-ct_test_assert( $rp->retain_until === $plus( $rp->closed_at, 8 ) && $rf->retain_until === $plus( $rf->closed_at, 8 ) && $rl->retain_until === $plus( $rl->terms_accepted_at, 5 ), 'retain_until was not extended to the longer configured period.' );
+ct_test_assert( $rp->retain_until === $plus( $rp->terms_accepted_at, 5 ) && $rf->retain_until === $plus( $rf->closed_at, 8 ) && $rl->retain_until === $plus( $rl->terms_accepted_at, 5 ), "retain_until was not extended to the longer configured period ({$rp->retain_until} {$rf->retain_until} {$rl->retain_until}; checked {$rp->retention_checked_at})." );
 $run_raised();
 ct_test_assert( ! ct_test_exists( $raise_past ) && ! get_post( $raise_past['request_id'] ), 'Evidence was not deleted once the extended date arrived.' );
 ct_test_assert( ct_test_exists( $raise_future ) && ct_test_exists( $raise_legacy ), 'Evidence was deleted before its extended date.' );
