@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 
+from integrations.worker.admission import AdmissionDenied
 from integrations.worker.runner import SubprocessRunner, _linux_preexec_limits
 from integrations.worker.service import load_secret
 
@@ -30,7 +31,21 @@ else:
                    env={'PATH': '/usr/local/bin:/usr/bin:/bin'},
                    preexec_fn=_linux_preexec_limits)
 
-result = SubprocessRunner().run('https://runtime-fixture.example.invalid/', timeout=15)
+class RefusingGate:
+    # With no network the lookup fails before any admission is requested; if the
+    # scanner ever asked, a refusal here would fail the run.
+    admits = 0
+
+    def admit(self):
+        RefusingGate.admits += 1
+        raise AdmissionDenied('job_cancelled')
+
+    def probe(self):
+        return None
+
+
+result = SubprocessRunner().run('https://runtime-fixture.example.invalid/', timeout=15, gate=RefusingGate())
+assert RefusingGate.admits == 0, 'an admission was requested although the destination never resolved'
 assert result['status'] == 'error', result['status']
 assert result['php2shell_status'] == 'unknown'
 assert result['php2shell_exploitability'] == 'not_tested'

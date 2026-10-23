@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CompleteTech Authorized PHP2Shell Scan Queue
  * Description: Confirmation-gated, one-target PHP2Shell screening queue for Promo Requests.
- * Version: 0.1.0
+ * Version: 0.2.0
  *
  * This MU plugin stores authorization and job state locally. It never starts a
  * scanner process. The external worker talks to the signed REST routes below.
@@ -17,7 +17,34 @@ if ( ! defined( 'CT_SCAN_DEFAULT_TERMS_VERSION' ) ) {
 }
 
 if ( ! defined( 'CT_SCAN_SCHEMA_VERSION' ) ) {
-	define( 'CT_SCAN_SCHEMA_VERSION', '2' );
+	define( 'CT_SCAN_SCHEMA_VERSION', '3' );
+}
+
+/**
+ * Execution profiles. A job freezes its profile id at creation, and the limits
+ * live here in code rather than in editable configuration, so a later setting
+ * cannot broaden an existing authorization. `r2-header-v1` is the current
+ * homepage-header screening: robots.txt (at most six hops) plus the homepage
+ * (at most six hops, with at most one HTTP-to-HTTPS origin change) is at most
+ * 20 requests. Unknown profiles are refused.
+ */
+function ct_scan_current_profile() {
+	return 'r2-header-v1';
+}
+
+function ct_scan_profile_limits( $profile_id ) {
+	$profiles = array(
+		'r2-header-v1' => array(
+			'http_requests'   => 20,
+			// At most one request per second for the target, enforced centrally.
+			'min_interval_ms' => 1000,
+			// Disclosed bounds: an admission may be used for one second, and one
+			// admitted request may finish within the ten-second timeout.
+			'valid_ms'        => 1000,
+			'timeout_ms'      => 10000,
+		),
+	);
+	return is_string( $profile_id ) && isset( $profiles[ $profile_id ] ) ? $profiles[ $profile_id ] : false;
 }
 
 /** Load the secret-bearing settings without ever rendering their values. */
@@ -38,6 +65,10 @@ function ct_scan_config() {
 		'global_daily_limit'       => 20,
 		'target_daily_limit'       => 1,
 		'job_retention_days'       => 365,
+		// The admission guard is advisory to a scanner that ignores it; only enforced network egress
+		// (allow the customer's HTTP/HTTPS, deny private/metadata ranges) makes it a boundary. The
+		// operator must state, deliberately, that this exists. See docs/WORDPRESS.md "Egress".
+		'egress_enforced'          => false,
 	);
 
 	$path = defined( 'CT_SCAN_PRIVATE_CONFIG' )
@@ -59,6 +90,7 @@ function ct_scan_config() {
 	$config['enabled'] = true === $config['enabled']
 		&& is_string( $config['worker_hmac_secret'] )
 		&& strlen( $config['worker_hmac_secret'] ) >= 32
+		&& true === $config['egress_enforced']
 		&& is_string( $config['expected_checker_revision'] )
 		&& 1 === preg_match( '/\A[a-f0-9]{40}\z/i', $config['expected_checker_revision'] )
 		&& is_string( $config['supported_terms_version'] )
@@ -84,7 +116,12 @@ function ct_scan_nonces_table() {
 
 /** Create plugin tables once; MU plugins do not receive activation hooks. */
 function ct_scan_maybe_install_schema() {
-	if ( get_option( 'ct_scan_schema_version' ) === CT_SCAN_SCHEMA_VERSION ) {
+	$previous = get_option( 'ct_scan_schema_version' );
+	if ( $previous === CT_SCAN_SCHEMA_VERSION ) {
+		return;
+	}
+	// A failed upgrade must not re-run dbDelta on every public request: back off for five minutes.
+	if ( get_transient( 'ct_scan_schema_backoff' ) ) {
 		return;
 	}
 	global $wpdb;
@@ -128,6 +165,9 @@ function ct_scan_maybe_install_schema() {
 		report_notification_at datetime NULL,
 		report_delivered_at datetime NULL,
 		revoked_at datetime NULL,
+		profile_id varchar(32) NOT NULL DEFAULT 'r2-header-v1',
+		http_admitted smallint(5) unsigned NOT NULL DEFAULT 0,
+		last_admit_ms bigint(20) unsigned NULL,
 		PRIMARY KEY  (job_id),
 		UNIQUE KEY request_id (request_id),
 		KEY status_created (status,created_at),
@@ -145,14 +185,24 @@ function ct_scan_maybe_install_schema() {
 	) {$charset};";
 	dbDelta( $sql );
 	$required = array(
-		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash' ),
+		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
 	);
 	foreach ( $required as $table => $columns ) {
 		$found = $wpdb->get_col( "SHOW COLUMNS FROM {$table}", 0 );
 		if ( ! is_array( $found ) || array_diff( $columns, $found ) ) {
+			// Loud once per back-off window, and bounded. The worker API stays refused (fail closed).
+			error_log( 'ct-scan: database upgrade to schema ' . CT_SCAN_SCHEMA_VERSION . ' is incomplete for ' . $table . '; the worker API stays refused. Retrying in 5 minutes. Restore from backup or repair the table.' ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			set_transient( 'ct_scan_schema_backoff', '1', 5 * MINUTE_IN_SECONDS );
 			return;
 		}
+	}
+	delete_transient( 'ct_scan_schema_backoff' );
+	if ( is_string( $previous ) && '' !== $previous && version_compare( $previous, '3', '<' ) ) {
+		// A job that started before request counting existed has no record of what it already
+		// sent: it gets no fresh budget, so its remaining admissions are refused.
+		$limits = ct_scan_profile_limits( ct_scan_current_profile() );
+		$wpdb->query( $wpdb->prepare( "UPDATE {$jobs} SET http_admitted = %d WHERE status = 'running'", (int) $limits['http_requests'] ) );
 	}
 	update_option( 'ct_scan_schema_version', CT_SCAN_SCHEMA_VERSION, false );
 }
@@ -240,6 +290,8 @@ function ct_scan_meta_string( $post_id, $key ) {
 
 /** Check the saved request and acceptance snapshot before any job is created. */
 function ct_scan_validate_saved_request( $request_id, $fields, $require_current_terms = true, $frozen_expiry = '' ) {
+	// Authorization is judged on what the database holds now, never on an object-cache copy.
+	clean_post_cache( (int) $request_id );
 	$config = ct_scan_config();
 	$post   = get_post( $request_id );
 	if ( ! $post || 'ct_promo_request' !== $post->post_type || 'private' !== $post->post_status ) {
@@ -344,10 +396,14 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 }
 
 /** Acquire the per-site MySQL advisory lock used to serialize state changes. */
-function ct_scan_lock_acquire() {
+function ct_scan_lock_acquire( $wait_seconds = 0 ) {
 	global $wpdb;
 	$name = 'ctscan_' . substr( hash( 'sha256', DB_NAME . '|' . $wpdb->prefix ), 0, 24 );
-	return '1' === (string) $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', $name ) );
+	// Worker paths never wait (they fail closed and retry). Customer stop and
+	// operator revocation may wait briefly so a concurrent admission cannot make
+	// a cancellation spuriously fail.
+	$wait = max( 0, min( 5, (int) $wait_seconds ) );
+	return '1' === (string) $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $name, $wait ) );
 }
 
 function ct_scan_lock_release() {
@@ -439,8 +495,9 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 				'confirmation_token_hash'  => hash( 'sha256', $token ),
 				'confirmation_expires_at'  => $confirm_expires,
 				'stop_token_hash'          => hash( 'sha256', $stop_token ),
+				'profile_id'               => ct_scan_current_profile(),
 			),
-			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
+			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
 		if ( 1 !== $inserted ) {
 			$existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$jobs} WHERE request_id = %d LIMIT 1", $request_id ) );
@@ -711,13 +768,15 @@ function ct_scan_row_by_stop_hash( $hash ) {
 }
 
 /**
- * Customer stop: request-bound and idempotent, serialized with claims, starts and results
- * by the queue lock. A cancelled job is rejected by the start and result endpoints. A check
- * the worker already started may finish its current requests; no new screening starts.
+ * Customer stop: request-bound and idempotent, serialized with claims, starts, results and
+ * request admissions by the queue lock. A cancelled job is rejected by the start, admit and
+ * result endpoints. A request already admitted when the stop commits may finish within its
+ * ten-second timeout; no further request is admitted. Waits briefly for the lock so that a
+ * concurrent admission cannot make the customer's stop fail.
  * Returns 'stopped', 'already_stopped', 'already_finished', or a WP_Error.
  */
 function ct_scan_customer_stop( $job_id, $token ) {
-	if ( ! ct_scan_lock_acquire() ) {
+	if ( ! ct_scan_lock_acquire( 3 ) ) {
 		return new WP_Error( 'queue_busy', 'The request is temporarily busy. Please try again.' );
 	}
 	global $wpdb;
@@ -975,6 +1034,125 @@ function ct_scan_start( WP_REST_Request $request ) {
 	}
 }
 
+/**
+ * Per-request admission decision. The sandboxed scanner holds no key: before every
+ * connection to the target, the supervisor asks this guard through the signed
+ * `admit` route. The caller MUST hold the queue lock, so this decision is
+ * serialized with customer stop, operator revocation, expiry, lease changes and
+ * every other admission. Returns array( http_status, payload ).
+ *
+ * `http` reserves one request from the frozen profile's budget and records the
+ * admission time in the same compare-and-set update; the reservation is consumed
+ * at once and is valid for ct_scan_profile_limits()['valid_ms']. `probe` only
+ * reports whether the job is still live (no budget, no pacing).
+ *
+ * Nothing here is permissive on failure: an unknown profile, a clock that moved
+ * backwards, a failed write, or an unconfirmed recipient is a refusal.
+ */
+function ct_scan_admit_locked( $data, $now_ms ) {
+	global $wpdb;
+	$table  = ct_scan_jobs_table();
+	$refuse = static function ( $status, $reason, $extra = array() ) {
+		return array( (int) $status, array_merge( array( 'ok' => false, 'reason' => sanitize_key( $reason ) ), $extra ) );
+	};
+	// No table-wide maintenance here: probes run every couple of seconds under the same
+	// lock as Stop, so this path stays short. Expiry and lease are checked on the row.
+	$row = ct_scan_row( $data['id'] );
+	if ( ! $row ) {
+		return $refuse( 410, 'job_not_found' );
+	}
+	if ( 'running' === $row->status && strtotime( $row->authorization_expires_at . ' UTC' ) <= time() ) {
+		$wpdb->update( $table, array( 'status' => 'expired', 'error_code' => 'authorization_expired', 'finished_at' => ct_scan_utc_now(), 'lease_hash' => null, 'lease_until' => null, 'confirmation_token_hash' => null ), array( 'job_id' => (int) $row->job_id, 'status' => 'running' ), array( '%s', '%s', '%s', '%s', '%s', '%s' ), array( '%d', '%s' ) );
+		ct_scan_mark_request_status( (int) $row->request_id, 'expired', 'authorization_expired' );
+		return $refuse( 410, 'job_expired' );
+	}
+	if ( 'cancelled' === $row->status ) {
+		return $refuse( 410, 'job_cancelled' );
+	}
+	if ( 'expired' === $row->status ) {
+		return $refuse( 410, 'job_expired' );
+	}
+	if ( 'running' !== $row->status || 1 !== (int) $row->attempts ) {
+		return $refuse( 410, 'job_not_running' );
+	}
+	if ( empty( $row->lease_hash ) || ! hash_equals( $row->lease_hash, hash( 'sha256', $data['lease'] ) )
+		|| ! hash_equals( $row->scope_hash, $data['scope_hash'] ) || strtotime( $row->lease_until . ' UTC' ) <= time() ) {
+		return $refuse( 410, 'lease_invalid_or_expired' );
+	}
+	if ( empty( $row->confirmed_at ) ) {
+		return $refuse( 410, 'recipient_unconfirmed' );
+	}
+	if ( ! ct_scan_authorization_is_live( $row ) ) {
+		$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => ct_scan_utc_now(), 'lease_hash' => null, 'lease_until' => null ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%s', '%s', '%s', '%s' ), array( '%d' ) );
+		ct_scan_mark_request_status( (int) $row->request_id, 'cancelled', 'authorization_changed' );
+		return $refuse( 410, 'authorization_revoked_or_expired' );
+	}
+	$limits = ct_scan_profile_limits( $row->profile_id );
+	if ( ! $limits ) {
+		return $refuse( 410, 'profile_unknown' );
+	}
+	if ( 'probe' === $data['kind'] ) {
+		return array( 200, array( 'ok' => true, 'live' => true ) );
+	}
+	$last = null === $row->last_admit_ms ? null : (int) $row->last_admit_ms;
+	if ( null !== $last ) {
+		if ( $now_ms + $limits['min_interval_ms'] < $last ) {
+			// The clock moved backwards by more than the pacing interval: do not guess.
+			return $refuse( 410, 'clock_anomaly' );
+		}
+		$wait = $last + $limits['min_interval_ms'] - $now_ms;
+		if ( $wait > 0 ) {
+			return $refuse( 429, 'rate_wait', array( 'retry_after_ms' => (int) min( $wait, $limits['min_interval_ms'] ) ) );
+		}
+	}
+	$used = (int) $row->http_admitted;
+	if ( $used >= $limits['http_requests'] ) {
+		return $refuse( 409, 'budget_exhausted' );
+	}
+	$updated = $wpdb->update(
+		$table,
+		array( 'http_admitted' => $used + 1, 'last_admit_ms' => $now_ms ),
+		array( 'job_id' => (int) $row->job_id, 'status' => 'running', 'lease_hash' => $row->lease_hash, 'http_admitted' => $used ),
+		array( '%d', '%d' ),
+		array( '%d', '%s', '%s', '%d' )
+	);
+	if ( 1 !== $updated ) {
+		return $refuse( 503, 'admission_write_failed' );
+	}
+	return array( 200, array(
+		'ok'             => true,
+		'admitted'       => true,
+		'sequence'       => $used + 1,
+		'valid_ms'       => (int) $limits['valid_ms'],
+		'timeout_ms'     => (int) $limits['timeout_ms'],
+		'http_remaining' => (int) ( $limits['http_requests'] - $used - 1 ),
+	) );
+}
+
+function ct_scan_admit( WP_REST_Request $request ) {
+	$body = ct_scan_rest_authenticate( $request, '/ct-scan/v1/admit' );
+	if ( is_wp_error( $body ) ) {
+		return ct_scan_rest_error( (int) $body->get_error_data()['status'], $body->get_error_code() );
+	}
+	$data = ct_scan_decode_request_body( $body );
+	if ( is_wp_error( $data ) || ! ct_scan_expected_keys( $data, array( 'id', 'lease', 'scope_hash', 'kind' ) ) || ! ct_scan_callback_payload( $data )
+		|| ! is_string( $data['kind'] ) || ! in_array( $data['kind'], array( 'http', 'probe' ), true ) ) {
+		return ct_scan_rest_error( 400, 'request_invalid' );
+	}
+	if ( ! ct_scan_lock_acquire() ) {
+		// Fail closed: a refusal here ends the screening rather than risking an unserialized send.
+		return ct_scan_rest_response( 503, array( 'ok' => false, 'reason' => 'queue_busy' ) );
+	}
+	try {
+		$decision = ct_scan_admit_locked( $data, (int) floor( microtime( true ) * 1000 ) );
+	} catch ( Throwable $error ) {
+		$decision = array( 503, array( 'ok' => false, 'reason' => 'admission_error' ) );
+	} finally {
+		ct_scan_lock_release();
+	}
+	return ct_scan_rest_response( $decision[0], $decision[1] );
+}
+
 function ct_scan_clean_result_line( $value, $limit = 500 ) {
 	return is_string( $value ) && strlen( $value ) <= $limit;
 }
@@ -1137,6 +1315,10 @@ function ct_scan_result( WP_REST_Request $request ) {
 			return ct_scan_rest_error( 410, 'authorization_revoked_or_expired' );
 		}
 		if ( 'completed' === $data['outcome'] ) {
+			// A completed result is only credible if the guard admitted at least one request for this job.
+			if ( (int) $row->http_admitted < 1 ) {
+				return ct_scan_rest_error( 409, 'no_admission' );
+			}
 			$encoded_result = ct_scan_validate_result( $data['result'], $row );
 			if ( is_wp_error( $encoded_result ) ) {
 				return ct_scan_rest_error( 422, $encoded_result->get_error_code() );
@@ -1179,6 +1361,11 @@ function ct_scan_register_rest_routes() {
 	register_rest_route( 'ct-scan/v1', '/start', array(
 		'methods'             => WP_REST_Server::CREATABLE,
 		'callback'            => 'ct_scan_start',
+		'permission_callback' => '__return_true',
+	) );
+	register_rest_route( 'ct-scan/v1', '/admit', array(
+		'methods'             => WP_REST_Server::CREATABLE,
+		'callback'            => 'ct_scan_admit',
 		'permission_callback' => '__return_true',
 	) );
 	register_rest_route( 'ct-scan/v1', '/result', array(
@@ -1275,7 +1462,7 @@ function ct_scan_build_report_body( $row ) {
 }
 
 function ct_scan_admin_revoke( $job_id ) {
-	if ( ! ct_scan_lock_acquire() ) {
+	if ( ! ct_scan_lock_acquire( 3 ) ) {
 		return new WP_Error( 'queue_busy', 'The queue is temporarily busy.' );
 	}
 	global $wpdb;

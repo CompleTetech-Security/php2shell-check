@@ -6,7 +6,9 @@ import json
 import os
 import platform
 import re
+import select
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -15,6 +17,7 @@ from datetime import datetime
 
 from wordpress_check import PHP2SHELL_CVES, PHP2SHELL_RULES_DATE, PHP2SHELL_SOURCES, Result, assess_php2shell
 
+from .admission import AdmissionPump
 from .network import RequestOrigin
 
 
@@ -110,7 +113,10 @@ class SubprocessRunner:
         self._popen = popen
         self._monotonic = monotonic
 
-    def run(self, target: str, *, timeout: float = MAX_WALL_SECONDS, stop_event=None) -> dict:
+    def run(self, target: str, *, timeout: float = MAX_WALL_SECONDS, stop_event=None, gate=None) -> dict:
+        # Fail closed by construction: without an admission gate there is no scan.
+        if gate is None:
+            raise ScannerFailure("admission_guard_required")
         if not sys.platform.startswith("linux") or os.name != "posix" or os.geteuid() != 0:
             raise ScannerFailure("scanner_isolation_unavailable")
         if not _has_kill_capability():
@@ -135,6 +141,12 @@ class SubprocessRunner:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPATH": self.repo_root,
         }
+        try:
+            parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ScannerFailure("admission_channel_unavailable") from exc
+        child_fd = child_sock.fileno()
+        env["CT_ADMISSION_FD"] = str(child_fd)
         command = [sys.executable, "-m", "integrations.worker.scanner"]
         try:
             process = self._popen(
@@ -145,37 +157,86 @@ class SubprocessRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 close_fds=True,
+                pass_fds=(child_fd,),
                 start_new_session=True,
                 preexec_fn=_linux_preexec_limits,
                 bufsize=0,
             )
         except (OSError, ValueError) as exc:
+            parent_sock.close()
+            child_sock.close()
             raise ScannerFailure("scanner_start_failed") from exc
+        child_sock.close()
+        pump = AdmissionPump(parent_sock, gate)
 
-        buffers = {"stdout": bytearray(), "stderr": bytearray()}
-        overflow = threading.Event()
-        stdout_reader = threading.Thread(
-            target=_read_bounded,
-            args=(process.stdout, MAX_SCANNER_STDOUT, buffers, "stdout", overflow),
-            daemon=True,
-        )
-        stderr_reader = threading.Thread(
-            target=_read_bounded,
-            args=(process.stderr, MAX_SCANNER_STDERR, buffers, "stderr", overflow),
-            daemon=True,
-        )
-        stdout_reader.start()
-        stderr_reader.start()
         try:
-            view = memoryview(payload)
-            while view:
-                written = process.stdin.write(view)
-                if not written:
-                    raise OSError("short scanner input write")
-                view = view[written:]
-            process.stdin.close()
-        except OSError:
-            self._kill_process(process)
+            buffers = {"stdout": bytearray(), "stderr": bytearray()}
+            overflow = threading.Event()
+            stdout_reader = threading.Thread(
+                target=_read_bounded,
+                args=(process.stdout, MAX_SCANNER_STDOUT, buffers, "stdout", overflow),
+                daemon=True,
+            )
+            stderr_reader = threading.Thread(
+                target=_read_bounded,
+                args=(process.stderr, MAX_SCANNER_STDERR, buffers, "stderr", overflow),
+                daemon=True,
+            )
+            stdout_reader.start()
+            stderr_reader.start()
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = process.stdin.write(view)
+                    if not written:
+                        raise OSError("short scanner input write")
+                    view = view[written:]
+                process.stdin.close()
+            except OSError:
+                self._kill_process(process)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self._kill_process(process)
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired as exc:
+                        _close_pipes(process)
+                        raise ScannerFailure("scanner_termination_failed") from exc
+                stdout_reader.join(timeout=2)
+                stderr_reader.join(timeout=2)
+                _close_pipes(process)
+                raise ScannerFailure("scanner_input_failed")
+
+            deadline = self._monotonic() + float(timeout)
+            timed_out = False
+            stopped = False
+            while process.poll() is None:
+                if overflow.is_set():
+                    self._kill_process(process)
+                    break
+                if stop_event is not None and stop_event.is_set():
+                    stopped = True
+                    self._kill_process(process)
+                    break
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    self._kill_process(process)
+                    break
+                fatal = None
+                if pump.closed:
+                    time.sleep(min(0.025, remaining))
+                else:
+                    readable, _, _ = select.select([parent_sock], [], [], min(0.025, remaining))
+                    if readable:
+                        fatal = pump.service()
+                # Admission, cancellation, expiry and the in-flight bound are enforced here,
+                # not by the scanner: any fatal reason kills it at once.
+                fatal = fatal or pump.tick()
+                if fatal:
+                    self._kill_process(process)
+                    break
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -187,55 +248,30 @@ class SubprocessRunner:
                     raise ScannerFailure("scanner_termination_failed") from exc
             stdout_reader.join(timeout=2)
             stderr_reader.join(timeout=2)
-            _close_pipes(process)
-            raise ScannerFailure("scanner_input_failed")
-
-        deadline = self._monotonic() + float(timeout)
-        timed_out = False
-        stopped = False
-        while process.poll() is None:
-            if overflow.is_set():
-                self._kill_process(process)
-                break
-            if stop_event is not None and stop_event.is_set():
-                stopped = True
-                self._kill_process(process)
-                break
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                timed_out = True
-                self._kill_process(process)
-                break
-            time.sleep(min(0.025, remaining))
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self._kill_process(process)
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired as exc:
+            if stdout_reader.is_alive() or stderr_reader.is_alive():
                 _close_pipes(process)
-                raise ScannerFailure("scanner_termination_failed") from exc
-        stdout_reader.join(timeout=2)
-        stderr_reader.join(timeout=2)
-        if stdout_reader.is_alive() or stderr_reader.is_alive():
-            _close_pipes(process)
-            stdout_reader.join(timeout=2)
-            stderr_reader.join(timeout=2)
-        else:
-            _close_pipes(process)
-        if timed_out:
-            raise ScannerFailure("scanner_timeout")
-        if stopped:
-            raise ScannerFailure("worker_shutdown")
-        if overflow.is_set() or len(buffers["stdout"]) > MAX_SCANNER_STDOUT:
-            raise ScannerFailure("scanner_output_overflow")
-        if stdout_reader.is_alive() or stderr_reader.is_alive():
-            raise ScannerFailure("scanner_pipe_stalled")
-        if process.returncode != 0:
-            child_error = self._parse_child_error(bytes(buffers["stdout"]))
-            raise ScannerFailure(child_error or "scanner_process_failed")
-        return self._parse_success(bytes(buffers["stdout"]), target, scope)
+                stdout_reader.join(timeout=2)
+                stderr_reader.join(timeout=2)
+            else:
+                _close_pipes(process)
+            if timed_out:
+                raise ScannerFailure("scanner_timeout")
+            if stopped:
+                raise ScannerFailure("worker_shutdown")
+            if pump.fatal:
+                raise ScannerFailure(pump.fatal)
+            if overflow.is_set() or len(buffers["stdout"]) > MAX_SCANNER_STDOUT:
+                raise ScannerFailure("scanner_output_overflow")
+            if stdout_reader.is_alive() or stderr_reader.is_alive():
+                raise ScannerFailure("scanner_pipe_stalled")
+            if process.returncode != 0:
+                child_error = self._parse_child_error(bytes(buffers["stdout"]))
+                raise ScannerFailure(child_error or "scanner_process_failed")
+            return self._parse_success(bytes(buffers["stdout"]), target, scope)
+        finally:
+            # Let an in-flight liveness probe finish before the socket and the API client are reused.
+            pump.wait_probe(5.0)
+            parent_sock.close()
 
     @staticmethod
     def _kill_process(process):

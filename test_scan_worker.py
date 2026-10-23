@@ -114,13 +114,23 @@ class _FakeAPI:
         return self.result_response
 
 
+class _UnusedGate:
+    """The isolation fixtures never contact a target, so their gate is never consulted."""
+
+    def admit(self):
+        raise AssertionError("fixture scanner unexpectedly asked for admission")
+
+    def probe(self):
+        return None
+
+
 class _FakeRunner:
     def __init__(self, result=None):
         self.result = result or _result()
         self.calls = []
 
-    def run(self, target, *, timeout, stop_event=None):
-        self.calls.append((target, timeout, stop_event))
+    def run(self, target, *, timeout, stop_event=None, gate=None):
+        self.calls.append((target, timeout, stop_event, gate))
         result = dict(self.result)
         result["input_url"] = target
         result["final_url"] = target
@@ -581,7 +591,7 @@ class WorkerSubprocessIsolationTests(unittest.TestCase):
         self.secret.write_bytes(b"supervisor-secret-material")
         self.secret.chmod(0o600)
         result_literal = repr(json.dumps(_result(), separators=(",", ":")))
-        script = f'''import json, os, sys, time
+        script = f'''import json, os, socket, sys, time
 from urllib.parse import urlsplit
 def safe_excepthook(kind, _value, _traceback):
     sys.stdout.write(json.dumps({{"ok":False,"error":"fixture_" + kind.__name__.lower()}}) + "\\n")
@@ -619,6 +629,14 @@ if host == "security.example.test":
     except BaseException as exc:
         sys.stdout.write(json.dumps({{"ok":False,"error":"fixture_" + type(exc).__name__.lower()}}) + "\\n")
         raise SystemExit(2)
+if host == "admit.example.test":
+    channel = socket.socket(fileno=int(os.environ["CT_ADMISSION_FD"]))
+    channel.sendall(b'{{"op":"admit","kind":"http","n":1}}\\n')
+    reply = b""
+    while not reply.endswith(b"\\n"):
+        reply += channel.recv(64)
+    channel.sendall(b'{{"op":"done","n":1}}\\n')
+    result["notes"] = ["child_uid=" + str(os.geteuid()), "admission_ok=" + str(json.loads(reply)["ok"]).lower()]
 sys.stdout.write(json.dumps({{"ok":True,"result":result}}, separators=(",", ":")) + "\\n")
 '''
         scanner = worker / "scanner.py"
@@ -630,27 +648,45 @@ sys.stdout.write(json.dumps({{"ok":True,"result":result}}, separators=(",", ":")
 
     def test_child_is_unprivileged_has_no_secret_env_or_key_access(self):
         with mock.patch.dict(os.environ, {"CT_SCAN_SECRET_FILE": str(self.secret)}):
-            result = self.runner.run("https://security.example.test/", timeout=5)
+            result = self.runner.run("https://security.example.test/", timeout=5, gate=_UnusedGate())
         self.assertIn("child_uid=65534", result["notes"])
         self.assertIn("secret_env_present=false", result["notes"])
         self.assertIn("secret_file=denied", result["notes"])
 
+    def test_unprivileged_child_can_ask_the_supervisor_for_admission_over_the_inherited_socket(self):
+        from integrations.worker.admission import Grant
+
+        class Gate:
+            admits = 0
+
+            def admit(self):
+                Gate.admits += 1
+                return Grant(1, 1.0, 10.0, 19)
+
+            def probe(self):
+                return None
+
+        result = self.runner.run("https://admit.example.test/", timeout=5, gate=Gate())
+        self.assertIn("child_uid=65534", result["notes"])
+        self.assertIn("admission_ok=true", result["notes"])
+        self.assertEqual(Gate.admits, 1)
+
     def test_parent_kills_child_at_deadline_and_caps_stdout(self):
         started = time.monotonic()
         with self.assertRaises(ScannerFailure) as timeout:
-            self.runner.run("https://timeout.example.test/", timeout=0.35)
+            self.runner.run("https://timeout.example.test/", timeout=0.35, gate=_UnusedGate())
         self.assertEqual(timeout.exception.slug, "scanner_timeout")
         self.assertLess(time.monotonic() - started, 2.0)
         with self.assertRaises(ScannerFailure) as overflow:
-            self.runner.run("https://oversize.example.test/", timeout=5)
+            self.runner.run("https://oversize.example.test/", timeout=5, gate=_UnusedGate())
         self.assertEqual(overflow.exception.slug, "scanner_output_overflow")
 
     def test_child_failure_and_partial_output_are_not_interpreted_as_results(self):
         with self.assertRaises(ScannerFailure) as failure:
-            self.runner.run("https://failure.example.test/", timeout=5)
+            self.runner.run("https://failure.example.test/", timeout=5, gate=_UnusedGate())
         self.assertEqual(failure.exception.slug, "fixture_failure")
         with self.assertRaises(ScannerFailure) as partial:
-            self.runner.run("https://partial.example.test/", timeout=5)
+            self.runner.run("https://partial.example.test/", timeout=5, gate=_UnusedGate())
         self.assertEqual(partial.exception.slug, "scanner_invalid_output")
 
 

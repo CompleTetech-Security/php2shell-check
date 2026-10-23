@@ -3,95 +3,7 @@
  * Disposable WordPress + MariaDB integration checks for the MU plugin.
  * Run only with the repository's `fixture-only` Docker Compose environment.
  */
-if ( PHP_SAPI !== 'cli' || getenv( 'WORDPRESS_DB_PASSWORD' ) !== 'fixture-only' || getenv( 'WORDPRESS_DB_HOST' ) !== 'db' ) {
-	throw new RuntimeException( 'Refusing to run outside the disposable WordPress fixture.' );
-}
-
-$private_config = tempnam( '/tmp', 'ct-scan-integration-' );
-file_put_contents( $private_config, '<?php return ' . var_export( array(
-	'enabled'                   => true,
-	'supported_terms_version'   => '2026-10-21-r2',
-	'expected_checker_revision' => str_repeat( 'a', 40 ),
-	'expected_rules_as_of'      => '2026-10-21',
-	'worker_hmac_secret'        => str_repeat( 'fixture-key-', 4 ),
-	'authorization_end_at'      => gmdate( 'Y-m-d\TH:i:s\Z', time() + 30 * 86400 ),
-	'confirmation_ttl_hours'    => 24,
-	'global_daily_limit'        => 1000,
-	'target_daily_limit'        => 100,
-), true ) . ';' );
-define( 'CT_SCAN_PRIVATE_CONFIG', $private_config );
-register_shutdown_function( static function () use ( $private_config ) { @unlink( $private_config ); } );
-
-$_SERVER['HTTP_HOST'] = 'wordpress';
-require '/var/www/html/wp-load.php';
-ct_scan_maybe_install_schema();
-
-function ct_test_assert( $condition, $message ) {
-	if ( ! $condition ) {
-		throw new RuntimeException( $message );
-	}
-}
-
-function ct_test_request( $host, $email = 'fixture@example.com' ) {
-	$target = 'https://' . $host . '/';
-	$contract = "Client contact: Fixture Reviewer\nClient email: {$email}\nWebsite (scan scope): {$target}\nReferred by: direct\nTerms version: 2026-10-21-r2\nAccepted test fixture terms.";
-	$id = wp_insert_post( array(
-		'post_type'    => 'ct_promo_request',
-		'post_status'  => 'private',
-		'post_title'   => 'Integration fixture request',
-		'post_content' => "TERMS AS ACCEPTED\n\n" . $contract,
-	), true );
-	if ( is_wp_error( $id ) ) {
-		throw new RuntimeException( $id->get_error_message() );
-	}
-	$meta = array(
-		'_ct_scan_target'            => $target,
-		'_ct_scan_email'             => $email,
-		'_ct_scan_name'              => 'Fixture Reviewer',
-		'_ct_ref'                    => 'direct',
-		'_ct_terms_saved'            => '1',
-		'_ct_terms_version'          => '2026-10-21-r2',
-		'_ct_terms_url'              => 'https://complete.tech/php2shell-scan-terms/',
-		'_ct_terms_sha256'           => hash( 'sha256', 'Accepted test fixture terms.' ),
-		'_ct_terms_accepted_at'      => gmdate( 'Y-m-d\TH:i:s\Z', time() - 30 ),
-		'_ct_terms_contract'         => $contract,
-	);
-	foreach ( $meta as $key => $value ) {
-		update_post_meta( $id, $key, $value );
-	}
-	return array( (int) $id, array( 'target' => $target, 'email' => $email, 'name' => 'Fixture Reviewer', 'referrer' => 'direct' ) );
-}
-
-function ct_test_rest_call( $callback, $route, $payload, $nonce = null, $timestamp = null ) {
-	$body = wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
-	$timestamp = null === $timestamp ? (string) time() : (string) $timestamp;
-	$nonce = null === $nonce ? bin2hex( random_bytes( 16 ) ) : $nonce;
-	$signing = $timestamp . "\n" . strtolower( $nonce ) . "\nPOST\n" . $route . "\n" . hash( 'sha256', $body );
-	$request = new WP_REST_Request( 'POST', $route );
-	$request->set_body( $body );
-	$request->set_header( 'X-CT-Timestamp', $timestamp );
-	$request->set_header( 'X-CT-Nonce', $nonce );
-	$request->set_header( 'X-CT-Signature', hash_hmac( 'sha256', $signing, ct_scan_config()['worker_hmac_secret'] ) );
-	return call_user_func( $callback, $request );
-}
-
-function ct_test_result( $target ) {
-	return array(
-		'input_url' => $target, 'final_url' => $target, 'status' => 'wordpress', 'fetch_status' => 'ok', 'http_status' => 200,
-		'wordpress_version' => '6.8', 'php_version' => '8.2.1', 'server' => 'fixture', 'powered_by' => 'PHP/8.2.1', 'title' => 'Fixture',
-		'evidence' => array( 'generator present' ), 'asset_version_hints' => array(), 'notes' => array(), 'checked_at' => gmdate( 'Y-m-d\TH:i:s\Z' ),
-		'php_version_candidates' => array( '8.2.1' ), 'php_evidence' => array( 'X-Powered-By: PHP/8.2.1 <script>alert(1)</script>' ),
-		'php2shell_status' => 'potentially_affected', 'php2shell_version_status' => 'below_upstream_fix', 'php2shell_fixed_version' => '8.2.31',
-		'php2shell_exploitability' => 'not_tested', 'php2shell_cves' => array( 'CVE-2026-109618', 'CVE-2026-109619' ),
-		'php2shell_rules_as_of' => '2026-10-21', 'php2shell_sources' => array( 'https://www.php.net/' ), 'php2shell_notes' => array( 'Public evidence only.' ),
-		'php2shell_recommendation' => 'Verify the deployed package and vendor backports.',
-	);
-}
-
-function ct_test_queue_job( $job_id ) {
-	global $wpdb;
-	$wpdb->update( ct_scan_jobs_table(), array( 'status' => 'queued', 'confirmation_token_hash' => null, 'confirmation_expires_at' => null, 'confirmed_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $job_id ) );
-}
+require __DIR__ . '/support.php';
 
 // Canonical scope normalization and control-character rejection.
 ct_test_assert( 'https://example.com/' === ct_scan_normalize_target( 'https://EXAMPLE.com/' ), 'Canonical origin must have lowercase host and trailing slash.' );
@@ -101,14 +13,7 @@ foreach ( array( "https://example.com/\n", 'https://example.com/path', 'https://
 
 global $wpdb;
 $jobs = ct_scan_jobs_table();
-$old_fixture_ids = $wpdb->get_col( $wpdb->prepare( "SELECT request_id FROM {$jobs} WHERE contact_name = %s", 'Fixture Reviewer' ) );
-foreach ( (array) $old_fixture_ids as $old_id ) {
-	$old_post = get_post( (int) $old_id );
-	if ( $old_post && 'ct_promo_request' === $old_post->post_type && 'private' === $old_post->post_status && 'Integration fixture request' === $old_post->post_title ) {
-		$wpdb->delete( $jobs, array( 'request_id' => (int) $old_id ), array( '%d' ) );
-		wp_delete_post( (int) $old_id, true );
-	}
-}
+ct_test_purge_fixtures();
 $request_ids = array();
 $mail_calls = array();
 $mail_mode = true;
@@ -177,6 +82,10 @@ $run = array(
 	'id' => $claimed['id'], 'lease' => $claimed['lease'], 'scope_hash' => $claimed['scope_hash'], 'outcome' => 'completed',
 	'result' => ct_test_result( $fields['target'] ), 'error' => '', 'checker_revision' => str_repeat( 'a', 40 ),
 );
+// A completed result is not credible unless the guard admitted at least one request for the job.
+$unadmitted = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', $run );
+ct_test_assert( 409 === $unadmitted->get_status() && 'no_admission' === $unadmitted->get_data()['error'] && 'running' === ct_scan_row( $claimed['id'] )->status, 'A completed result was accepted for a job that never had a request admitted.' );
+ct_test_assert( 200 === ct_test_rest_call( 'ct_scan_admit', '/ct-scan/v1/admit', array( 'id' => $claimed['id'], 'lease' => $claimed['lease'], 'scope_hash' => $claimed['scope_hash'], 'kind' => 'http' ) )->get_status(), 'Fixture admission was refused.' );
 $result = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', $run );
 ct_test_assert( 200 === $result->get_status() && true === $result->get_data()['ok'], 'Valid checker receipt was not acknowledged.' );
 $retry = ct_test_rest_call( 'ct_scan_result', '/ct-scan/v1/result', $run );
