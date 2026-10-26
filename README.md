@@ -83,6 +83,14 @@ via repeatable `--authorized-origin https://approved.example:8443`. Page and
 robots redirects outside that scope stop before any destination request and
 report `fetch_status=out_of_scope`; robots permission is not authorization.
 
+The CLI also enforces `--target-timeout 120`: a monotonic budget per target shared
+by robots, redirects, pacing and HTTP acquisition. `--timeout 15` remains the
+additional socket inactivity limit. DNS, connection, TLS, response headers and
+slow-trickling bodies run in one disposable request process at a time; on deadline
+exhaustion it is killed and reaped before the next target. A failed target records
+`fetch_status=deadline_exceeded` and an unknown assessment, rather than a negative
+finding. Process startup and cancellation have small OS scheduling overhead.
+
 ## Agent skill
 
 The [php2shell-check skill](skills/php2shell-check/SKILL.md) guides an agent

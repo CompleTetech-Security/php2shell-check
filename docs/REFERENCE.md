@@ -137,6 +137,7 @@ are rejected. Input is a text list, **not a CSV or an Excel workbook**.
 | `--brand NAME` | `CompleteTech LLC` | Organization name shown on the HTML report. |
 | `--delay SECONDS` | `1` | Positive minimum time between requests to an origin. Robots rules may increase it. |
 | `--timeout SECONDS` | `15` | Positive per-socket timeout, not a total deadline for a website. |
+| `--target-timeout SECONDS` | `120` | Positive monotonic budget shared by all work for each target. |
 | `--authorized-origin ORIGIN` | None | Additional authorized redirect origin; repeat for each approved scheme/host/port. No paths, queries or fragments. |
 | `--contact VALUE` | Empty | Public contact URL/email included in the User-Agent. |
 | `--help` | — | Show command help. |
@@ -167,6 +168,7 @@ embedded assets, or stale/spoofed metadata can resemble WordPress.
 
 - `ok`: the final page returned HTTP 2xx, even if its content was inconclusive.
 - `timeout`: a recognized socket timeout occurred.
+- `deadline_exceeded`: the target's total budget was exhausted; assessment remains unknown and the next input can proceed.
 - `dns_error`: a recognized DNS-resolution error occurred.
 - `out_of_scope`: a page or robots redirect was stopped before requesting an unauthorized origin; assessment remains unknown.
 - `blocked`: other cases preventing a successful fetch, including robots rules,
@@ -271,11 +273,35 @@ upload destination; avoid committing real target lists or scan results.
 
 ## Python use
 
+### Total target deadline
+
+The CLI defaults to `--target-timeout 120`. One monotonic budget covers robots,
+redirects, required pacing, DNS, connection/TLS, response headers/body and local
+assessment. The socket inactivity timeout is an additional bound, never a substitute
+for the total budget. Each HTTP acquisition uses one disposable child process;
+the parent keeps robots caches and request spacing. Expired acquisition is killed
+and reaped before continuing. Windows, macOS and Linux use the same process boundary,
+including for resolver calls that Python cannot cancel in a thread. No child is
+left running intentionally. Process creation/OS scheduling and cancellation have
+small overhead; reaping allows at most two further seconds, then aborts the batch
+rather than launching another request if the OS cannot reap the worker.
+
+Deadline exhaustion produces an error row with `fetch_status=deadline_exceeded`
+and `php2shell_status=unknown`. Other targets get fresh budgets. A completed batch
+can therefore contain incomplete assessments. There are no retries or authorization
+exceptions. Required pacing that cannot fit in the remaining budget fails immediately.
+
+Python callers opt into this same boundary with `Checker(target_timeout=120, ...)`.
+The low-level `Checker` default remains `target_timeout=None` for integrations with
+their own process supervisors; a direct unbounded `request()` is not a total-work
+guarantee. Custom in-process opener changes are not transferred to bounded child
+requests. The CLI's `--recover` stays offline and launches no HTTP worker.
+
 ```python
 from dataclasses import asdict
 from wordpress_check import Checker
 
-checker = Checker(timeout=15, delay=1, contact="https://your-domain.example/contact")
+checker = Checker(timeout=15, target_timeout=120, delay=1, contact="https://your-domain.example/contact")
 result = checker.check("https://example.com/")
 print(asdict(result))
 ```
