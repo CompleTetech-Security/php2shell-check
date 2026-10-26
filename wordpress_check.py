@@ -9,6 +9,7 @@ import argparse
 import base64
 import csv
 import html
+import hashlib
 import io
 import os
 import stat
@@ -31,6 +32,8 @@ from urllib.parse import parse_qs, quote, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
+TOOL_NAME = "php2shell-check"
+TOOL_VERSION = "1.0.0"
 BOT = "WordPressPublicChecker"
 REDIRECTS = {301, 302, 303, 307, 308}
 MAX_BODY = 2 * 1024 * 1024
@@ -673,7 +676,7 @@ def logo_data_uri(path) -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def render_html(rows, *, logo=DEFAULT_LOGO, brand="CompleteTech LLC", generated_at=None) -> str:
+def render_html(rows, *, logo=DEFAULT_LOGO, brand="CompleteTech LLC", generated_at=None, rules_as_of=PHP2SHELL_RULES_DATE) -> str:
     """Render result dictionaries as a self-contained, script-free HTML report."""
     def esc(value):
         return html.escape("" if value is None else str(value))
@@ -694,7 +697,7 @@ def render_html(rows, *, logo=DEFAULT_LOGO, brand="CompleteTech LLC", generated_
         notes = row.get("php2shell_notes") or []
         body.append(
             "<tr>"
-            f"<td class=site>{esc(row.get('final_url') or row.get('input_url'))}</td>"
+            f"<td class=site>{esc(row.get('final_url') or row.get('input_url'))}<br>Observed: {esc(row.get('checked_at') or 'unknown')}</td>"
             f"<td><span class='pill {esc(status)}'>{esc(STATUS_LABELS.get(status, status))}</span></td>"
             f"<td><code>{esc(row.get('php_version') or '—')}</code></td>"
             f"<td><code>{esc(row.get('php2shell_fixed_version') or '—')}</code></td>"
@@ -715,7 +718,7 @@ def render_html(rows, *, logo=DEFAULT_LOGO, brand="CompleteTech LLC", generated_
 <title>PHP2Shell Exposure Report</title><style>{REPORT_CSS}</style></head>
 <body><main>
 <header>{logo_html}<div><div class="eyebrow">{esc(brand)}</div><h1>PHP2Shell Exposure Report</h1>
-<p class="sub">{' &amp; '.join(PHP2SHELL_CVES)} · generated {esc(generated_at)} · rules as of {PHP2SHELL_RULES_DATE}</p></div></header>
+<p class="sub">{' &amp; '.join(PHP2SHELL_CVES)} · generated {esc(generated_at)} · rules as of {esc(rules_as_of)}</p></div></header>
 <div class="tiles">{tile_html}</div>
 <h2>Results</h2>
 <div class="wrap"><table><thead><tr><th>Website</th><th>PHP2Shell</th><th>PHP reported</th><th>Upstream fix</th><th>Detection</th><th>HTTP</th><th>Notes</th></tr></thead>
@@ -760,8 +763,52 @@ def publish_report(path, text, *, replace=False):
         temporary.unlink(missing_ok=True)
 
 
-def run_report(rows, total, *, complete=False):
-    return {"journal_schema": "php2shell-run-v1", "complete": complete,
+def report_provenance():
+    # Resolve the executing file only; evidence/checkpoint symlink policy is unchanged.
+    source = Path(__file__).resolve(strict=True)
+    descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("Checker identity requires a regular executable file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(16 * 1024 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) > 16 * 1024 * 1024:
+        raise ValueError("Checker executable exceeds identity size limit")
+    rules = {"as_of": PHP2SHELL_RULES_DATE, "cves": PHP2SHELL_CVES,
+             "fixes": sorted((list(key), value) for key, value in PHP2SHELL_FIXES.items()),
+             "sources": PHP2SHELL_SOURCES}
+    return {"tool": TOOL_NAME, "tool_version": TOOL_VERSION,
+            "executable_sha256": hashlib.sha256(data).hexdigest(),
+            "rules_sha256": hashlib.sha256(json.dumps(rules, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "rules_as_of": PHP2SHELL_RULES_DATE,
+            "generated_at": datetime.now(timezone.utc).isoformat()}
+
+
+def validate_provenance(value):
+    if not isinstance(value, dict) or set(value) != {"tool", "tool_version", "executable_sha256", "rules_sha256", "rules_as_of", "generated_at"}:
+        raise ValueError("Invalid checkpoint provenance fields")
+    if value["tool"] != TOOL_NAME or not isinstance(value["tool_version"], str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value["tool_version"]):
+        raise ValueError("Invalid checkpoint tool identity")
+    for key in ("executable_sha256", "rules_sha256"):
+        if not isinstance(value[key], str) or not re.fullmatch(r"[0-9a-f]{64}", value[key]):
+            raise ValueError("Invalid checkpoint digest")
+    for key in ("rules_as_of", "generated_at"):
+        if not isinstance(value[key], str):
+            raise ValueError("Invalid checkpoint provenance date")
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value["rules_as_of"]):
+        raise ValueError("Invalid checkpoint rules date")
+    try:
+        stamp = datetime.fromisoformat(value["generated_at"])
+    except ValueError as exc:
+        raise ValueError("Invalid checkpoint generation time") from exc
+    if stamp.utcoffset() is None or stamp.utcoffset().total_seconds() != 0:
+        raise ValueError("Checkpoint generation time must be UTC")
+
+
+def run_report(rows, total, *, complete=False, provenance=None):
+    return {"journal_schema": "php2shell-run-v1", "provenance": report_provenance() if provenance is None else provenance, "complete": complete,
             "completed_targets": len(rows), "pending_targets": total - len(rows),
             "total_targets": total, "results": list(rows)}
 
@@ -781,8 +828,10 @@ def load_checkpoint(path):
     if len(raw) > MAX_CHECKPOINT_BYTES:
         raise ValueError("Checkpoint exceeds 64 MiB recovery limit")
     report = json.loads(raw)
-    if not isinstance(report, dict) or set(report) != {"journal_schema", "complete", "completed_targets", "pending_targets", "total_targets", "results"}:
+    if not isinstance(report, dict) or set(report) not in ({"journal_schema", "complete", "completed_targets", "pending_targets", "total_targets", "results"}, {"journal_schema", "provenance", "complete", "completed_targets", "pending_targets", "total_targets", "results"}):
         raise ValueError("Invalid checkpoint fields")
+    if "provenance" in report:
+        validate_provenance(report["provenance"])
     rows = report["results"]
     if (report["journal_schema"] != "php2shell-run-v1" or type(report["complete"]) is not bool
             or not isinstance(rows, list) or len(rows) > MAX_CHECKPOINT_ROWS
@@ -812,21 +861,26 @@ def load_checkpoint(path):
 
 def format_report(report, args):
     metadata = {key: report[key] for key in ("complete", "completed_targets", "pending_targets", "total_targets")}
+    provenance = report.get("provenance")
+    # Legacy journals have no acquisition identity; never attribute them to this executable.
+    identity = provenance or {"tool": "unknown", "tool_version": "unknown", "executable_sha256": "unknown",
+                              "rules_sha256": "unknown", "rules_as_of": "unknown", "generated_at": "unknown"}
     if args.format == "json":
-        return json.dumps({**metadata, "results": report["results"]}, ensure_ascii=False, indent=2) + "\n"
+        return json.dumps({**metadata, "provenance": provenance, "results": report["results"]}, ensure_ascii=False, indent=2) + "\n"
     if args.format == "html":
-        rendered = render_html(report["results"], logo=args.logo, brand=args.brand)
+        rendered = render_html(report["results"], logo=args.logo, brand=args.brand, generated_at=identity["generated_at"], rules_as_of=identity["rules_as_of"])
         state = "complete" if report["complete"] else "incomplete / recovered"
         banner = f"<p class=callout>Run {state}: {report['completed_targets']} completed; {report['pending_targets']} pending; {report['total_targets']} total targets.</p>"
-        return rendered.replace('<h2>Results</h2>', banner + '<h2>Results</h2>', 1)
+        details = "<p class=callout>Acquisition provenance: " + "; ".join(html.escape(key + "=" + str(value)) for key, value in identity.items()) + "</p>"
+        return rendered.replace('<h2>Results</h2>', banner + details + '<h2>Results</h2>', 1)
     stream = io.StringIO(newline="")
-    fields = list(Result.__dataclass_fields__) + ["record_type", *metadata]
+    fields = list(Result.__dataclass_fields__) + ["record_type", *metadata, *identity]
     writer = csv.DictWriter(stream, fieldnames=fields)
     writer.writeheader()
     for row in report["results"]:
-        writer.writerow({key: csv_safe(value) for key, value in {**row, "record_type": "result", **metadata}.items()})
+        writer.writerow({key: csv_safe(value) for key, value in {**row, "record_type": "result", **metadata, **identity}.items()})
     if not report["results"]:
-        writer.writerow({"record_type": "summary", **metadata})
+        writer.writerow({key: csv_safe(value) for key, value in {"record_type": "summary", **metadata, **identity}.items()})
     return stream.getvalue()
 
 
@@ -883,7 +937,7 @@ def main(argv=None) -> int:
             try:
                 for index, url in enumerate(urls):
                     result = checker.check(url)
-                    report = run_report([*report["results"], asdict(result)], len(urls))
+                    report = run_report([*report["results"], asdict(result)], len(urls), provenance=report["provenance"])
                     if checkpoint:
                         publish_report(checkpoint, checkpoint_json(report), replace=True)
                     print(f"[{index + 1}/{len(urls)}] {url}: {result.status}", file=sys.stderr)

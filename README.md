@@ -144,3 +144,10 @@ Dual licensed. It's free under [AGPL-3.0](LICENSE) for research, education, and 
   <a href="https://complete.tech"><img src="assets/logo.png" alt="CompleteTech LLC" width="160"></a><br>
   <sub>Built by <a href="https://complete.tech">CompleteTech LLC</a> · Innovation at Every Integration</sub>
 </p>
+
+
+### Standalone report provenance
+
+New runs include a `provenance` object in JSON and durable checkpoints with `tool`, `tool_version`, `executable_sha256`, `rules_sha256`, `rules_as_of`, and UTC `generated_at`. CSV appends the same fields to every result or empty summary, after existing completeness columns; HTML displays them separately from per-result observation time. The executable digest identifies the exact standalone file bytes (including when launched through a symlink); the rules digest identifies the embedded fix table, CVEs, date and sources, without claiming deployment attestation.
+
+Recovery preserves the original acquisition identity and generation time, even using a changed checker. Older checkpoints remain readable but JSON has `provenance: null` and CSV/HTML label unavailable identity as `unknown`; recovery never attributes old evidence to its current executable. Per-row `checked_at`, rules verification date and run generation time retain distinct meanings. Existing complete/incomplete counts and `exploitability=not_tested` semantics remain unchanged.
