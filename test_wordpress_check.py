@@ -284,7 +284,7 @@ class LocalHTTPTests(unittest.TestCase):
                 with redirect_stderr(io.StringIO()):
                     self.assertEqual(main(["--input", str(source), "--format", fmt, "--output", str(output), "--delay", "0.001"]), 0)
                 content = output.read_text(encoding="utf-8")
-                rows = json.loads(content) if fmt == "json" else list(csv.DictReader(io.StringIO(content)))
+                rows = json.loads(content)["results"] if fmt == "json" else list(csv.DictReader(io.StringIO(content)))
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["status"], "wordpress")
 
