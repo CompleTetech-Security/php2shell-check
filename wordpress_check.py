@@ -33,7 +33,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 TOOL_NAME = "php2shell-check"
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.0.1"
 BOT = "WordPressPublicChecker"
 REDIRECTS = {301, 302, 303, 307, 308}
 MAX_BODY = 2 * 1024 * 1024
