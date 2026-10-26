@@ -153,3 +153,12 @@ python -c "import json; from wordpress_check import assess_php2shell; print(json
 Label this as offline version interpretation, not a live observation. For
 conflicting supplied values, pass all values through `version_candidates`
 instead of selecting one; do not invent a version when none was disclosed.
+
+
+### Standalone report provenance
+
+New runs include a `provenance` object in JSON and durable checkpoints with `tool`, `tool_version`, `executable_sha256`, `rules_sha256`, `rules_as_of`, and UTC `generated_at`. CSV appends the same fields to every result or empty summary, after existing completeness columns; HTML displays them separately from per-result observation time. The executable digest identifies the exact standalone file bytes (including when launched through a symlink); the rules digest identifies the embedded fix table, CVEs, date and sources, without claiming deployment attestation.
+
+Recovery preserves the original acquisition identity and generation time, even using a changed checker. Older checkpoints remain readable but JSON has `provenance: null` and CSV/HTML label unavailable identity as `unknown`; recovery never attributes old evidence to its current executable. Per-row `checked_at`, rules verification date and run generation time retain distinct meanings. Existing complete/incomplete counts and `exploitability=not_tested` semantics remain unchanged.
+
+When rendering an older checkpoint, HTML explicitly labels the rendering checker's fix table and source links as **current reference guidance** with their own rule date. They do not reclassify the preserved results or replace the acquisition rule date/digest.
