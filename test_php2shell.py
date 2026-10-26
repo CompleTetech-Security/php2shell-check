@@ -152,7 +152,7 @@ class HeaderAndWorkflowTests(unittest.TestCase):
             output = io.StringIO()
             with patch.object(Checker, 'request', side_effect=replies), redirect_stdout(output), redirect_stderr(io.StringIO()):
                 self.assertEqual(main(['https://example.test/', '--format', fmt]), 0)
-            rows = json.loads(output.getvalue()) if fmt == 'json' else list(csv.DictReader(io.StringIO(output.getvalue())))
+            rows = json.loads(output.getvalue())['results'] if fmt == 'json' else list(csv.DictReader(io.StringIO(output.getvalue())))
             self.assertEqual(rows[0]['php2shell_status'], 'potentially_affected')
             self.assertEqual(rows[0]['php2shell_exploitability'], 'not_tested')
 

@@ -129,7 +129,9 @@ are rejected. Input is a text list, **not a CSV or an Excel workbook**.
 | --- | --- | --- |
 | `urls` | None | Zero or more HTTP(S) URLs or bare domains. |
 | `--input PATH` | None | UTF-8 text file containing one website per line. |
-| `--output PATH` | stdout | Write results to this file. An existing output file is overwritten. |
+| `--output PATH` | stdout | Atomically publish the final report; refuse an existing path by default. Keep a durable `PATH.partial.json` checkpoint. |
+| `--force` | off | Explicitly replace an existing final output after successful rendering; never replace an existing checkpoint. |
+| `--recover PATH` | none | Render a persisted checkpoint without targets, requests, or automatic retries. |
 | `--format csv\|json\|html` | `csv` | Output format. `html` writes a self-contained, branded report. |
 | `--logo PATH` | `assets/logo.png` | Logo inlined into the HTML report. A missing file is omitted. |
 | `--brand NAME` | `CompleteTech LLC` | Organization name shown on the HTML report. |
@@ -202,6 +204,8 @@ the coarse `blocked` value as proof that the owner deliberately blocked you.
 | `php2shell_sources` | Official PHP advisories and the vendor-backport reference. |
 | `php2shell_notes` | Evidence limits and the reason for this interpretation. |
 | `php2shell_recommendation` | Administrator review or patch-verification guidance. |
+
+CLI JSON is now a run envelope: `complete`, `completed_targets`, `pending_targets`, `total_targets`, and `results`. Consumers of the previous top-level array must read `results`. The result dictionaries and their evidence arrays are unchanged. CSV appends `record_type` and these four run fields to the existing result columns; an empty report has a summary row. HTML labels run completeness and counts separately from assessment status.
 
 JSON preserves arrays in the evidence, version-candidate, CVE, source, and note fields. CSV joins array values
 with ` | ` and prefixes potentially dangerous spreadsheet-formula strings with
@@ -286,14 +290,22 @@ Do not use `request()` directly to bypass the policy checks in `check()`.
 
 ## File handling and exit codes
 
-Results are flushed after each website. CSV retains completed rows after an
-interruption; JSON can be left without its closing bracket. HTML is written when the run ends, including after an interruption. There is no automatic
-resume or retry. Preserve any partial result file before rerunning with the same
-`--output` path, because the CLI opens it for replacement.
+With `--output report.html`, the CLI first creates `report.html.partial.json` exclusively. Each completed result is committed to a private temporary file, flushed and fsynced, and atomically replaces that checkpoint before progress is printed. Checkpoints contain completed result dictionaries and explicit conservative incomplete/completed/pending counts, not pending target URLs. They contain assessment evidence and must be protected like the report. Never commit real checkpoints.
 
-Exit code `0` means the run completed, not that every website was reachable or
-identified. Inspect each result's status. Argument/input-file errors exit with
-code `2`. Unexpected I/O errors may raise a Python exception.
+The final JSON, CSV or HTML is rendered completely and fsynced before publication in the destination directory. Default publication uses an atomic hard link and fails closed if hard links are unavailable or another writer creates the destination first. `--force` explicitly allows atomic replacement of the final file; failures before publication preserve its prior contents. Existing checkpoint names are always refused, even with `--force`; choose a fresh output name. Directories and symbolic-link output paths are refused.
+
+A handled Ctrl-C returns `130`, retains the incomplete checkpoint, and does not publish a final file or replace a previous report. A forced process termination cannot execute cleanup, but previously checkpointed results remain reconstructable. Recovery performs no requests and never reruns completed targets:
+
+```sh
+python wordpress_check.py --recover report.html.partial.json --format html --output recovered.html
+python wordpress_check.py --recover report.html.partial.json --format json --output recovered.json
+```
+
+Recovery returns `130` for an incomplete checkpoint, even if all targets were checkpointed before final publication. The conservative checkpoint is intentionally retained after success and is not final-output attestation. Keep the final report as the completion receipt. Recovery requires a regular non-symlink checkpoint, validates its structure/counts/result types and reads at most 64 MiB (100,000 result rows). Keep both the original checkpoint and any reconstructed artifact; continuation requires a separately authorized new run of pending targets only. The tool never resumes automatically.
+
+Without `--output`, results accumulate in memory and stdout receives one well-formed report on completion or a handled interrupt. Stdout/pipes do not provide durable recovery after forced termination; use `--output` when preserving evidence matters. Final output/partial names and report/input paths must differ.
+
+Exit code `0` means the run completed, not that every website was reachable or patched. `130` means interruption or incomplete recovery; `2` means argument/input/recovery/publication error. Inspect operational and assessment status separately. Disk exhaustion or abrupt termination during a new checkpoint leaves the previous atomic checkpoint intact; the in-progress result may not have been committed. No file mechanism guarantees recovery from storage hardware failure.
 
 ## Tests and contributing
 

@@ -46,6 +46,10 @@ Python 3.10+ on Windows, macOS, or Linux. Nothing to install.
 
 Use `--logo path/to/logo.png` and `--brand "Your Company"` to brand it for your own organization. CSV and JSON remain available for spreadsheets and pipelines.
 
+File outputs refuse reuse by default; `--force` explicitly permits atomic final replacement. Every completed row is fsynced into `OUTPUT.partial.json` before progress, so an interrupted or force-killed run can be rendered offline with `python wordpress_check.py --recover OUTPUT.partial.json --format html --output recovered.html`. Recovery never requests targets and labels incomplete evidence (`130`). Existing checkpoints are always protected, including with `--force`; choose fresh paths and protect both artifacts. Successful final files are atomically published. Stdout cannot recover after forced termination.
+
+CLI JSON now has a run envelope with `complete`, completed/pending/total target counts and `results` (previously a top-level array); CSV appends corresponding run metadata and an empty summary, and HTML labels completeness. See [recovery and file handling](docs/REFERENCE.md#file-handling-and-exit-codes) for naming, limits and conservative retained checkpoints.
+
 ## What the results mean
 
 | Status | Meaning |

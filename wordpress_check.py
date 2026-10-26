@@ -9,6 +9,10 @@ import argparse
 import base64
 import csv
 import html
+import io
+import os
+import stat
+import tempfile
 import json
 import math
 import mimetypes
@@ -629,11 +633,96 @@ version number, and hidden versions are reported as unknown, not safe. Administr
 """
 
 
+
+def publish_report(path, text, *, replace=False):
+    """Publish one fully fsynced artifact; no-clobber is enforced at publication."""
+    descriptor, temporary = tempfile.mkstemp(prefix=".php2shell-", dir=path.parent)
+    temporary = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if replace:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)  # Fail closed when atomic no-clobber is unavailable.
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def run_report(rows, total, *, complete=False):
+    return {"journal_schema": "php2shell-run-v1", "complete": complete,
+            "completed_targets": len(rows), "pending_targets": total - len(rows),
+            "total_targets": total, "results": list(rows)}
+
+
+def load_checkpoint(path):
+    if path.is_symlink():
+        raise ValueError("Recovery refuses symbolic-link checkpoints")
+    with path.open("rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("Recovery requires a regular checkpoint file")
+        raw = stream.read(64 * 1024 * 1024 + 1)
+    if len(raw) > 64 * 1024 * 1024:
+        raise ValueError("Checkpoint exceeds 64 MiB recovery limit")
+    report = json.loads(raw)
+    if not isinstance(report, dict) or set(report) != {"journal_schema", "complete", "completed_targets", "pending_targets", "total_targets", "results"}:
+        raise ValueError("Invalid checkpoint fields")
+    rows = report["results"]
+    if (report["journal_schema"] != "php2shell-run-v1" or type(report["complete"]) is not bool
+            or not isinstance(rows, list) or len(rows) > 100000
+            or any(type(report[k]) is not int or report[k] < 0 for k in ("completed_targets", "pending_targets", "total_targets"))
+            or report["completed_targets"] != len(rows)
+            or report["completed_targets"] + report["pending_targets"] != report["total_targets"]
+            or (report["complete"] and report["pending_targets"])):
+        raise ValueError("Invalid checkpoint completeness")
+    example = asdict(Result(input_url=""))
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != set(example):
+            raise ValueError("Invalid checkpoint result fields")
+        if row["php2shell_exploitability"] != "not_tested":
+            raise ValueError("Checkpoint cannot attest exploitability")
+        for key, value in row.items():
+            default = example[key]
+            if isinstance(default, list):
+                valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
+            elif key == "http_status":
+                valid = value is None or (type(value) is int and 100 <= value <= 599)
+            else:
+                valid = type(value) is type(default)
+            if not valid:
+                raise ValueError("Invalid checkpoint result value")
+    return report
+
+
+def format_report(report, args):
+    metadata = {key: report[key] for key in ("complete", "completed_targets", "pending_targets", "total_targets")}
+    if args.format == "json":
+        return json.dumps({**metadata, "results": report["results"]}, ensure_ascii=False, indent=2) + "\n"
+    if args.format == "html":
+        rendered = render_html(report["results"], logo=args.logo, brand=args.brand)
+        state = "complete" if report["complete"] else "incomplete / recovered"
+        banner = f"<p class=callout>Run {state}: {report['completed_targets']} completed; {report['pending_targets']} pending; {report['total_targets']} total targets.</p>"
+        return rendered.replace('<h2>Results</h2>', banner + '<h2>Results</h2>', 1)
+    stream = io.StringIO(newline="")
+    fields = list(Result.__dataclass_fields__) + ["record_type", *metadata]
+    writer = csv.DictWriter(stream, fieldnames=fields)
+    writer.writeheader()
+    for row in report["results"]:
+        writer.writerow({key: csv_safe(value) for key, value in {**row, "record_type": "result", **metadata}.items()})
+    if not report["results"]:
+        writer.writerow({"record_type": "summary", **metadata})
+    return stream.getvalue()
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("urls", nargs="*", help="Website URLs or bare domains (defaults to HTTPS)")
     parser.add_argument("--input", type=Path, help="UTF-8 text file: one URL per line; # comments allowed")
-    parser.add_argument("--output", type=Path, help="Save results here; otherwise write to stdout")
+    parser.add_argument("--output", type=Path, help="Atomically save results; existing paths refused unless --force")
+    parser.add_argument("--force", action="store_true", help="Explicitly replace an existing final output only after successful completion")
+    parser.add_argument("--recover", type=Path, help="Render a persisted .partial.json checkpoint without making requests")
     parser.add_argument("--format", choices=("csv", "json", "html"), default="csv", help="csv, json, or a branded html report")
     parser.add_argument("--delay", type=positive_float, default=1.0, help="Minimum seconds between requests to an origin (default: 1)")
     parser.add_argument("--timeout", type=positive_float, default=15.0, help="Socket timeout per request (default: 15 seconds)")
@@ -651,41 +740,54 @@ def main(argv=None) -> int:
         except OSError as exc:
             parser.error(str(exc))
     urls = list(dict.fromkeys(urls))
-    if not urls:
+    if not urls and not args.recover:
         parser.error("provide website URLs or --input websites.txt")
+    if args.recover and (urls or args.input):
+        parser.error("--recover cannot be combined with targets or --input")
+    if args.force and not args.output:
+        parser.error("--force requires --output")
     if args.input and args.output and args.input.resolve() == args.output.resolve():
         parser.error("--output must differ from --input")
-    checker = Checker(timeout=args.timeout, delay=args.delay, contact=args.contact, authorized_origins=args.authorized_origin)
-    output = args.output.open("w", encoding="utf-8", newline="") if args.output else sys.stdout
-    writer = csv.DictWriter(output, fieldnames=list(Result.__dataclass_fields__)) if args.format == "csv" else None
-    report_rows = []
+    checkpoint = Path(str(args.output) + ".partial.json") if args.output and not args.recover else None
+    if args.output:
+        if args.output.is_symlink() or (args.output.exists() and (not args.force or not args.output.is_file())):
+            parser.error("Output already exists or is not a regular file; choose a new path or explicitly --force")
+        if args.recover and args.output.resolve() == args.recover.resolve():
+            parser.error("Recovery output must differ from its checkpoint")
     try:
-        if writer:
-            writer.writeheader()
-        elif args.format == "json":
-            output.write("[\n")
-        for index, url in enumerate(urls):
-            result = checker.check(url)
-            print(f"[{index + 1}/{len(urls)}] {url}: {result.status}", file=sys.stderr)
-            row = asdict(result)
-            if writer:
-                writer.writerow({key: csv_safe(value) for key, value in row.items()})
-            elif args.format == "html":
-                report_rows.append(row)
-            else:
-                if index:
-                    output.write(",\n")
-                output.write(json.dumps(row, ensure_ascii=False, indent=2))
-            output.flush()
-        if args.format == "json":
-            output.write("\n]\n")
-    finally:
-        # An interrupted html run still reports the websites that completed.
-        if args.format == "html":
-            output.write(render_html(report_rows, logo=args.logo, brand=args.brand))
+        if args.recover:
+            report = load_checkpoint(args.recover)
+        else:
+            report = run_report([], len(urls))
+            if checkpoint:
+                # Exclusive creation protects a previous interrupted run from accidental reuse.
+                publish_report(checkpoint, json.dumps(report, ensure_ascii=False))
+            checker = Checker(timeout=args.timeout, delay=args.delay, contact=args.contact, authorized_origins=args.authorized_origin)
+            try:
+                for index, url in enumerate(urls):
+                    result = checker.check(url)
+                    report = run_report([*report["results"], asdict(result)], len(urls))
+                    if checkpoint:
+                        publish_report(checkpoint, json.dumps(report, ensure_ascii=False), replace=True)
+                    print(f"[{index + 1}/{len(urls)}] {url}: {result.status}", file=sys.stderr)
+                report["complete"] = True
+            except KeyboardInterrupt:
+                if not checkpoint:
+                    sys.stdout.write(format_report(report, args))
+                    sys.stdout.flush()
+                print("Interrupted: run incomplete; completed results remain in the checkpoint." if checkpoint else "Interrupted: output is incomplete.", file=sys.stderr)
+                return 130
+        rendered = format_report(report, args)
         if args.output:
-            output.close()
-    return 0
+            publish_report(args.output, rendered, replace=args.force)
+        else:
+            sys.stdout.write(rendered)
+            sys.stdout.flush()
+        # Retain the conservative checkpoint, even after success: recovery never invents completion.
+        return 0 if report["complete"] else 130
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"Report failed: {exc}. Existing output and persisted checkpoint are preserved.", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

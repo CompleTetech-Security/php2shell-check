@@ -63,7 +63,7 @@ matching revision when known.
 ## Run and preserve the output
 
 Choose a new output path outside version control; create its parent directory
-first. `--output` overwrites an existing file. The following paths and domains
+first. `--output` refuses existing files; `--force` explicitly replaces only the final artifact after rendering. Existing `.partial.json` checkpoints are never overwritten by a new run. The following paths and domains
 are examples: replace them with the authorized inputs and chosen output paths,
 and do not scan example domains as a test.
 
@@ -92,16 +92,12 @@ public contact value the user intends to disclose in requests.
 
 Inspect each result even if the process exits with `0`: that means the run
 completed, not that every fetch succeeded or every site is patched. Argument or
-input-file errors exit with `2`; unexpected I/O errors can raise exceptions.
+input/recovery/publication errors exit with `2`; interruption or incomplete recovery exits with `130`.
 For blocked or failed targets, report the reason without silently retrying.
 
-On interruption, preserve the output before any rerun. Completed CSV rows are
-flushed incrementally; JSON may lack its closing bracket. HTML is rendered from
-completed rows during normal finalization, including a handled interruption
-path, but a force-killed process may leave it empty. There is no automatic
-resume. Determine which targets completed, then run only authorized outstanding
-targets into a **new** output file if continuation is requested or already in
-scope; do not imply the original run completed.
+Use `--output` for durable evidence. The CLI atomically checkpoints every completed row to `OUTPUT.partial.json` before printing progress; forced termination preserves prior checkpoints. Ctrl-C returns `130` and leaves an explicitly incomplete checkpoint without replacing any previous final report. Recover JSON/CSV/HTML offline with `python wordpress_check.py --recover OUTPUT.partial.json --format html --output NEW.html`; do not supply targets. Recovery never makes requests and returns `130` for incomplete evidence. JSON now wraps rows under `results` with completeness and completed/pending/total counts; CSV appends run fields and an empty summary, HTML labels run state. Protect checkpoints like reports. A conservative incomplete checkpoint remains even after final success, so preserve the final artifact as the completion receipt.
+
+Stdout has no forced-termination durability. Recovery is bounded to regular non-symlink files up to 64 MiB / 100,000 rows; never claim uncommitted in-progress results survived. There is no automatic resume: use completed/pending counts and saved rows to prepare only authorized outstanding targets into a fresh output if continuation is authorized. Never imply the original run completed.
 
 ## Interpret and deliver
 
