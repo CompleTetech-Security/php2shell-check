@@ -87,7 +87,14 @@ evidence and timestamps must be preserved; HTML does not expose every field.
 
 `--delay` and `--timeout` must be positive finite numbers. Delay defaults to one
 second per origin and can be increased by robots rules. Timeout defaults to 15
-seconds **per socket**, not a total run deadline. Add `--contact` only for a
+seconds **per socket**. `--target-timeout` defaults to 120 positive finite seconds
+per target, shared by robots, redirects, pacing, DNS/connect/TLS, headers and body.
+A disposable HTTP acquisition process is killed and reaped on expiry, so stalled
+DNS and trickling responses cannot hold the next target indefinitely on Windows,
+macOS or Linux. Allow small process-startup/cancellation scheduling overhead.
+`fetch_status=deadline_exceeded` means incomplete/unknown, never a negative finding.
+The batch continues after that result; completed-input counts do not imply every
+assessment succeeded. Add `--contact` only for a
 public contact value the user intends to disclose in requests.
 
 Inspect each result even if the process exits with `0`: that means the run

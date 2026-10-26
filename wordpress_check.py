@@ -18,6 +18,7 @@ import math
 import mimetypes
 import re
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -130,6 +131,10 @@ class CheckStopped(Exception):
 
 class OutOfScope(CheckStopped):
     """A redirect destination lacks explicit origin authorization."""
+
+
+class TargetDeadline(CheckStopped):
+    """The shared monotonic target budget expired."""
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -389,10 +394,14 @@ def inspect_page(response: Response, result: Result) -> None:
 
 
 class Checker:
-    def __init__(self, *, timeout=15.0, delay=1.0, contact="", max_crawl_delay=60.0, authorized_origins=()):
+    def __init__(self, *, timeout=15.0, delay=1.0, contact="", max_crawl_delay=60.0, authorized_origins=(), target_timeout=None):
         self.timeout = timeout
         self.delay = delay
         self.max_crawl_delay = max_crawl_delay
+        if target_timeout is not None and (not math.isfinite(target_timeout) or target_timeout <= 0):
+            raise ValueError("target_timeout must be positive and finite")
+        self.target_timeout = target_timeout
+        self._deadline = None
         self.authorized_origins = {origin_key(authorized_origin(value)) for value in authorized_origins}
         self.user_agent = f"{BOT}/1.0" + (f" (+{contact})" if contact else "")
         self.opener = build_opener(NoRedirect())
@@ -400,11 +409,73 @@ class Checker:
         self.robots: dict[str, tuple[RobotsPolicy | None, float, str]] = {}
 
     def request(self, url: str, limit: int, delay: float | None = None) -> Response:
+        own_deadline = self._deadline is None and self.target_timeout is not None
+        if own_deadline:
+            self._deadline = time.monotonic() + self.target_timeout
+        try:
+            return self._request(url, limit, delay)
+        finally:
+            if own_deadline:
+                self._deadline = None
+
+    def _remaining(self):
+        if self._deadline is None:
+            return None
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TargetDeadline("Total target deadline exceeded; assessment incomplete.")
+        return remaining
+
+    def _request(self, url, limit, delay):
         site = origin(url)
         wait = max(self.delay, delay or 0) - (time.monotonic() - self.last_request.get(site, -math.inf))
+        remaining = self._remaining()
         if wait > 0:
+            if remaining is not None and wait >= remaining:
+                raise TargetDeadline("Total target deadline cannot accommodate required pacing; assessment incomplete.")
             time.sleep(wait)
         self.last_request[site] = time.monotonic()
+        remaining = self._remaining()
+        if remaining is None:
+            return self._fetch(url, limit)
+        # A disposable process bounds even resolver calls and trickling headers/body.
+        # One child is active at a time; parent retains robots policy and pacing.
+        command = [sys.executable, "-I", "-c", "import runpy,sys; runpy.run_path(sys.argv[1])['_request_worker']()", str(Path(__file__).resolve())]
+        child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            payload = json.dumps({"url": url, "limit": limit, "timeout": min(self.timeout, remaining), "user_agent": self.user_agent})
+            output, _ = child.communicate(payload.encode("utf-8"), timeout=self._remaining())
+        except subprocess.TimeoutExpired:
+            raise TargetDeadline("Total target deadline exceeded during HTTP acquisition; assessment incomplete.") from None
+        finally:
+            if child.poll() is None:
+                child.kill()
+            # Reap the only child before another target can start. No resolver thread survives.
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                # An OS-level cancellation failure must abort, never launch another worker.
+                raise RuntimeError("Unable to reap HTTP worker after cancellation; batch aborted") from None
+            for pipe in (child.stdin, child.stdout, child.stderr):
+                if pipe is not None:
+                    pipe.close()
+            self.last_request[site] = time.monotonic()
+        self._remaining()
+        if child.returncode != 0:
+            raise OSError("HTTP acquisition worker failed")
+        message = json.loads(output)
+        if "error" in message:
+            kind = message.get("kind")
+            error = message["error"]
+            if kind == "timeout":
+                raise TimeoutError(error)
+            if kind == "dns":
+                raise socket.gaierror(error)
+            raise OSError(error)
+        return Response(**message["response"])
+
+    def _fetch(self, url, limit):
         req = Request(url, headers={"User-Agent": self.user_agent, "Accept": "text/html,text/plain;q=0.9,*/*;q=0.1", "Accept-Encoding": "identity"})
         try:
             stream = self.opener.open(req, timeout=self.timeout)
@@ -467,11 +538,13 @@ class Checker:
 
     def check(self, value: str) -> Result:
         result = Result(input_url=value)
+        self._deadline = time.monotonic() + self.target_timeout if self.target_timeout is not None else None
         try:
             url = normalize_url(value)
             authorized = self.authorized_origins | {origin_key(url)}
             seen = set()
             for _ in range(6):
+                self._remaining()
                 result.final_url = url
                 if url in seen:
                     raise CheckStopped("Page redirect loop; stopped.")
@@ -482,6 +555,7 @@ class Checker:
                 if response.status not in REDIRECTS:
                     result.notes.append(self.robots[origin(url)][2])
                     inspect_page(response, result)
+                    self._remaining()
                     return result
                 location = response.headers.get("location")
                 if not location:
@@ -495,6 +569,9 @@ class Checker:
             raise CheckStopped("Too many page redirects; stopped.")
         except CheckStopped as exc:
             result.status = "blocked"
+            if isinstance(exc, TargetDeadline):
+                result.status = "error"
+                result.fetch_status = "deadline_exceeded"
             if isinstance(exc, OutOfScope):
                 result.fetch_status = "out_of_scope"
             result.notes.append(str(exc))
@@ -507,8 +584,29 @@ class Checker:
                 result.fetch_status = "dns_error"
             result.notes.append(str(exc))
         finally:
-            annotate_php2shell(result)
+            self._deadline = None
+            if result.fetch_status == "deadline_exceeded":
+                # Evidence parsed just as the budget expired is not a completed assessment.
+                for name, value in assess_php2shell().items():
+                    setattr(result, name, value)
+                result.php2shell_notes.append("Total target deadline exceeded; assessment incomplete.")
+            else:
+                annotate_php2shell(result)
         return result
+
+
+def _request_worker():
+    """Private bounded HTTP acquisition; policy decisions stay in the parent."""
+    payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    checker = Checker(timeout=payload["timeout"], delay=0)
+    checker.user_agent = payload["user_agent"]
+    try:
+        message = {"response": asdict(checker._fetch(payload["url"], payload["limit"]))}
+    except (ValueError, URLError, OSError, HTTPException, UnicodeError) as exc:
+        cause = exc.reason if isinstance(exc, URLError) else exc
+        kind = "timeout" if isinstance(cause, (TimeoutError, socket.timeout)) else "dns" if isinstance(cause, socket.gaierror) else "error"
+        message = {"error": str(exc)[:4096], "kind": kind}
+    sys.stdout.buffer.write(json.dumps(message, ensure_ascii=False).encode("utf-8"))
 
 
 def positive_float(value):
@@ -742,6 +840,7 @@ def main(argv=None) -> int:
     parser.add_argument("--format", choices=("csv", "json", "html"), default="csv", help="csv, json, or a branded html report")
     parser.add_argument("--delay", type=positive_float, default=1.0, help="Minimum seconds between requests to an origin (default: 1)")
     parser.add_argument("--timeout", type=positive_float, default=15.0, help="Socket timeout per request (default: 15 seconds)")
+    parser.add_argument("--target-timeout", type=positive_float, default=120.0, help="Total monotonic seconds per target, including DNS, HTTP, redirects and pacing (default: 120)")
     parser.add_argument("--authorized-origin", action="append", default=[], type=authorized_origin, help="Additional authorized redirect origin (scheme, host and optional port); repeatable")
     parser.add_argument("--contact", default="", help="Public contact URL/email to include in the honest User-Agent")
     parser.add_argument("--logo", type=Path, default=DEFAULT_LOGO, help="Logo image for the html report (default: assets/logo.png)")
@@ -780,7 +879,7 @@ def main(argv=None) -> int:
             if checkpoint:
                 # Exclusive creation protects a previous interrupted run from accidental reuse.
                 publish_report(checkpoint, checkpoint_json(report))
-            checker = Checker(timeout=args.timeout, delay=args.delay, contact=args.contact, authorized_origins=args.authorized_origin)
+            checker = Checker(timeout=args.timeout, delay=args.delay, contact=args.contact, authorized_origins=args.authorized_origin, target_timeout=args.target_timeout)
             try:
                 for index, url in enumerate(urls):
                     result = checker.check(url)
