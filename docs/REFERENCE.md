@@ -135,6 +135,7 @@ are rejected. Input is a text list, **not a CSV or an Excel workbook**.
 | `--brand NAME` | `CompleteTech LLC` | Organization name shown on the HTML report. |
 | `--delay SECONDS` | `1` | Positive minimum time between requests to an origin. Robots rules may increase it. |
 | `--timeout SECONDS` | `15` | Positive per-socket timeout, not a total deadline for a website. |
+| `--authorized-origin ORIGIN` | None | Additional authorized redirect origin; repeat for each approved scheme/host/port. No paths, queries or fragments. |
 | `--contact VALUE` | Empty | Public contact URL/email included in the User-Agent. |
 | `--help` | — | Show command help. |
 
@@ -165,6 +166,7 @@ embedded assets, or stale/spoofed metadata can resemble WordPress.
 - `ok`: the final page returned HTTP 2xx, even if its content was inconclusive.
 - `timeout`: a recognized socket timeout occurred.
 - `dns_error`: a recognized DNS-resolution error occurred.
+- `out_of_scope`: a page or robots redirect was stopped before requesting an unauthorized origin; assessment remains unknown.
 - `blocked`: other cases preventing a successful fetch, including robots rules,
   HTTP errors, invalid input, and TLS errors.
 
@@ -225,9 +227,19 @@ This is a practical, conservative parser, not a claim of full RFC certification.
 
 - A missing policy with HTTP 404/410 permits a page check. Other unsuccessful
   policy responses stop it. HTML masquerading as robots.txt also stops it.
-- Same-origin robots redirects and same-host `www`/HTTPS canonical redirects
-  to `/robots.txt` are supported. Other cross-origin robots redirects stop.
-- Page redirects are limited to five hops. HTTPS-to-HTTP downgrades stop.
+- Each target authorizes its own scheme, hostname and effective port, with
+  case-insensitive hostname and default-port normalization. The sole implicit
+  cross-origin allowance is HTTP port 80 to HTTPS port 443 on the same hostname.
+  A `www` hostname, different hostname, or other port needs explicit approval
+  with repeatable `--authorized-origin https://approved.example:8443`.
+  Other target entries and earlier checks do not grant redirect authorization.
+- Page and robots redirect destinations are checked against this scope before
+  any destination request, including its robots fetch. Same-origin robots
+  redirects may change path; approved cross-origin robots redirects must retain
+  `/robots.txt`. Robots permission never grants assessment authorization.
+- Page redirects are limited to five hops. HTTPS-to-HTTP downgrades stop even
+  when the HTTP origin was explicitly authorized. Destination robots rules,
+  verified TLS and pacing remain enforced.
 - HTTP 401/403/407/429/451 page responses stop without an automatic retry.
 - Policies requiring more than 60 seconds between requests are recorded as
   blocked; the page is skipped rather than ignoring the delay.
@@ -267,6 +279,9 @@ print(asdict(result))
 Reuse a `Checker` instance to preserve policy caches and pacing across requests.
 The instance is not designed for concurrent use. Python callers can change
 `max_crawl_delay` (default 60 seconds); increasing it can mean long waits.
+Pass `authorized_origins=["https://approved.example:8443"]` to explicitly allow
+additional redirect origins. This applies to all checks on that instance; each
+check otherwise starts with only its supplied origin and the narrow upgrade rule.
 Do not use `request()` directly to bypass the policy checks in `check()`.
 
 ## File handling and exit codes

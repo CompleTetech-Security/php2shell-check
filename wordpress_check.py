@@ -124,6 +124,10 @@ class CheckStopped(Exception):
     """The checker cannot safely or usefully continue."""
 
 
+class OutOfScope(CheckStopped):
+    """A redirect destination lacks explicit origin authorization."""
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -218,6 +222,25 @@ def normalize_url(value: str) -> str:
 def origin(url: str) -> str:
     p = urlsplit(url)
     return urlunsplit((p.scheme, p.netloc, "", "", ""))
+
+
+def origin_key(url: str) -> tuple[str, str, int]:
+    p = urlsplit(url)
+    return p.scheme, p.hostname.lower(), p.port if p.port is not None else (443 if p.scheme == "https" else 80)
+
+
+def authorized_origin(value: str) -> str:
+    url = normalize_url(value)
+    p = urlsplit(url)
+    if p.path != "/" or p.query or urlsplit(value).fragment:
+        raise ValueError("Authorized origins must contain only scheme, hostname and optional port")
+    return origin(url)
+
+
+def in_scope(url: str, authorized: set[tuple[str, str, int]]) -> bool:
+    key = origin_key(url)
+    # Only the ordinary HTTP default port may upgrade to default-port HTTPS.
+    return key in authorized or (key[0] == "https" and key[2] == 443 and ("http", key[1], 80) in authorized)
 
 
 @dataclass
@@ -362,10 +385,11 @@ def inspect_page(response: Response, result: Result) -> None:
 
 
 class Checker:
-    def __init__(self, *, timeout=15.0, delay=1.0, contact="", max_crawl_delay=60.0):
+    def __init__(self, *, timeout=15.0, delay=1.0, contact="", max_crawl_delay=60.0, authorized_origins=()):
         self.timeout = timeout
         self.delay = delay
         self.max_crawl_delay = max_crawl_delay
+        self.authorized_origins = {origin_key(authorized_origin(value)) for value in authorized_origins}
         self.user_agent = f"{BOT}/1.0" + (f" (+{contact})" if contact else "")
         self.opener = build_opener(NoRedirect())
         self.last_request: dict[str, float] = {}
@@ -392,8 +416,10 @@ class Checker:
             headers = {k.lower(): ", ".join(stream.headers.get_all(k)) for k in stream.headers.keys()}
             return Response(stream.code, headers, body, len(raw) > limit)
 
-    def policy(self, url: str) -> float:
+    def policy(self, url: str, authorized=None) -> float:
         site = origin(url)
+        if authorized is None:
+            authorized = self.authorized_origins | {origin_key(url)}
         if site not in self.robots:
             robot_url = site + "/robots.txt"
             response = None
@@ -409,15 +435,12 @@ class Checker:
                 if not location:
                     raise CheckStopped("robots.txt redirect without Location; skipping site.")
                 target = normalize_url(urljoin(robot_url, location))
-                if origin(target) != site:
-                    initial = urlsplit(site)
-                    redirected = urlsplit(target)
-                    same_host = (initial.hostname or '').removeprefix('www.') == (redirected.hostname or '').removeprefix('www.')
-                    same_port = initial.port == redirected.port
-                    canonical = same_host and same_port and redirected.path == '/robots.txt'
-                    no_downgrade = not (initial.scheme == 'https' and redirected.scheme == 'http')
-                    if not (canonical and no_downgrade):
-                        raise CheckStopped("robots.txt redirects to another origin; policy cannot be verified, skipping site.")
+                if not in_scope(target, authorized):
+                    raise OutOfScope("robots.txt redirects to another origin outside authorized scope; skipping site.")
+                if urlsplit(robot_url).scheme == "https" and urlsplit(target).scheme == "http":
+                    raise CheckStopped("HTTPS-to-HTTP robots.txt redirect; stopped.")
+                if origin_key(target) != origin_key(url) and urlsplit(target).path != "/robots.txt":
+                    raise CheckStopped("Cross-origin robots.txt redirect must retain /robots.txt; skipping site.")
                 robot_url = target
             assert response is not None
             if response.status in {404, 410}:
@@ -442,13 +465,14 @@ class Checker:
         result = Result(input_url=value)
         try:
             url = normalize_url(value)
+            authorized = self.authorized_origins | {origin_key(url)}
             seen = set()
             for _ in range(6):
                 result.final_url = url
                 if url in seen:
                     raise CheckStopped("Page redirect loop; stopped.")
                 seen.add(url)
-                delay = self.policy(url)
+                delay = self.policy(url, authorized)
                 response = self.request(url, MAX_BODY, delay)
                 result.http_status = response.status
                 if response.status not in REDIRECTS:
@@ -461,10 +485,14 @@ class Checker:
                 target = normalize_url(urljoin(url, location))
                 if urlsplit(url).scheme == "https" and urlsplit(target).scheme == "http":
                     raise CheckStopped("HTTPS-to-HTTP redirect; stopped.")
+                if not in_scope(target, authorized):
+                    raise OutOfScope("Page redirect outside authorized origin scope; stopped before requesting destination.")
                 url = target
             raise CheckStopped("Too many page redirects; stopped.")
         except CheckStopped as exc:
             result.status = "blocked"
+            if isinstance(exc, OutOfScope):
+                result.fetch_status = "out_of_scope"
             result.notes.append(str(exc))
         except (ValueError, URLError, OSError, HTTPException, UnicodeError) as exc:
             result.status = "error"
@@ -609,6 +637,7 @@ def main(argv=None) -> int:
     parser.add_argument("--format", choices=("csv", "json", "html"), default="csv", help="csv, json, or a branded html report")
     parser.add_argument("--delay", type=positive_float, default=1.0, help="Minimum seconds between requests to an origin (default: 1)")
     parser.add_argument("--timeout", type=positive_float, default=15.0, help="Socket timeout per request (default: 15 seconds)")
+    parser.add_argument("--authorized-origin", action="append", default=[], type=authorized_origin, help="Additional authorized redirect origin (scheme, host and optional port); repeatable")
     parser.add_argument("--contact", default="", help="Public contact URL/email to include in the honest User-Agent")
     parser.add_argument("--logo", type=Path, default=DEFAULT_LOGO, help="Logo image for the html report (default: assets/logo.png)")
     parser.add_argument("--brand", default="CompleteTech LLC", help="Organization name shown on the html report")
@@ -626,7 +655,7 @@ def main(argv=None) -> int:
         parser.error("provide website URLs or --input websites.txt")
     if args.input and args.output and args.input.resolve() == args.output.resolve():
         parser.error("--output must differ from --input")
-    checker = Checker(timeout=args.timeout, delay=args.delay, contact=args.contact)
+    checker = Checker(timeout=args.timeout, delay=args.delay, contact=args.contact, authorized_origins=args.authorized_origin)
     output = args.output.open("w", encoding="utf-8", newline="") if args.output else sys.stdout
     writer = csv.DictWriter(output, fieldnames=list(Result.__dataclass_fields__)) if args.format == "csv" else None
     report_rows = []

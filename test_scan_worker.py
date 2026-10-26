@@ -385,7 +385,7 @@ class WorkerNetworkTests(unittest.TestCase):
         self.assertEqual(received, [("/receipt", b'{"signed":true}')])
 
     def test_page_and_robots_redirects_cannot_escape_scope(self):
-        for mode, expected_status in (("page", "error"), ("robots", "blocked"), ("robots_www", "error")):
+        for mode in ("page", "robots", "robots_www"):
             requested = []
             resolver_hosts = []
 
@@ -446,7 +446,8 @@ class WorkerNetworkTests(unittest.TestCase):
                 checker.opener = PinnedOpener(FixtureScope())
                 with mock.patch.object(network, "_public_addresses", side_effect=fixture_addresses):
                     result = checker.check("http://example.test/")
-                self.assertEqual(result.status, expected_status)
+                self.assertEqual(result.status, "blocked")
+                self.assertEqual(result.fetch_status, "out_of_scope")
                 self.assertTrue(resolver_hosts)
                 self.assertTrue(all(host == "example.test" for host in resolver_hosts))
                 if mode == "page":

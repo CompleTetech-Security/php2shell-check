@@ -41,11 +41,16 @@ matching revision when known.
   existing authorization; ask only if scope or permission is genuinely missing.
   A permissive or missing robots.txt is not authorization.
 - The checker fetches robots.txt and the supplied page, following up to five
-  page redirects and checking destination robots policies. It can follow
-  redirects to other hosts and accepts local/private addresses; it has no host
-  allowlist option. If a strict host boundary is required, use an appropriately
-  restricted network environment or offline evidence instead of assuming the
-  CLI enforces that boundary.
+  page redirects and checking destination robots policies. Each target permits
+  only its supplied scheme/hostname/effective port, plus same-host HTTP port 80
+  to HTTPS port 443. Additional origins (including `www` or different ports)
+  need explicit user authorization and repeatable `--authorized-origin ORIGIN`.
+  Supply only scheme, hostname and optional port, with no path/query/fragment.
+  Page and robots redirects outside scope stop before any destination request
+  with `fetch_status=out_of_scope`; report this as blocked, unknown assessment.
+  Other batch targets do not implicitly authorize redirects. HTTPS downgrades
+  remain blocked even for explicitly listed origins. Local/private addresses
+  remain supported; hosted use still requires appropriate network controls.
 - Pass explicit HTTP(S) URLs or bare domains (which default to HTTPS). For a
   batch, prepare UTF-8 text with one target per line. Blank lines and full-line
   `#` comments are ignored; a BOM is accepted. Exact duplicates are skipped.
