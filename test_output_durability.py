@@ -6,7 +6,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
@@ -17,6 +19,73 @@ class DurableOutputTests(unittest.TestCase):
     def call(self, args):
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             return m.main(args)
+
+    def test_generated_nonstandard_status_checkpoint_recovers_without_requests(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(404 if self.path == '/robots.txt' else 999)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        original_check = m.Checker.check
+        calls = []
+        def check_then_interrupt(checker, url):
+            calls.append(url)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return original_check(checker, url)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / 'interrupted.json'
+                origin = 'http://127.0.0.1:' + str(server.server_port)
+                with patch.object(m.Checker, 'check', check_then_interrupt):
+                    self.assertEqual(self.call([origin + '/999', origin + '/pending', '--delay', '0.001',
+                                                '--output', str(target), '--format', 'json']), 130)
+                checkpoint = Path(str(target) + '.partial.json')
+                report = m.load_checkpoint(checkpoint)
+                self.assertEqual(report['results'][0]['http_status'], 999)
+                self.assertEqual((report['completed_targets'], report['pending_targets']), (1, 1))
+                for fmt in ('json', 'csv', 'html'):
+                    output = Path(directory) / ('recovered.' + fmt)
+                    with patch.object(m.Checker, 'check', side_effect=AssertionError('network')):
+                        self.assertEqual(self.call(['--recover', str(checkpoint), '--output', str(output),
+                                                    '--format', fmt]), 130)
+                    text = output.read_text(encoding='utf-8')
+                    self.assertIn('999', text)
+                    if fmt == 'json':
+                        recovered = json.loads(text)
+                        self.assertFalse(recovered['complete'])
+                        self.assertEqual(recovered['results'][0]['php2shell_exploitability'], 'not_tested')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_checkpoint_status_domain_and_unsafe_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'boundary.json'
+            for status in (None, 100, 599, 600, 999):
+                with self.subTest(accepted=status):
+                    report = m.run_report([m.asdict(m.Result(input_url='one.example', http_status=status))], 2)
+                    checkpoint.write_text(m.checkpoint_json(report), encoding='utf-8')
+                    self.assertEqual(m.load_checkpoint(checkpoint)['results'][0]['http_status'], status)
+            for status in (99, 1000, -1, True, 999.0, '999', [], {}):
+                with self.subTest(rejected=status):
+                    report = m.run_report([m.asdict(m.Result(input_url='one.example', http_status=status))], 2)
+                    checkpoint.write_text(m.checkpoint_json(report), encoding='utf-8')
+                    with self.assertRaisesRegex(ValueError, 'Invalid checkpoint result value'):
+                        m.load_checkpoint(checkpoint)
+            report = m.run_report([m.asdict(m.Result(input_url='one.example', http_status=999,
+                                                   php2shell_exploitability='confirmed'))], 2)
+            checkpoint.write_text(m.checkpoint_json(report), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'cannot attest exploitability'):
+                m.load_checkpoint(checkpoint)
 
     def test_existing_output_and_failed_force_remain_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:

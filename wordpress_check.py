@@ -704,7 +704,7 @@ def load_checkpoint(path):
             if isinstance(default, list):
                 valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
             elif key == "http_status":
-                valid = value is None or (type(value) is int and 100 <= value <= 599)
+                valid = value is None or (type(value) is int and 100 <= value <= 999)
             else:
                 valid = type(value) is type(default)
             if not valid:
