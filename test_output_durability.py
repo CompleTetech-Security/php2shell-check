@@ -116,6 +116,16 @@ m.main(['https://one.example','https://two.example','--output',sys.argv[1],'--fo
                 check.assert_not_called()
             self.assertEqual(json.loads(target.read_text()), report)
 
+    def test_checkpoint_limit_preserves_previous_committed_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'limited.json'
+            initial_size = len(m.checkpoint_json(m.run_report([], 1)).encode('utf-8'))
+            with patch.object(m, 'MAX_CHECKPOINT_BYTES', initial_size + 1), patch.object(m.Checker, 'check', return_value=m.Result(input_url='one.example')):
+                self.assertEqual(self.call(['one.example', '--output', str(target)]), 2)
+            self.assertFalse(target.exists())
+            report = m.load_checkpoint(Path(str(target) + '.partial.json'))
+            self.assertEqual((report['completed_targets'], report['pending_targets']), (0, 1))
+
     def test_empty_incomplete_stdout_and_invalid_recovery(self):
         with patch.object(m.Checker, 'check', side_effect=KeyboardInterrupt), redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()):
             self.assertEqual(m.main(['one.example', '--format', 'json']), 130)

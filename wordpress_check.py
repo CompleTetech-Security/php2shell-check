@@ -634,6 +634,17 @@ version number, and hidden versions are reported as unknown, not safe. Administr
 
 
 
+MAX_CHECKPOINT_BYTES = 64 * 1024 * 1024
+MAX_CHECKPOINT_ROWS = 100000
+
+
+def checkpoint_json(report):
+    text = json.dumps(report, ensure_ascii=False)
+    if len(text.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
+        raise ValueError("Checkpoint exceeds recovery byte limit; last committed checkpoint retained")
+    return text
+
+
 def publish_report(path, text, *, replace=False):
     """Publish one fully fsynced artifact; no-clobber is enforced at publication."""
     descriptor, temporary = tempfile.mkstemp(prefix=".php2shell-", dir=path.parent)
@@ -663,15 +674,15 @@ def load_checkpoint(path):
     with path.open("rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("Recovery requires a regular checkpoint file")
-        raw = stream.read(64 * 1024 * 1024 + 1)
-    if len(raw) > 64 * 1024 * 1024:
+        raw = stream.read(MAX_CHECKPOINT_BYTES + 1)
+    if len(raw) > MAX_CHECKPOINT_BYTES:
         raise ValueError("Checkpoint exceeds 64 MiB recovery limit")
     report = json.loads(raw)
     if not isinstance(report, dict) or set(report) != {"journal_schema", "complete", "completed_targets", "pending_targets", "total_targets", "results"}:
         raise ValueError("Invalid checkpoint fields")
     rows = report["results"]
     if (report["journal_schema"] != "php2shell-run-v1" or type(report["complete"]) is not bool
-            or not isinstance(rows, list) or len(rows) > 100000
+            or not isinstance(rows, list) or len(rows) > MAX_CHECKPOINT_ROWS
             or any(type(report[k]) is not int or report[k] < 0 for k in ("completed_targets", "pending_targets", "total_targets"))
             or report["completed_targets"] != len(rows)
             or report["completed_targets"] + report["pending_targets"] != report["total_targets"]
@@ -742,6 +753,8 @@ def main(argv=None) -> int:
     urls = list(dict.fromkeys(urls))
     if not urls and not args.recover:
         parser.error("provide website URLs or --input websites.txt")
+    if len(urls) > MAX_CHECKPOINT_ROWS:
+        parser.error("At most 100,000 targets per run; split inputs explicitly")
     if args.recover and (urls or args.input):
         parser.error("--recover cannot be combined with targets or --input")
     if args.force and not args.output:
@@ -761,14 +774,14 @@ def main(argv=None) -> int:
             report = run_report([], len(urls))
             if checkpoint:
                 # Exclusive creation protects a previous interrupted run from accidental reuse.
-                publish_report(checkpoint, json.dumps(report, ensure_ascii=False))
+                publish_report(checkpoint, checkpoint_json(report))
             checker = Checker(timeout=args.timeout, delay=args.delay, contact=args.contact, authorized_origins=args.authorized_origin)
             try:
                 for index, url in enumerate(urls):
                     result = checker.check(url)
                     report = run_report([*report["results"], asdict(result)], len(urls))
                     if checkpoint:
-                        publish_report(checkpoint, json.dumps(report, ensure_ascii=False), replace=True)
+                        publish_report(checkpoint, checkpoint_json(report), replace=True)
                     print(f"[{index + 1}/{len(urls)}] {url}: {result.status}", file=sys.stderr)
                 report["complete"] = True
             except KeyboardInterrupt:
