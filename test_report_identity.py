@@ -55,6 +55,20 @@ class ReportIdentityTests(unittest.TestCase):
         self.assertFalse(report['complete'])
         self.assertEqual(report['completed_targets'], 1)
 
+    def test_recovery_distinguishes_updated_reference_rules_from_acquisition(self):
+        report = m.run_report([m.asdict(m.Result(input_url='old.invalid', php2shell_fixed_version='8.2.35'))], 1)
+        original = dict(report['provenance'])
+        with patch.object(m, 'PHP2SHELL_RULES_DATE', '2099-01-01'), patch.object(m, 'PHP2SHELL_FIXES', {(8, 2): 99}), patch.object(m, 'PHP2SHELL_SOURCES', ('https://reference.invalid/new',)):
+            text = m.format_report(report, self.args('html'))
+            self.assertIn('acquisition rules as of ' + original['rules_as_of'], text)
+            self.assertIn('Current reference rules as of 2099-01-01', text)
+            self.assertIn('8.2.99', text)
+            self.assertIn('8.2.35', text)
+            self.assertIn('Current reference sources:', text)
+            for fmt in ('json', 'csv'):
+                self.assertIn(original['rules_sha256'], m.format_report(report, self.args(fmt)))
+        self.assertEqual(report['provenance'], original)
+
     def test_copied_and_symlinked_executable_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             copy = Path(directory)/'standalone.py'
