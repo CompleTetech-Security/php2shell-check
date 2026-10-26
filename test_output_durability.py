@@ -116,6 +116,22 @@ m.main(['https://one.example','https://two.example','--output',sys.argv[1],'--fo
                 check.assert_not_called()
             self.assertEqual(json.loads(target.read_text()), report)
 
+    @unittest.skipUnless(hasattr(os, 'mkfifo') and os.name == 'posix', 'POSIX FIFO fixture')
+    def test_fifo_recovery_rejected_without_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = Path(directory) / 'checkpoint.fifo'
+            os.mkfifo(fifo, 0o600)
+            run = subprocess.run([sys.executable, 'wordpress_check.py', '--recover', str(fifo)],
+                                 capture_output=True, timeout=10)
+            self.assertEqual(run.returncode, 2)
+            self.assertIn(b'regular checkpoint', run.stderr)
+
+    def test_directory_recovery_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(m.Checker, 'check') as check:
+                self.assertEqual(self.call(['--recover', directory]), 2)
+                check.assert_not_called()
+
     def test_checkpoint_limit_preserves_previous_committed_state(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / 'limited.json'

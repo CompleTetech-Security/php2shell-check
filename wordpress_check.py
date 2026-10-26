@@ -671,10 +671,15 @@ def run_report(rows, total, *, complete=False):
 def load_checkpoint(path):
     if path.is_symlink():
         raise ValueError("Recovery refuses symbolic-link checkpoints")
-    with path.open("rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise ValueError("Recovery requires a regular checkpoint file")
-        raw = stream.read(MAX_CHECKPOINT_BYTES + 1)
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_CHECKPOINT_BYTES + 1)
+    finally:
+        os.close(descriptor)
     if len(raw) > MAX_CHECKPOINT_BYTES:
         raise ValueError("Checkpoint exceeds 64 MiB recovery limit")
     report = json.loads(raw)
