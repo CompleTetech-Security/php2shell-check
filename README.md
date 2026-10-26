@@ -72,6 +72,13 @@ Thresholds come from the PHP project's advisories for [CVE-2026-109618](https://
 
 Check only websites you are authorized to assess, and keep real target lists and results out of version control.
 
+Redirects stay within each supplied origin (scheme, hostname and effective port).
+Only same-host HTTP port 80 to HTTPS port 443 is implicitly allowed. Additional
+origins, including `www` names or different ports, require explicit authorization
+via repeatable `--authorized-origin https://approved.example:8443`. Page and
+robots redirects outside that scope stop before any destination request and
+report `fetch_status=out_of_scope`; robots permission is not authorization.
+
 ## Agent skill
 
 The [php2shell-check skill](skills/php2shell-check/SKILL.md) guides an agent
